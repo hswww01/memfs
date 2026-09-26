@@ -201,6 +201,138 @@ static void test_directory_order(void) {
 	memfs_destroy(fs);
 }
 
+static void test_small_storage(void) {
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	uint8_t value = 0x5a;
+	uint8_t out = 0;
+	uint32_t transferred;
+
+	printf("== small storage ==\n");
+
+	CHECK(memfs_create(8 * 1024 * 1024ULL, L"TEST", &fs) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, fs->root, L"small.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+
+	CHECK(memfs_node_write(file, &value, 0, 1, false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == 1);
+	CHECK(file->small_data != NULL);
+	CHECK(file->page_groups == NULL);
+	CHECK(file->small_capacity == MEMFS_ALLOCATION_UNIT);
+	CHECK(file->resident_bytes == MEMFS_ALLOCATION_UNIT);
+	CHECK(fs->resident_bytes == MEMFS_ALLOCATION_UNIT);
+	CHECK(file->allocation_size == MEMFS_ALLOCATION_UNIT);
+
+	CHECK(memfs_node_read(file, &out, 0, 1, &transferred) == MEMFS_OK);
+	CHECK(out == value);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	CHECK(fs->resident_bytes == 0);
+	CHECK(fs->used_bytes == 0);
+	memfs_destroy(fs);
+}
+
+static void test_sparse_pages(void) {
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	uint8_t value = 0xa7;
+	uint8_t buffer[32];
+	uint32_t transferred;
+	uint64_t sparse_size = 64ULL * 1024ULL * 1024ULL;
+	uint64_t write_offset = 32ULL * 1024ULL * 1024ULL + 123;
+	uint32_t i;
+
+	printf("== sparse pages ==\n");
+
+	CHECK(memfs_create(128ULL * 1024ULL * 1024ULL, L"TEST", &fs) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, fs->root, L"sparse.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+
+	CHECK(memfs_node_set_file_size(file, sparse_size) == MEMFS_OK);
+	CHECK(file->file_size == sparse_size);
+	CHECK(file->allocation_size == sparse_size);
+	CHECK(fs->used_bytes == sparse_size);
+	CHECK(file->resident_bytes == 0);
+	CHECK(fs->resident_bytes == 0);
+
+	memset(buffer, 0xcc, sizeof(buffer));
+	CHECK(memfs_node_read(file, buffer, 16ULL * 1024ULL * 1024ULL, sizeof(buffer), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(buffer));
+	for (i = 0; i < sizeof(buffer); i++)
+		CHECK(buffer[i] == 0);
+
+	CHECK(memfs_node_write(file, &value, write_offset, 1, false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == 1);
+	CHECK(file->resident_bytes == MEMFS_PAGE_SIZE);
+	CHECK(fs->resident_bytes == MEMFS_PAGE_SIZE);
+	CHECK(file->page_groups != NULL);
+
+	memset(buffer, 0xcc, sizeof(buffer));
+	CHECK(memfs_node_read(file, buffer, write_offset - 8, sizeof(buffer), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(buffer));
+	CHECK(buffer[8] == value);
+	for (i = 0; i < sizeof(buffer); i++) {
+		if (i != 8)
+			CHECK(buffer[i] == 0);
+	}
+
+	CHECK(memfs_node_set_file_size(file, 2048) == MEMFS_OK);
+	CHECK(file->file_size == 2048);
+	CHECK(file->allocation_size == sparse_size);
+	CHECK(file->resident_bytes == 0);
+	CHECK(fs->resident_bytes == 0);
+
+	CHECK(memfs_node_set_allocation_size(file, 2048) == MEMFS_OK);
+	CHECK(file->allocation_size == 2048);
+	CHECK(fs->used_bytes == 2048);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	CHECK(fs->used_bytes == 0);
+	CHECK(fs->resident_bytes == 0);
+	memfs_destroy(fs);
+}
+
+static void test_small_to_paged_promotion(void) {
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	uint8_t prefix[1024];
+	uint8_t value = 0x7d;
+	uint8_t verify[1024];
+	uint32_t transferred;
+	uint32_t i;
+
+	printf("== small -> paged promotion ==\n");
+
+	for (i = 0; i < sizeof(prefix); i++)
+		prefix[i] = (uint8_t)i;
+
+	CHECK(memfs_create(16ULL * 1024ULL * 1024ULL, L"TEST", &fs) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, fs->root, L"promote.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+
+	CHECK(memfs_node_write(file, prefix, 0, sizeof(prefix), false, false, &transferred) == MEMFS_OK);
+	CHECK(file->small_data != NULL);
+	CHECK(file->resident_bytes == 1024);
+
+	CHECK(memfs_node_write(file, &value, 2ULL * MEMFS_PAGE_SIZE + 17, 1, false, false, &transferred) == MEMFS_OK);
+
+	CHECK(file->small_data == NULL);
+	CHECK(file->page_groups != NULL);
+	CHECK(file->resident_bytes == 2ULL * MEMFS_PAGE_SIZE);
+
+	memset(verify, 0, sizeof(verify));
+	CHECK(memfs_node_read(file, verify, 0, sizeof(verify), &transferred) == MEMFS_OK);
+	CHECK(memcmp(prefix, verify, sizeof(prefix)) == 0);
+
+	CHECK(memfs_node_set_file_size(file, 1024) == MEMFS_OK);
+	CHECK(file->small_data != NULL);
+	CHECK(file->page_groups == NULL);
+	CHECK(file->resident_bytes == 1024);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	CHECK(fs->resident_bytes == 0);
+	memfs_destroy(fs);
+}
 int main(void) {
 	setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -209,6 +341,9 @@ int main(void) {
 	test_rename_and_delete();
 	test_capacity();
 	test_directory_order();
+	test_small_storage();
+	test_sparse_pages();
+	test_small_to_paged_promotion();
 
 	printf("\nchecks=%d failures=%d => %s\n", g_checks, g_failures, g_failures ? "FAIL" : "PASS");
 

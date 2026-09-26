@@ -79,6 +79,441 @@ static void memfs_all_remove(Memfs* fs, MemfsNode* node) {
 	node->all_next = NULL;
 }
 
+static void memfs_resident_add(MemfsNode* node, uint64_t bytes) {
+	node->resident_bytes += bytes;
+	node->fs->resident_bytes += bytes;
+}
+
+static void memfs_resident_sub(MemfsNode* node, uint64_t bytes) {
+	if (bytes > node->resident_bytes)
+		bytes = node->resident_bytes;
+	if (bytes > node->fs->resident_bytes)
+		node->fs->resident_bytes = 0;
+	else
+		node->fs->resident_bytes -= bytes;
+	node->resident_bytes -= bytes;
+}
+
+static MemfsPageGroup* memfs_storage_group(MemfsNode* node, uint64_t group_index) {
+	if (group_index >= node->page_group_capacity)
+		return NULL;
+	return node->page_groups[group_index];
+}
+
+static uint8_t* memfs_storage_page(MemfsNode* node, uint64_t page_index) {
+	uint64_t group_index = page_index >> MEMFS_PAGE_GROUP_SHIFT;
+	MemfsPageGroup* group = memfs_storage_group(node, group_index);
+
+	if (group == NULL)
+		return NULL;
+	return group->pages[page_index & MEMFS_PAGE_GROUP_MASK];
+}
+
+static MemfsResult memfs_storage_ensure_group(MemfsNode* node, uint64_t group_index, MemfsPageGroup** out_group) {
+	MemfsPageGroup** groups;
+	MemfsPageGroup* group;
+	uint32_t old_capacity;
+	uint32_t new_capacity;
+
+	if (group_index >= UINT32_MAX)
+		return MEMFS_ERR_NO_SPACE;
+
+	if (group_index >= node->page_group_capacity) {
+		old_capacity = node->page_group_capacity;
+		new_capacity = old_capacity ? old_capacity : 4U;
+
+		while (group_index >= new_capacity) {
+			if (new_capacity > UINT32_MAX / 2U) {
+				new_capacity = (uint32_t)group_index + 1U;
+				break;
+			}
+			new_capacity <<= 1;
+		}
+
+		if ((size_t)new_capacity > SIZE_MAX / sizeof(*groups))
+			return MEMFS_ERR_NO_MEMORY;
+
+		groups = realloc(node->page_groups, (size_t)new_capacity * sizeof(*groups));
+		if (groups == NULL)
+			return MEMFS_ERR_NO_MEMORY;
+
+		memset(groups + old_capacity, 0, (size_t)(new_capacity - old_capacity) * sizeof(*groups));
+
+		node->page_groups = groups;
+		node->page_group_capacity = new_capacity;
+	}
+
+	group = node->page_groups[group_index];
+	if (group == NULL) {
+		group = calloc(1, sizeof(*group));
+		if (group == NULL)
+			return MEMFS_ERR_NO_MEMORY;
+
+		node->page_groups[group_index] = group;
+	}
+
+	*out_group = group;
+	return MEMFS_OK;
+}
+
+static MemfsResult memfs_storage_ensure_page(MemfsNode* node, uint64_t page_index, uint8_t** out_page) {
+	uint64_t group_index = page_index >> MEMFS_PAGE_GROUP_SHIFT;
+	uint32_t slot = (uint32_t)(page_index & MEMFS_PAGE_GROUP_MASK);
+	MemfsPageGroup* group;
+	MemfsResult result;
+	uint8_t* page;
+
+	result = memfs_storage_ensure_group(node, group_index, &group);
+	if (result != MEMFS_OK)
+		return result;
+
+	page = group->pages[slot];
+	if (page == NULL) {
+		page = calloc(1, MEMFS_PAGE_SIZE);
+		if (page == NULL) {
+			if (group->present_pages == 0) {
+				free(group);
+				node->page_groups[group_index] = NULL;
+			}
+			return MEMFS_ERR_NO_MEMORY;
+		}
+
+		group->pages[slot] = page;
+		group->present_pages++;
+		memfs_resident_add(node, MEMFS_PAGE_SIZE);
+	}
+
+	*out_page = page;
+	return MEMFS_OK;
+}
+
+static void memfs_storage_compact_groups(MemfsNode* node) {
+	uint32_t used = node->page_group_capacity;
+	uint32_t target = 0;
+	MemfsPageGroup** groups;
+
+	while (used && node->page_groups[used - 1U] == NULL)
+		used--;
+
+	if (used == 0) {
+		free(node->page_groups);
+		node->page_groups = NULL;
+		node->page_group_capacity = 0;
+		return;
+	}
+
+	target = 4U;
+	while (target < used && target <= UINT32_MAX / 2U)
+		target <<= 1;
+	if (target < used)
+		target = used;
+
+	if (target >= node->page_group_capacity)
+		return;
+
+	groups = realloc(node->page_groups, (size_t)target * sizeof(*groups));
+	if (groups) {
+		node->page_groups = groups;
+		node->page_group_capacity = target;
+	}
+}
+
+static void memfs_storage_destroy_pages(MemfsNode* node) {
+	uint32_t group_index;
+
+	for (group_index = 0; group_index < node->page_group_capacity; group_index++) {
+		MemfsPageGroup* group = node->page_groups[group_index];
+		uint32_t slot;
+
+		if (group == NULL)
+			continue;
+
+		for (slot = 0; slot < MEMFS_PAGES_PER_GROUP; slot++) {
+			if (group->pages[slot]) {
+				free(group->pages[slot]);
+				group->pages[slot] = NULL;
+				memfs_resident_sub(node, MEMFS_PAGE_SIZE);
+			}
+		}
+
+		free(group);
+	}
+
+	free(node->page_groups);
+	node->page_groups = NULL;
+	node->page_group_capacity = 0;
+}
+
+static void memfs_storage_destroy(MemfsNode* node) {
+	if (node->small_data) {
+		free(node->small_data);
+		memfs_resident_sub(node, node->small_capacity);
+		node->small_data = NULL;
+		node->small_capacity = 0;
+	}
+
+	memfs_storage_destroy_pages(node);
+}
+
+static MemfsResult memfs_storage_ensure_small(MemfsNode* node, uint64_t required_end) {
+	uint64_t aligned;
+	uint8_t* data;
+
+	if (required_end > MEMFS_PAGE_SIZE)
+		return MEMFS_ERR_INVALID;
+
+	aligned = memfs_align_allocation(required_end);
+	if (aligned == UINT64_MAX || aligned > MEMFS_PAGE_SIZE)
+		return MEMFS_ERR_NO_SPACE;
+
+	if (aligned <= node->small_capacity)
+		return MEMFS_OK;
+
+	data = realloc(node->small_data, (size_t)aligned);
+	if (data == NULL)
+		return MEMFS_ERR_NO_MEMORY;
+
+	memset(data + node->small_capacity, 0, (size_t)(aligned - node->small_capacity));
+
+	memfs_resident_add(node, aligned - node->small_capacity);
+	node->small_data = data;
+	node->small_capacity = (uint32_t)aligned;
+	return MEMFS_OK;
+}
+
+static MemfsResult memfs_storage_promote(MemfsNode* node) {
+	uint8_t* page;
+	MemfsResult result;
+
+	if (node->small_data == NULL)
+		return MEMFS_OK;
+
+	result = memfs_storage_ensure_page(node, 0, &page);
+	if (result != MEMFS_OK)
+		return result;
+
+	memcpy(page, node->small_data, node->small_capacity);
+	free(node->small_data);
+	memfs_resident_sub(node, node->small_capacity);
+	node->small_data = NULL;
+	node->small_capacity = 0;
+	return MEMFS_OK;
+}
+
+static void memfs_storage_trim_small(MemfsNode* node, uint64_t new_size) {
+	uint64_t target;
+	uint8_t* data;
+
+	if (node->small_data == NULL)
+		return;
+
+	if (new_size == 0) {
+		free(node->small_data);
+		memfs_resident_sub(node, node->small_capacity);
+		node->small_data = NULL;
+		node->small_capacity = 0;
+		return;
+	}
+
+	if (new_size < node->small_capacity) {
+		memset(node->small_data + new_size, 0, (size_t)(node->small_capacity - new_size));
+	}
+
+	target = memfs_align_allocation(new_size);
+	if (target == UINT64_MAX || target >= node->small_capacity)
+		return;
+
+	data = realloc(node->small_data, (size_t)target);
+	if (data == NULL)
+		return;
+
+	memfs_resident_sub(node, node->small_capacity - target);
+	node->small_data = data;
+	node->small_capacity = (uint32_t)target;
+}
+
+static void memfs_storage_trim_pages(MemfsNode* node, uint64_t new_size) {
+	uint64_t first_free_page = (new_size + MEMFS_PAGE_MASK) >> MEMFS_PAGE_SHIFT;
+	uint64_t tail_page = new_size >> MEMFS_PAGE_SHIFT;
+	uint32_t group_index;
+
+	if ((new_size & MEMFS_PAGE_MASK) != 0) {
+		uint8_t* page = memfs_storage_page(node, tail_page);
+
+		if (page) {
+			uint32_t in_page = (uint32_t)(new_size & MEMFS_PAGE_MASK);
+
+			memset(page + in_page, 0, MEMFS_PAGE_SIZE - in_page);
+		}
+	}
+
+	for (group_index = 0; group_index < node->page_group_capacity; group_index++) {
+		MemfsPageGroup* group = node->page_groups[group_index];
+		uint32_t slot;
+
+		if (group == NULL)
+			continue;
+
+		for (slot = 0; slot < MEMFS_PAGES_PER_GROUP; slot++) {
+			uint64_t page_index = ((uint64_t)group_index << MEMFS_PAGE_GROUP_SHIFT) | slot;
+
+			if (page_index < first_free_page)
+				continue;
+			if (group->pages[slot] == NULL)
+				continue;
+
+			free(group->pages[slot]);
+			group->pages[slot] = NULL;
+			group->present_pages--;
+			memfs_resident_sub(node, MEMFS_PAGE_SIZE);
+		}
+
+		if (group->present_pages == 0) {
+			free(group);
+			node->page_groups[group_index] = NULL;
+		}
+	}
+
+	memfs_storage_compact_groups(node);
+}
+
+static void memfs_storage_try_demote(MemfsNode* node, uint64_t new_size) {
+	uint64_t target;
+	uint8_t* data = NULL;
+	uint8_t* page;
+
+	if (node->page_groups == NULL || new_size > MEMFS_PAGE_SIZE)
+		return;
+
+	target = memfs_align_allocation(new_size);
+	if (target == UINT64_MAX || target > MEMFS_PAGE_SIZE)
+		return;
+
+	if (target) {
+		data = calloc(1, (size_t)target);
+		if (data == NULL)
+			return;
+
+		page = memfs_storage_page(node, 0);
+		if (page)
+			memcpy(data, page, (size_t)new_size);
+	}
+
+	memfs_storage_destroy_pages(node);
+	node->small_data = data;
+	node->small_capacity = (uint32_t)target;
+	if (target)
+		memfs_resident_add(node, target);
+}
+
+static void memfs_storage_trim_data(MemfsNode* node, uint64_t new_size) {
+	if (node->page_groups) {
+		memfs_storage_trim_pages(node, new_size);
+		memfs_storage_try_demote(node, new_size);
+	} else {
+		memfs_storage_trim_small(node, new_size);
+	}
+}
+
+static void memfs_storage_read_range(MemfsNode* node, uint8_t* buffer, uint64_t offset, uint64_t length) {
+	uint64_t done = 0;
+
+	if (length == 0)
+		return;
+
+	if (node->page_groups == NULL) {
+		uint64_t available = 0;
+
+		memset(buffer, 0, (size_t)length);
+		if (node->small_data == NULL || offset >= node->small_capacity)
+			return;
+
+		available = node->small_capacity - offset;
+		if (available > length)
+			available = length;
+
+		memcpy(buffer, node->small_data + offset, (size_t)available);
+		return;
+	}
+
+	while (done < length) {
+		uint64_t pos = offset + done;
+		uint64_t page_index = pos >> MEMFS_PAGE_SHIFT;
+		uint32_t in_page = (uint32_t)(pos & MEMFS_PAGE_MASK);
+		uint32_t span = MEMFS_PAGE_SIZE - in_page;
+		uint8_t* page = memfs_storage_page(node, page_index);
+
+		if (span > length - done)
+			span = (uint32_t)(length - done);
+
+		if (page)
+			memcpy(buffer + done, page + in_page, span);
+		else
+			memset(buffer + done, 0, span);
+
+		done += span;
+	}
+}
+
+static MemfsResult memfs_storage_write_range(MemfsNode* node, const uint8_t* buffer, uint64_t offset, uint64_t length) {
+	uint64_t end = offset + length;
+	uint64_t done;
+	MemfsResult result;
+
+	if (length == 0)
+		return MEMFS_OK;
+
+	if (end <= MEMFS_PAGE_SIZE && node->page_groups == NULL) {
+		result = memfs_storage_ensure_small(node, end);
+		if (result != MEMFS_OK)
+			return result;
+
+		memcpy(node->small_data + offset, buffer, (size_t)length);
+		return MEMFS_OK;
+	}
+
+	result = memfs_storage_promote(node);
+	if (result != MEMFS_OK)
+		return result;
+
+	// 第一遍只保证所有目标页都存在。这样一旦 malloc 失败，
+	// 不会出现部分用户数据已经写入、但整个 Write 返回失败的状态。
+	done = 0;
+	while (done < length) {
+		uint64_t pos = offset + done;
+		uint64_t page_index = pos >> MEMFS_PAGE_SHIFT;
+		uint32_t in_page = (uint32_t)(pos & MEMFS_PAGE_MASK);
+		uint32_t span = MEMFS_PAGE_SIZE - in_page;
+		uint8_t* page;
+
+		if (span > length - done)
+			span = (uint32_t)(length - done);
+
+		result = memfs_storage_ensure_page(node, page_index, &page);
+		if (result != MEMFS_OK)
+			return result;
+
+		done += span;
+	}
+
+	// 第二遍才真正写数据。
+	done = 0;
+	while (done < length) {
+		uint64_t pos = offset + done;
+		uint64_t page_index = pos >> MEMFS_PAGE_SHIFT;
+		uint32_t in_page = (uint32_t)(pos & MEMFS_PAGE_MASK);
+		uint32_t span = MEMFS_PAGE_SIZE - in_page;
+		uint8_t* page = memfs_storage_page(node, page_index);
+
+		if (span > length - done)
+			span = (uint32_t)(length - done);
+
+		memcpy(page + in_page, buffer + done, span);
+		done += span;
+	}
+
+	return MEMFS_OK;
+}
 static void memfs_node_free(MemfsNode* node) {
 	Memfs* fs;
 
@@ -89,14 +524,13 @@ static void memfs_node_free(MemfsNode* node) {
 	if (node->allocation_size <= fs->used_bytes)
 		fs->used_bytes -= node->allocation_size;
 
+	memfs_storage_destroy(node);
 	memfs_all_remove(fs, node);
 	memfs_dir_destroy(node->dir);
-	free(node->data);
 	free(node->security);
 	free(node->name);
 	free(node);
 }
-
 static MemfsResult memfs_copy_security(PSECURITY_DESCRIPTOR security, PSECURITY_DESCRIPTOR* out_security,
 									   uint32_t* out_size) {
 	uint32_t size;
@@ -301,39 +735,30 @@ static MemfsResult memfs_node_alloc(Memfs* fs, MemfsNode* parent, const wchar_t*
 static MemfsResult memfs_resize_allocation(MemfsNode* node, uint64_t allocation_size) {
 	Memfs* fs = node->fs;
 	uint64_t old_size = node->allocation_size;
-	uint8_t* data;
 
 	if (allocation_size == old_size)
 		return MEMFS_OK;
 
-	if (allocation_size > SIZE_MAX)
-		return MEMFS_ERR_NO_SPACE;
-
 	if (allocation_size > old_size) {
 		uint64_t delta = allocation_size - old_size;
 
-		if (delta > fs->capacity - fs->used_bytes)
+		if (fs->used_bytes > fs->capacity || delta > fs->capacity - fs->used_bytes) {
 			return MEMFS_ERR_NO_SPACE;
-	}
+		}
 
-	if (allocation_size == 0) {
-		free(node->data);
-		node->data = NULL;
+		fs->used_bytes += delta;
 	} else {
-		data = realloc(node->data, (size_t)allocation_size);
-		if (data == NULL)
-			return MEMFS_ERR_NO_MEMORY;
+		uint64_t delta = old_size - allocation_size;
 
-		if (allocation_size > old_size)
-			memset(data + old_size, 0, (size_t)(allocation_size - old_size));
+		// 缩小 AllocationSize 时，超出新边界的 resident page
+		// 可以立即释放；页尾也会清零，避免以后扩容看到旧数据。
+		memfs_storage_trim_data(node, allocation_size);
 
-		node->data = data;
+		if (delta > fs->used_bytes)
+			fs->used_bytes = 0;
+		else
+			fs->used_bytes -= delta;
 	}
-
-	if (allocation_size > old_size)
-		fs->used_bytes += allocation_size - old_size;
-	else
-		fs->used_bytes -= old_size - allocation_size;
 
 	node->allocation_size = allocation_size;
 	if (node->file_size > allocation_size)
@@ -341,7 +766,6 @@ static MemfsResult memfs_resize_allocation(MemfsNode* node, uint64_t allocation_
 
 	return MEMFS_OK;
 }
-
 uint64_t memfs_now(void) {
 	FILETIME ft;
 	ULARGE_INTEGER value;
@@ -404,14 +828,8 @@ void memfs_destroy(Memfs* fs) {
 	if (fs == NULL)
 		return;
 
-	while ((node = fs->all_head) != NULL) {
-		memfs_all_remove(fs, node);
-		memfs_dir_destroy(node->dir);
-		free(node->data);
-		free(node->security);
-		free(node->name);
-		free(node);
-	}
+	while ((node = fs->all_head) != NULL)
+		memfs_node_free(node);
 
 	free(fs);
 }
@@ -732,8 +1150,8 @@ MemfsResult memfs_node_set_file_size(MemfsNode* node, uint64_t new_size) {
 			return result;
 	}
 
-	if (new_size > old_file_size && node->data)
-		memset(node->data + old_file_size, 0, (size_t)(new_size - old_file_size));
+	if (new_size < old_file_size)
+		memfs_storage_trim_data(node, new_size);
 
 	node->file_size = new_size;
 	node->change_time = memfs_now();
@@ -749,6 +1167,8 @@ MemfsResult memfs_node_read(MemfsNode* node, void* buffer, uint64_t offset, uint
 		return MEMFS_ERR_IS_DIRECTORY;
 
 	*bytes_read = 0;
+	if (length == 0)
+		return MEMFS_OK;
 	if (offset >= node->file_size)
 		return MEMFS_ERR_NOT_FOUND;
 
@@ -758,7 +1178,8 @@ MemfsResult memfs_node_read(MemfsNode* node, void* buffer, uint64_t offset, uint
 	if (end > node->file_size)
 		end = node->file_size;
 
-	memcpy(buffer, node->data + offset, (size_t)(end - offset));
+	memfs_storage_read_range(node, buffer, offset, end - offset);
+
 	*bytes_read = (uint32_t)(end - offset);
 	node->last_access_time = memfs_now();
 	return MEMFS_OK;
@@ -767,6 +1188,9 @@ MemfsResult memfs_node_read(MemfsNode* node, void* buffer, uint64_t offset, uint
 MemfsResult memfs_node_write(MemfsNode* node, const void* buffer, uint64_t offset, uint32_t length, bool write_to_end,
 							 bool constrained_io, uint32_t* bytes_written) {
 	uint64_t end;
+	uint64_t write_length;
+	uint64_t old_allocation;
+	bool allocation_grew = false;
 	MemfsResult result;
 
 	if (node == NULL || buffer == NULL || bytes_written == NULL)
@@ -775,39 +1199,54 @@ MemfsResult memfs_node_write(MemfsNode* node, const void* buffer, uint64_t offse
 		return MEMFS_ERR_IS_DIRECTORY;
 
 	*bytes_written = 0;
+	old_allocation = node->allocation_size;
+
+	if (length == 0)
+		return MEMFS_OK;
 
 	if (write_to_end)
 		offset = node->file_size;
+
+	end = offset + length;
+	if (end < offset)
+		return MEMFS_ERR_INVALID;
 
 	if (constrained_io) {
 		if (offset >= node->file_size)
 			return MEMFS_OK;
 
-		end = offset + length;
-		if (end < offset)
-			return MEMFS_ERR_INVALID;
 		if (end > node->file_size)
 			end = node->file_size;
-	} else {
-		end = offset + length;
-		if (end < offset)
-			return MEMFS_ERR_INVALID;
+	} else if (end > node->allocation_size) {
+		uint64_t new_allocation = memfs_align_allocation(end);
 
-		if (end > node->file_size) {
-			result = memfs_node_set_file_size(node, end);
-			if (result != MEMFS_OK)
-				return result;
-		}
+		if (new_allocation == UINT64_MAX)
+			return MEMFS_ERR_NO_SPACE;
+
+		result = memfs_resize_allocation(node, new_allocation);
+		if (result != MEMFS_OK)
+			return result;
+
+		allocation_grew = true;
 	}
 
-	memcpy(node->data + offset, buffer, (size_t)(end - offset));
-	*bytes_written = (uint32_t)(end - offset);
+	write_length = end - offset;
+	result = memfs_storage_write_range(node, (const uint8_t*)buffer, offset, write_length);
+	if (result != MEMFS_OK) {
+		if (allocation_grew)
+			memfs_resize_allocation(node, old_allocation);
+		return result;
+	}
+
+	if (!constrained_io && end > node->file_size)
+		node->file_size = end;
+
+	*bytes_written = (uint32_t)write_length;
 	node->last_write_time = memfs_now();
 	node->change_time = node->last_write_time;
 	node->attributes |= FILE_ATTRIBUTE_ARCHIVE;
 	return MEMFS_OK;
 }
-
 MemfsResult memfs_node_replace_security(MemfsNode* node, PSECURITY_DESCRIPTOR security, uint32_t security_size) {
 	PSECURITY_DESCRIPTOR copy;
 

@@ -101,7 +101,14 @@ Nodes store only their component name and parent pointer. Full paths are resolve
 
 ### File data
 
-File contents live in one dynamically sized memory buffer per file. Allocation size is rounded to 512 bytes and counted against the configured volume capacity. Extending a file zero-fills the new range.
+File data uses two storage modes:
+
+- files up to 4 KiB use a small buffer that grows in 512-byte units, so tiny files do not pay a 4 KiB page cost;
+- larger or high-offset files use a two-level sparse page table with 4 KiB data pages. A second-level table covers 1 MiB of file address space and is allocated only when a page in that range is written.
+
+`AllocationSize` is still reserved in 512-byte units and counted against the configured volume capacity, preserving Windows `FileSize <= AllocationSize` semantics. Resident data pages are allocated only on write. Extending a large file therefore does not allocate or zero the whole range; unread holes return zeroes. Truncation releases pages, and small files can demote back to the compact buffer representation.
+
+In the current benchmark, appending 32 MiB in 64 KiB writes dropped from roughly 1.4 s with the original single-`realloc` buffer to about 9 ms with paged storage. Extending an empty file to 64 MiB no longer immediately commits about 64 MiB of process memory.
 
 ### Handle lifetime and deletion
 
@@ -129,7 +136,6 @@ tests/
 ## Planned next steps
 
 - Fine-grained locking for parallel I/O.
-- Optional chunked file storage to avoid realloc/copy for large files.
 - Named streams, reparse points and extended attributes.
 - Persistence/snapshot support.
 - Richer stress tests for rename/delete/open races.
