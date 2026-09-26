@@ -4,7 +4,9 @@ param(
 
     [string]$Drive = "R:",
 
-    [string]$Size = "64M"
+    [string]$Size = "64M",
+
+    [string[]]$ExtraArgs = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,21 +26,19 @@ $stderr = Join-Path $logDir "integration.stderr.log"
 
 Remove-Item $stdout, $stderr -Force -ErrorAction SilentlyContinue
 
-$process = Start-Process `
-    -FilePath $exePath `
-    -ArgumentList @("--mount", $Drive, "--size", $Size, "--label", "MEMTEST") `
-    -RedirectStandardOutput $stdout `
-    -RedirectStandardError $stderr `
-    -PassThru
+$arguments = @(
+    "--mount", $Drive,
+    "--size", $Size,
+    "--label", "MEMTEST"
+) + $ExtraArgs
+
+$process = Start-Process -FilePath $exePath -ArgumentList $arguments -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
 
 try {
     $mounted = $false
     for ($i = 0; $i -lt 50; $i++) {
         Start-Sleep -Milliseconds 100
-        if (Test-Path "$Drive\") {
-            $mounted = $true
-            break
-        }
+        if (Test-Path "$Drive\") { $mounted = $true; break }
         if ($process.HasExited) { break }
     }
 
@@ -60,16 +60,36 @@ try {
         throw "binary readback mismatch"
     }
 
+    $stream = [IO.File]::Open("$Drive\dir\sparse.bin", [IO.FileMode]::Create, [IO.FileAccess]::ReadWrite)
+    try {
+        $stream.SetLength(8MB)
+        $stream.Position = 4MB + 17
+        $stream.WriteByte(0x7d)
+        $stream.Position = 4MB
+        $check = New-Object byte[] 32
+        [void]$stream.Read($check, 0, $check.Length)
+        if ($check[17] -ne 0x7d) { throw "sparse write/read mismatch" }
+        for ($i = 0; $i -lt $check.Length; $i++) {
+            if ($i -ne 17 -and $check[$i] -ne 0) {
+                throw "sparse hole was not zero-filled"
+            }
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+
     Rename-Item "$Drive\hello.txt" "renamed.txt"
     Move-Item "$Drive\renamed.txt" "$Drive\dir\moved.txt"
 
     $names = @(Get-ChildItem "$Drive\dir" | Sort-Object Name | Select-Object -ExpandProperty Name)
-    if (($names -join ",") -ne "data.bin,moved.txt") {
+    if (($names -join ",") -ne "data.bin,moved.txt,sparse.bin") {
         throw "directory enumeration mismatch: $($names -join ',')"
     }
 
     Remove-Item "$Drive\dir\moved.txt"
     Remove-Item "$Drive\dir\data.bin"
+    Remove-Item "$Drive\dir\sparse.bin"
     Remove-Item "$Drive\dir"
 
     if ((Get-ChildItem "$Drive\" | Measure-Object).Count -ne 0) {

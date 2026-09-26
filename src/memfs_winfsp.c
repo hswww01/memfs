@@ -29,6 +29,8 @@ static NTSTATUS memfs_status(MemfsResult result) {
 		return STATUS_INSUFFICIENT_RESOURCES;
 	case MEMFS_ERR_ACCESS:
 		return STATUS_ACCESS_DENIED;
+	case MEMFS_ERR_DATA:
+		return STATUS_DATA_ERROR;
 	case MEMFS_ERR_INVALID:
 	default:
 		return STATUS_INVALID_PARAMETER;
@@ -66,7 +68,7 @@ static void memfs_fill_volume_info(Memfs* fs, FSP_FSCTL_VOLUME_INFO* volume_info
 	memset(volume_info, 0, sizeof(*volume_info));
 
 	volume_info->TotalSize = fs->capacity;
-	volume_info->FreeSize = fs->used_bytes <= fs->capacity ? fs->capacity - fs->used_bytes : 0;
+	volume_info->FreeSize = memfs_free_bytes(fs);
 
 	volume_info->VolumeLabelLength = fs->volume_label_bytes;
 	memcpy(volume_info->VolumeLabel, fs->volume_label, fs->volume_label_bytes);
@@ -474,7 +476,7 @@ static NTSTATUS fs_ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_contex
 		}
 	}
 
-	for (node = memfs_dir_first(dir); node; node = node->sibling_next) {
+	for (node = memfs_dir_first(dir); node; node = memfs_dir_next(node)) {
 		if (node->deleted)
 			continue;
 		if (marker && _wcsicmp(node->name, marker) <= 0)
@@ -550,13 +552,13 @@ static const FSP_FILE_SYSTEM_INTERFACE g_memfs_interface = {
 	.GetDirInfoByName = fs_GetDirInfoByName,
 };
 
-NTSTATUS memfs_winfsp_create(uint64_t capacity, const wchar_t* volume_label, MemfsWinFsp** out_instance) {
+NTSTATUS memfs_winfsp_create(const MemfsOptions* options, MemfsWinFsp** out_instance) {
 	FSP_FSCTL_VOLUME_PARAMS volume_params;
 	MemfsWinFsp* instance;
 	MemfsResult result;
 	NTSTATUS status;
 
-	if (out_instance == NULL)
+	if (options == NULL || out_instance == NULL)
 		return STATUS_INVALID_PARAMETER;
 
 	*out_instance = NULL;
@@ -565,7 +567,7 @@ NTSTATUS memfs_winfsp_create(uint64_t capacity, const wchar_t* volume_label, Mem
 	if (instance == NULL)
 		return STATUS_INSUFFICIENT_RESOURCES;
 
-	result = memfs_create(capacity, volume_label, &instance->store);
+	result = memfs_create_ex(options, &instance->store);
 	if (result != MEMFS_OK) {
 		free(instance);
 		return memfs_status(result);
@@ -600,12 +602,12 @@ NTSTATUS memfs_winfsp_create(uint64_t capacity, const wchar_t* volume_label, Mem
 	}
 
 	instance->file_system->UserContext = instance;
-	FspFileSystemSetOperationGuardStrategy(instance->file_system, FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_COARSE);
+
+	FspFileSystemSetOperationGuardStrategy(instance->file_system, FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE);
 
 	*out_instance = instance;
 	return STATUS_SUCCESS;
 }
-
 NTSTATUS memfs_winfsp_mount(MemfsWinFsp* instance, const wchar_t* mount_point) {
 	if (instance == NULL || mount_point == NULL)
 		return STATUS_INVALID_PARAMETER;

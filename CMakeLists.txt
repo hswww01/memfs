@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(memfs
-	VERSION 0.1.0
+	VERSION 0.2.0
 	LANGUAGES C)
 
 if(NOT WIN32)
@@ -11,6 +11,9 @@ endif()
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
+
+find_package(unofficial-sodium CONFIG REQUIRED)
+find_package(zstd CONFIG REQUIRED)
 
 set(WINFSP_ROOT "" CACHE PATH "WinFsp installation root")
 
@@ -65,7 +68,9 @@ target_compile_definitions(memfs_core
 
 target_link_libraries(memfs_core
 	PUBLIC
-		advapi32)
+		advapi32
+		unofficial-sodium::sodium
+		zstd::libzstd)
 
 add_executable(memfs
 	src/main.c
@@ -87,22 +92,6 @@ target_link_libraries(memfs
 		${WINFSP_LIBRARY}
 		advapi32)
 
-if(MSVC)
-	foreach(target memfs_core memfs)
-		target_compile_options(${target}
-			PRIVATE
-				/W4
-				/utf-8)
-	endforeach()
-endif()
-
-if(WINFSP_RUNTIME)
-	add_custom_command(TARGET memfs POST_BUILD
-		COMMAND ${CMAKE_COMMAND} -E copy_if_different
-			"${WINFSP_RUNTIME}"
-			"$<TARGET_FILE_DIR:memfs>")
-endif()
-
 enable_testing()
 
 add_executable(memfs_core_test
@@ -113,8 +102,23 @@ target_link_libraries(memfs_core_test
 		memfs_core)
 
 if(MSVC)
-	target_compile_options(memfs_core_test PRIVATE /W4 /utf-8)
-	target_compile_definitions(memfs_core_test PRIVATE _CRT_SECURE_NO_WARNINGS)
+	foreach(target memfs_core memfs memfs_core_test)
+		target_compile_options(${target}
+			PRIVATE
+				/W4
+				/utf-8)
+	endforeach()
+
+	target_compile_definitions(memfs_core_test
+		PRIVATE
+			_CRT_SECURE_NO_WARNINGS)
+endif()
+
+if(WINFSP_RUNTIME)
+	add_custom_command(TARGET memfs POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different
+			"${WINFSP_RUNTIME}"
+			"$<TARGET_FILE_DIR:memfs>")
 endif()
 
 add_test(NAME memfs_core_test COMMAND memfs_core_test)

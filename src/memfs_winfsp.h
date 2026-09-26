@@ -9,7 +9,7 @@ typedef struct MemfsWinFsp {
 	Memfs* store;
 } MemfsWinFsp;
 
-NTSTATUS memfs_winfsp_create(uint64_t capacity, const wchar_t* volume_label, MemfsWinFsp** out_instance);
+NTSTATUS memfs_winfsp_create(const MemfsOptions* options, MemfsWinFsp** out_instance);
 
 NTSTATUS memfs_winfsp_mount(MemfsWinFsp* instance, const wchar_t* mount_point);
 NTSTATUS memfs_winfsp_start(MemfsWinFsp* instance, uint32_t thread_count);
