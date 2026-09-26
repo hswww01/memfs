@@ -1,4 +1,5 @@
 #include "memfs_core.h"
+#include "memfs_object.h"
 
 #include <intrin.h>
 #include <sddl.h>
@@ -7,23 +8,6 @@
 #include <wctype.h>
 
 #define MEMFS_DEFAULT_SDDL L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)"
-
-static wchar_t* memfs_wcsdup(const wchar_t* s) {
-	size_t chars;
-	wchar_t* copy;
-
-	if (s == NULL)
-		return NULL;
-
-	chars = wcslen(s) + 1;
-	if (chars > SIZE_MAX / sizeof(wchar_t))
-		return NULL;
-
-	copy = malloc(chars * sizeof(wchar_t));
-	if (copy)
-		memcpy(copy, s, chars * sizeof(wchar_t));
-	return copy;
-}
 
 static void memfs_dir_destroy(MemfsDir* dir) {
 	if (dir == NULL)
@@ -556,13 +540,13 @@ static MemfsResult memfs_storage_ensure_group(MemfsNode* node, uint64_t group_in
 		return MEMFS_OK;
 	}
 
-	group = calloc(1, sizeof(*group));
+	group = memfs_allocator_alloc_page_group(&node->fs->allocator);
 	if (group == NULL)
 		return MEMFS_ERR_NO_MEMORY;
 
 	result = memfs_storage_group_reserve(node, node->page_group_count + 1U);
 	if (result != MEMFS_OK) {
-		free(group);
+		memfs_allocator_free_page_group(&node->fs->allocator, group);
 		return result;
 	}
 
@@ -587,7 +571,7 @@ static void memfs_storage_remove_group(MemfsNode* node, uint64_t group_index) {
 
 	group = node->page_groups[pos].group;
 	free(group->pages);
-	free(group);
+	memfs_allocator_free_page_group(&node->fs->allocator, group);
 
 	memmove(node->page_groups + pos, node->page_groups + pos + 1U,
 			(size_t)(node->page_group_count - pos - 1U) * sizeof(*node->page_groups));
@@ -709,7 +693,7 @@ static void memfs_storage_destroy_pages(MemfsNode* node) {
 		}
 
 		free(group->pages);
-		free(group);
+		memfs_allocator_free_page_group(&node->fs->allocator, group);
 	}
 
 	free(node->page_groups);
@@ -1300,16 +1284,17 @@ static void memfs_node_free(MemfsNode* node) {
 
 	fs = node->fs;
 
-	if (MEMFS_NODE_IS_DIRECTORY(node))
+	if (MEMFS_NODE_IS_DIRECTORY(node)) {
 		memfs_dir_destroy(node->dir);
-	else
+		memfs_object_free_dir(fs, node->dir);
+	} else {
 		memfs_storage_destroy(node);
+	}
 
 	memfs_atomic_sub_clamped(&fs->used_bytes, node->file_size);
 	memfs_security_release(node->security);
-	if (node->name_external)
-		free(node->name);
-	free(node);
+	memfs_object_free_name(fs, node->name);
+	memfs_object_free_node(fs, node);
 }
 static void memfs_destroy_namespace_node(MemfsNode* node);
 
@@ -1792,33 +1777,26 @@ static void memfs_touch_directory(MemfsNode* dir) {
 static MemfsResult memfs_node_alloc(Memfs* fs, MemfsNode* parent, const wchar_t* name, bool directory,
 									uint32_t attributes, PSECURITY_DESCRIPTOR security, MemfsNode** out_node) {
 	const wchar_t* source_name = name ? name : L"";
-	size_t name_chars = wcslen(source_name) + 1U;
-	size_t name_bytes;
-	size_t dir_bytes = directory ? sizeof(MemfsDir) : 0U;
-	size_t total_size;
-	uint8_t* cursor;
 	MemfsNode* node;
 	MemfsResult result;
 
-	if (name_chars > SIZE_MAX / sizeof(wchar_t))
-		return MEMFS_ERR_NO_MEMORY;
+	if (fs == NULL || out_node == NULL)
+		return MEMFS_ERR_INVALID;
 
-	name_bytes = name_chars * sizeof(wchar_t);
-	if (sizeof(*node) > SIZE_MAX - dir_bytes || sizeof(*node) + dir_bytes > SIZE_MAX - name_bytes) {
-		return MEMFS_ERR_NO_MEMORY;
-	}
+	*out_node = NULL;
 
-	total_size = sizeof(*node) + dir_bytes + name_bytes;
-	node = calloc(1, total_size);
+	node = memfs_object_alloc_node(fs);
 	if (node == NULL)
 		return MEMFS_ERR_NO_MEMORY;
 
 	node->fs = fs;
-	cursor = (uint8_t*)node + sizeof(*node);
 
 	if (directory) {
-		node->dir = (MemfsDir*)cursor;
-		cursor += sizeof(MemfsDir);
+		node->dir = memfs_object_alloc_dir(fs);
+		if (node->dir == NULL) {
+			memfs_object_free_node(fs, node);
+			return MEMFS_ERR_NO_MEMORY;
+		}
 		attributes |= FILE_ATTRIBUTE_DIRECTORY;
 	} else {
 		attributes &= ~FILE_ATTRIBUTE_DIRECTORY;
@@ -1826,9 +1804,14 @@ static MemfsResult memfs_node_alloc(Memfs* fs, MemfsNode* parent, const wchar_t*
 			attributes = FILE_ATTRIBUTE_NORMAL;
 	}
 
-	node->name = (wchar_t*)cursor;
-	memcpy(node->name, source_name, name_bytes);
-	node->name_external = false;
+	node->name = memfs_object_dup_name(fs, source_name);
+	if (node->name == NULL) {
+		if (directory)
+			memfs_object_free_dir(fs, node->dir);
+		memfs_object_free_node(fs, node);
+		return MEMFS_ERR_NO_MEMORY;
+	}
+
 	node->name_hash = memfs_name_hash(node->name);
 
 	if (security) {
@@ -1848,10 +1831,10 @@ static MemfsResult memfs_node_alloc(Memfs* fs, MemfsNode* parent, const wchar_t*
 	}
 
 	if (result != MEMFS_OK) {
-		if (MEMFS_NODE_IS_DIRECTORY(node))
-			if (directory)
-				memfs_dir_destroy(node->dir);
-		free(node);
+		memfs_object_free_name(fs, node->name);
+		if (directory)
+			memfs_object_free_dir(fs, node->dir);
+		memfs_object_free_node(fs, node);
 		return result;
 	}
 
@@ -1983,6 +1966,11 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 	if (fs == NULL)
 		return MEMFS_ERR_NO_MEMORY;
 
+	if (!memfs_allocator_init(&fs->allocator, sizeof(MemfsNode), sizeof(MemfsDir), sizeof(MemfsPageGroup))) {
+		free(fs);
+		return MEMFS_ERR_NO_MEMORY;
+	}
+
 	fs->capacity = options->capacity;
 	fs->next_index = 1;
 	randombytes_buf(&fs->treap_seed, sizeof(fs->treap_seed));
@@ -2033,6 +2021,7 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 			sodium_memzero(fs->encryption_key, MEMFS_ENCRYPTION_KEY_SIZE);
 			(void)sodium_munlock(fs->encryption_key, MEMFS_ENCRYPTION_KEY_SIZE);
 		}
+		memfs_allocator_destroy(&fs->allocator);
 		free(fs);
 		return result;
 	}
@@ -2071,6 +2060,7 @@ void memfs_destroy(Memfs* fs) {
 		(void)sodium_munlock(fs->encryption_key, MEMFS_ENCRYPTION_KEY_SIZE);
 	}
 
+	memfs_allocator_destroy(&fs->allocator);
 	free(fs);
 }
 
@@ -2380,7 +2370,7 @@ MemfsResult memfs_node_rename(MemfsNode* node, MemfsNode* new_parent, const wcha
 			return MEMFS_ERR_NOT_EMPTY;
 	}
 
-	new_name_copy = memfs_wcsdup(new_name);
+	new_name_copy = memfs_object_dup_name(node->fs, new_name);
 	if (new_name_copy == NULL)
 		return MEMFS_ERR_NO_MEMORY;
 
@@ -2400,11 +2390,9 @@ MemfsResult memfs_node_rename(MemfsNode* node, MemfsNode* new_parent, const wcha
 	old_parent = node->parent;
 	memfs_dir_remove(node);
 
-	if (node->name_external)
-		free(node->name);
+	memfs_object_free_name(node->fs, node->name);
 
 	node->name = new_name_copy;
-	node->name_external = true;
 	node->name_hash = memfs_name_hash(node->name);
 	memfs_dir_insert(new_parent, node);
 

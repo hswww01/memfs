@@ -56,7 +56,9 @@ find_file(WINFSP_RUNTIME
 	HINTS ${_winfsp_bin_hints})
 
 add_library(memfs_core STATIC
-	src/memfs_core.c)
+	src/memfs_core.c
+	src/memfs_alloc.c
+	src/memfs_object.c)
 
 target_include_directories(memfs_core
 	PUBLIC
@@ -101,8 +103,16 @@ target_link_libraries(memfs_core_test
 	PRIVATE
 		memfs_core)
 
+add_executable(memfs_bench
+	bench/memfs_bench.c)
+
+target_link_libraries(memfs_bench
+	PRIVATE
+		memfs_core
+		psapi)
+
 if(MSVC)
-	foreach(target memfs_core memfs memfs_core_test)
+	foreach(target memfs_core memfs memfs_core_test memfs_bench)
 		target_compile_options(${target}
 			PRIVATE
 				/W4

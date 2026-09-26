@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <wchar.h>
+#include "memfs_alloc.h"
 
 #define MEMFS_ALLOCATION_UNIT 512U
 #define MEMFS_MAX_NAME 255U
@@ -150,14 +151,15 @@ struct MemfsNode {
 	uint16_t small_capacity;
 	uint8_t small_inline : 1;
 	uint8_t deleted : 1;
-	uint8_t name_external : 1;
-	uint8_t reserved_flags : 5;
+	uint8_t reserved_flags : 6;
 	int8_t compression_score;
 };
 
 #define MEMFS_NODE_IS_DIRECTORY(node) ((node) != NULL && 0 != ((node)->attributes & FILE_ATTRIBUTE_DIRECTORY))
 
 struct Memfs {
+	MemfsAllocator allocator;
+
 	MemfsNode* root;
 
 	// 仅保存已经从 namespace 移除但仍被 open handle 引用的节点。

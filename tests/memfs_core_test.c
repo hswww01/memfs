@@ -128,7 +128,7 @@ static void test_rename_and_delete(void) {
 	CHECK(memfs_lookup_path(fs, L"\\A\\x.txt", &found) == MEMFS_ERR_NOT_FOUND);
 	CHECK(memfs_lookup_path(fs, L"\\B\\y.txt", &found) == MEMFS_OK);
 	CHECK(found == file);
-	CHECK(file->name_external);
+	CHECK(wcscmp(file->name, L"y.txt") == 0);
 
 	CHECK(memfs_node_unlink(b) == MEMFS_ERR_NOT_EMPTY);
 	CHECK(memfs_node_unlink(file) == MEMFS_OK);
@@ -904,6 +904,46 @@ static void test_concurrent_files(void) {
 	memfs_destroy(fs);
 }
 
+static void test_allocator_reclaim(void) {
+	enum { FILES = 20000 };
+	Memfs* fs = NULL;
+	MemfsNode* node;
+	MemfsAllocatorStats before_delete;
+	MemfsAllocatorStats after_delete;
+	uint32_t i;
+	wchar_t name[32];
+
+	printf("== allocator reclaim ==\n");
+
+	CHECK(memfs_create(8 * 1024 * 1024ULL, L"ALLOC", &fs) == MEMFS_OK);
+	if (fs == NULL)
+		return;
+
+	for (i = 0; i < FILES; i++) {
+		swprintf_s(name, _countof(name), L"f%05u", i);
+		CHECK(memfs_node_create(fs, fs->root, name, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) == MEMFS_OK);
+		memfs_node_close(node);
+	}
+
+	memfs_allocator_get_stats(&fs->allocator, &before_delete);
+	CHECK(before_delete.live_objects > FILES);
+	CHECK(before_delete.reserved_bytes > 1024 * 1024ULL);
+
+	for (i = 0; i < FILES; i++) {
+		swprintf_s(name, _countof(name), L"f%05u", i);
+		node = memfs_dir_lookup(fs->root, name);
+		CHECK(node != NULL);
+		if (node)
+			CHECK(memfs_node_unlink(node) == MEMFS_OK);
+	}
+
+	memfs_allocator_get_stats(&fs->allocator, &after_delete);
+	CHECK(after_delete.live_objects == 3);
+	CHECK(after_delete.reserved_bytes < 1024 * 1024ULL);
+
+	memfs_destroy(fs);
+}
+
 int main(void) {
 	setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -923,6 +963,7 @@ int main(void) {
 	test_compression_encryption();
 	test_shared_security();
 	test_concurrent_files();
+	test_allocator_reclaim();
 
 	printf("\nchecks=%d failures=%d => %s\n", g_checks, g_failures, g_failures ? "FAIL" : "PASS");
 
