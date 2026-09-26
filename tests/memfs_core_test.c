@@ -1,4 +1,5 @@
 #include <Windows.h>
+#include <sddl.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -98,8 +99,10 @@ static void test_io_and_resize(void) {
 	CHECK(file->file_size == 512);
 
 	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	CHECK(fs->orphan_head == file);
 	memfs_node_close(file);
-	CHECK(fs->used_bytes == 0);
+	CHECK(fs->orphan_head == NULL);
+	CHECK((uint64_t)fs->used_bytes == 0);
 
 	memfs_destroy(fs);
 }
@@ -125,6 +128,7 @@ static void test_rename_and_delete(void) {
 	CHECK(memfs_lookup_path(fs, L"\\A\\x.txt", &found) == MEMFS_ERR_NOT_FOUND);
 	CHECK(memfs_lookup_path(fs, L"\\B\\y.txt", &found) == MEMFS_OK);
 	CHECK(found == file);
+	CHECK(file->name_external);
 
 	CHECK(memfs_node_unlink(b) == MEMFS_ERR_NOT_EMPTY);
 	CHECK(memfs_node_unlink(file) == MEMFS_OK);
@@ -150,11 +154,12 @@ static void test_capacity(void) {
 
 	CHECK(memfs_create(1536, L"TINY", &fs) == MEMFS_OK);
 	CHECK(memfs_node_create(fs, fs->root, L"a", false, FILE_ATTRIBUTE_NORMAL, NULL, 1024, &a) == MEMFS_OK);
+	CHECK(memfs_node_write(a, buffer, 0, 1024, false, false, &written) == MEMFS_OK);
+	CHECK(written == 1024);
+	CHECK(memfs_free_bytes(fs) == 512);
 
-	CHECK(memfs_node_create(fs, fs->root, L"b", false, FILE_ATTRIBUTE_NORMAL, NULL, 1024, &b) == MEMFS_ERR_NO_SPACE);
-
-	CHECK(memfs_node_create(fs, fs->root, L"b", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &b) == MEMFS_OK);
-
+	// AllocationSize preallocation does not consume byte-granular logical quota.
+	CHECK(memfs_node_create(fs, fs->root, L"b", false, FILE_ATTRIBUTE_NORMAL, NULL, 1024, &b) == MEMFS_OK);
 	CHECK(memfs_node_write(b, buffer, 0, 1024, false, false, &written) == MEMFS_ERR_NO_SPACE);
 
 	CHECK(memfs_node_unlink(a) == MEMFS_OK);
@@ -193,6 +198,10 @@ static void test_directory_order(void) {
 		}
 	}
 	CHECK(p == NULL);
+	CHECK(memfs_dir_upper_bound(fs->root, L"") == nodes[1]);
+	CHECK(memfs_dir_upper_bound(fs->root, L"Alpha") == nodes[3]);
+	CHECK(memfs_dir_upper_bound(fs->root, L"Delta") == nodes[2]);
+	CHECK(memfs_dir_upper_bound(fs->root, L"zeta") == NULL);
 
 	for (i = 0; i < 5; i++) {
 		CHECK(memfs_node_unlink(nodes[i]) == MEMFS_OK);
@@ -216,20 +225,39 @@ static void test_small_storage(void) {
 
 	CHECK(memfs_node_write(file, &value, 0, 1, false, false, &transferred) == MEMFS_OK);
 	CHECK(transferred == 1);
-	CHECK(file->small_page != NULL);
-	CHECK(file->page_groups == NULL);
-	CHECK(file->small_capacity == MEMFS_SMALL_GRANULE);
-	CHECK(file->resident_bytes < MEMFS_ALLOCATION_UNIT);
-	CHECK(fs->resident_bytes < MEMFS_ALLOCATION_UNIT);
-	CHECK(file->allocation_size == MEMFS_ALLOCATION_UNIT);
+	CHECK(file->small_inline);
+	CHECK(file->page_group_count == 0);
+	CHECK(file->small_capacity == 1);
+	CHECK(memfs_node_resident_bytes(file) == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+	CHECK(file->allocation_size == 1);
+	CHECK((uint64_t)fs->used_bytes == 1);
 
 	CHECK(memfs_node_read(file, &out, 0, 1, &transferred) == MEMFS_OK);
 	CHECK(out == value);
 
+	CHECK(memfs_node_write(file, &value, 1, 1, false, false, &transferred) == MEMFS_OK);
+	CHECK(file->small_capacity == 2);
+	CHECK(memfs_node_resident_bytes(file) == 0);
+	CHECK(file->allocation_size == 2);
+	CHECK((uint64_t)fs->used_bytes == 2);
+
+	CHECK(memfs_node_write(file, &value, 2, 1, false, false, &transferred) == MEMFS_OK);
+	CHECK(file->small_capacity == 4);
+	CHECK(memfs_node_resident_bytes(file) == 0);
+	CHECK(file->allocation_size == 3);
+	CHECK((uint64_t)fs->used_bytes == 3);
+
+	CHECK(memfs_node_write(file, &value, 4, 1, false, false, &transferred) == MEMFS_OK);
+	CHECK(file->small_capacity == 8);
+	CHECK(memfs_node_resident_bytes(file) == 0);
+	CHECK(file->allocation_size == 5);
+	CHECK((uint64_t)fs->used_bytes == 5);
+
 	CHECK(memfs_node_unlink(file) == MEMFS_OK);
 	memfs_node_close(file);
-	CHECK(fs->resident_bytes == 0);
-	CHECK(fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+	CHECK((uint64_t)fs->used_bytes == 0);
 	memfs_destroy(fs);
 }
 
@@ -251,9 +279,9 @@ static void test_sparse_pages(void) {
 	CHECK(memfs_node_set_file_size(file, sparse_size) == MEMFS_OK);
 	CHECK(file->file_size == sparse_size);
 	CHECK(file->allocation_size == sparse_size);
-	CHECK(fs->used_bytes == sparse_size);
-	CHECK(file->resident_bytes == 0);
-	CHECK(fs->resident_bytes == 0);
+	CHECK((uint64_t)fs->used_bytes == sparse_size);
+	CHECK(memfs_node_resident_bytes(file) == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
 
 	memset(buffer, 0xcc, sizeof(buffer));
 	CHECK(memfs_node_read(file, buffer, 16ULL * 1024ULL * 1024ULL, sizeof(buffer), &transferred) == MEMFS_OK);
@@ -263,11 +291,32 @@ static void test_sparse_pages(void) {
 
 	CHECK(memfs_node_write(file, &value, write_offset, 1, false, false, &transferred) == MEMFS_OK);
 	CHECK(transferred == 1);
-	CHECK(file->resident_bytes >= MEMFS_PAGE_SIZE);
-	CHECK(file->resident_bytes < MEMFS_PAGE_SIZE + 64U);
-	CHECK(fs->resident_bytes >= MEMFS_PAGE_SIZE);
-	CHECK(fs->resident_bytes < MEMFS_PAGE_SIZE + 64U);
-	CHECK(file->page_groups != NULL);
+	CHECK(memfs_node_resident_bytes(file) >= MEMFS_PAGE_SIZE);
+	CHECK(memfs_node_resident_bytes(file) < MEMFS_PAGE_SIZE + 64U);
+	CHECK((uint64_t)fs->resident_bytes >= MEMFS_PAGE_SIZE);
+	CHECK((uint64_t)fs->resident_bytes < MEMFS_PAGE_SIZE + 64U);
+	CHECK(file->page_group_count != 0);
+	CHECK(sizeof(MemfsPageGroup) <= 64U);
+	if (file->page_group_count != 0) {
+		uint64_t group_index = (write_offset >> MEMFS_PAGE_SHIFT) >> MEMFS_PAGE_GROUP_SHIFT;
+		MemfsPageGroup* group = NULL;
+
+		CHECK(file->page_group_count == 1);
+		CHECK(file->page_group_capacity == 1);
+		CHECK(file->page_groups[0].index == group_index);
+
+		if (file->page_group_count == 1)
+			group = file->page_groups[0].group;
+
+		CHECK(group != NULL);
+		if (group) {
+			CHECK(group->page_count == 1);
+			CHECK(group->page_capacity == 1);
+			CHECK(group->pages != NULL);
+			if (group->pages)
+				CHECK(group->pages[0] != NULL);
+		}
+	}
 
 	memset(buffer, 0xcc, sizeof(buffer));
 	CHECK(memfs_node_read(file, buffer, write_offset - 8, sizeof(buffer), &transferred) == MEMFS_OK);
@@ -281,17 +330,57 @@ static void test_sparse_pages(void) {
 	CHECK(memfs_node_set_file_size(file, 2048) == MEMFS_OK);
 	CHECK(file->file_size == 2048);
 	CHECK(file->allocation_size == sparse_size);
-	CHECK(file->resident_bytes == 0);
-	CHECK(fs->resident_bytes == 0);
+	CHECK(memfs_node_resident_bytes(file) == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
 
 	CHECK(memfs_node_set_allocation_size(file, 2048) == MEMFS_OK);
 	CHECK(file->allocation_size == 2048);
-	CHECK(fs->used_bytes == 2048);
+	CHECK((uint64_t)fs->used_bytes == 2048);
 
 	CHECK(memfs_node_unlink(file) == MEMFS_OK);
 	memfs_node_close(file);
-	CHECK(fs->used_bytes == 0);
-	CHECK(fs->resident_bytes == 0);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+	memfs_destroy(fs);
+}
+
+static void test_very_high_sparse_offset(void) {
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	uint8_t value = 0x6b;
+	uint8_t out = 0;
+	uint32_t transferred;
+	uint64_t offset = 1ULL << 40;
+	uint64_t expected_group = (offset >> MEMFS_PAGE_SHIFT) >> MEMFS_PAGE_GROUP_SHIFT;
+
+	printf("== very high sparse offset ==\n");
+
+	CHECK(memfs_create(2ULL << 40, L"HUGE", &fs) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, fs->root, L"huge-sparse.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) ==
+		  MEMFS_OK);
+
+	CHECK(memfs_node_write(file, &value, offset, 1, false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == 1);
+
+	CHECK(file->page_group_count == 1);
+	CHECK(file->page_group_capacity == 1);
+	CHECK(file->page_group_count != 0);
+
+	if (file->page_group_count != 0) {
+		CHECK(file->page_groups[0].index == expected_group);
+		CHECK(file->page_groups[0].group != NULL);
+		if (file->page_groups[0].group) {
+			CHECK(file->page_groups[0].group->page_count == 1);
+			CHECK(file->page_groups[0].group->page_capacity == 1);
+		}
+	}
+
+	CHECK(memfs_node_read(file, &out, offset, 1, &transferred) == MEMFS_OK);
+	CHECK(out == value);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	CHECK(memfs_resident_bytes(fs) == 0);
 	memfs_destroy(fs);
 }
 
@@ -313,30 +402,30 @@ static void test_small_to_paged_promotion(void) {
 	CHECK(memfs_node_create(fs, fs->root, L"promote.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
 
 	CHECK(memfs_node_write(file, prefix, 0, sizeof(prefix), false, false, &transferred) == MEMFS_OK);
-	CHECK(file->small_page != NULL);
-	CHECK(file->resident_bytes >= 1024);
-	CHECK(file->resident_bytes < 1088);
+	CHECK(!file->small_inline);
+	CHECK(memfs_node_resident_bytes(file) >= 1024);
+	CHECK(memfs_node_resident_bytes(file) < 1088);
 
 	CHECK(memfs_node_write(file, &value, 2ULL * MEMFS_PAGE_SIZE + 17, 1, false, false, &transferred) == MEMFS_OK);
 
-	CHECK(file->small_page == NULL);
-	CHECK(file->page_groups != NULL);
-	CHECK(file->resident_bytes >= 2ULL * MEMFS_PAGE_SIZE);
-	CHECK(file->resident_bytes < 2ULL * MEMFS_PAGE_SIZE + 128U);
+	CHECK(file->small_capacity == 0);
+	CHECK(file->page_group_count != 0);
+	CHECK(memfs_node_resident_bytes(file) >= 2ULL * MEMFS_PAGE_SIZE);
+	CHECK(memfs_node_resident_bytes(file) < 2ULL * MEMFS_PAGE_SIZE + 128U);
 
 	memset(verify, 0, sizeof(verify));
 	CHECK(memfs_node_read(file, verify, 0, sizeof(verify), &transferred) == MEMFS_OK);
 	CHECK(memcmp(prefix, verify, sizeof(prefix)) == 0);
 
 	CHECK(memfs_node_set_file_size(file, 1024) == MEMFS_OK);
-	CHECK(file->small_page != NULL);
-	CHECK(file->page_groups == NULL);
-	CHECK(file->resident_bytes >= 1024);
-	CHECK(file->resident_bytes < 1088);
+	CHECK(!file->small_inline);
+	CHECK(file->page_group_count == 0);
+	CHECK(memfs_node_resident_bytes(file) >= 1024);
+	CHECK(memfs_node_resident_bytes(file) < 1088);
 
 	CHECK(memfs_node_unlink(file) == MEMFS_OK);
 	memfs_node_close(file);
-	CHECK(fs->resident_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
 	memfs_destroy(fs);
 }
 static void test_large_directory(void) {
@@ -368,12 +457,51 @@ static void test_large_directory(void) {
 	CHECK(fs->root->dir->child_count == COUNT);
 	CHECK(fs->root->dir->hash != NULL);
 	CHECK(sizeof(MemfsDir) <= 24);
+	CHECK(sizeof(MemfsNode) <= 144);
+	CHECK(fs->root->dir->hash->count == COUNT);
 
 	for (i = 0; i < COUNT; i += 97U) {
 		swprintf_s(name, _countof(name), L"ITEM-%05u", i);
 		CHECK(memfs_dir_lookup(fs->root, name) == nodes[i]);
 	}
 
+	for (node = memfs_dir_first(fs->root); node; node = memfs_dir_next(node)) {
+		if (prev)
+			CHECK(_wcsicmp(prev->name, node->name) < 0);
+		prev = node;
+		count++;
+	}
+	CHECK(count == COUNT);
+
+	// Robin Hood backward-shift deletion: remove half the table, verify both
+	// negative and positive lookups, then fill it again to exercise probe chains.
+	for (i = 1; i < COUNT; i += 2U) {
+		CHECK(memfs_node_unlink(nodes[i]) == MEMFS_OK);
+		memfs_node_close(nodes[i]);
+		nodes[i] = NULL;
+	}
+	CHECK(fs->root->dir->child_count == COUNT / 2U);
+	CHECK(fs->root->dir->hash != NULL);
+	CHECK(fs->root->dir->hash->count == COUNT / 2U);
+
+	for (i = 0; i < COUNT; i++) {
+		swprintf_s(name, _countof(name), L"item-%05u", i);
+		if (i & 1U)
+			CHECK(memfs_dir_lookup(fs->root, name) == NULL);
+		else
+			CHECK(memfs_dir_lookup(fs->root, name) == nodes[i]);
+	}
+
+	for (i = 1; i < COUNT; i += 2U) {
+		swprintf_s(name, _countof(name), L"new-%05u", i);
+		CHECK(memfs_node_create(fs, fs->root, name, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &nodes[i]) == MEMFS_OK);
+	}
+	CHECK(fs->root->dir->child_count == COUNT);
+	CHECK(fs->root->dir->hash != NULL);
+	CHECK(fs->root->dir->hash->count == COUNT);
+
+	prev = NULL;
+	count = 0;
 	for (node = memfs_dir_first(fs->root); node; node = memfs_dir_next(node)) {
 		if (prev)
 			CHECK(_wcsicmp(prev->name, node->name) < 0);
@@ -414,9 +542,9 @@ static void test_compression(void) {
 
 	CHECK(memfs_node_write(file, input, 0, sizeof(input), false, false, &transferred) == MEMFS_OK);
 	CHECK(transferred == sizeof(input));
-	CHECK(file->page_groups != NULL);
+	CHECK(file->page_group_count != 0);
 
-	group = file->page_groups[0];
+	group = file->page_groups[0].group;
 	CHECK(group != NULL);
 	if (group) {
 		CHECK(group->pages[0] != NULL);
@@ -427,12 +555,75 @@ static void test_compression(void) {
 			CHECK(0 != (group->pages[1]->flags & MEMFS_PAGE_COMPRESSED));
 	}
 
-	CHECK(file->resident_bytes < 1024);
+	CHECK(memfs_node_resident_bytes(file) < 1024);
 
 	memset(output, 0, sizeof(output));
 	CHECK(memfs_node_read(file, output, 0, sizeof(output), &transferred) == MEMFS_OK);
 	CHECK(transferred == sizeof(output));
 	CHECK(memcmp(input, output, sizeof(input)) == 0);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	memfs_destroy(fs);
+}
+
+static void test_adaptive_compression(void) {
+	MemfsOptions options = {0};
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	MemfsPageGroup* group;
+	uint8_t page[MEMFS_PAGE_SIZE];
+	uint8_t verify[MEMFS_PAGE_SIZE];
+	uint32_t transferred;
+	uint32_t state = 0x12345678U;
+	uint32_t page_index;
+	uint32_t i;
+
+	printf("== adaptive compression ==\n");
+
+	options.capacity = 4ULL * 1024ULL * 1024ULL;
+	options.volume_label = L"ADAPT";
+	options.compression_enabled = true;
+	options.compression_level = 1;
+
+	CHECK(memfs_create_ex(&options, &fs) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, fs->root, L"adaptive.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+
+	// 64 pages of pseudo-random input: after a few failed probes the
+	// compressor should enter skip/probe mode.
+	for (page_index = 0; page_index < 64; page_index++) {
+		for (i = 0; i < sizeof(page); i += sizeof(state)) {
+			state ^= state << 13;
+			state ^= state >> 17;
+			state ^= state << 5;
+			memcpy(page + i, &state, sizeof(state));
+		}
+
+		CHECK(memfs_node_write(file, page, (uint64_t)page_index * MEMFS_PAGE_SIZE, sizeof(page), false, false,
+							   &transferred) == MEMFS_OK);
+	}
+
+	CHECK(file->compression_score >= MEMFS_COMPRESSION_SKIP_SCORE);
+
+	// Data becomes compressible. Periodic probes must discover this and
+	// re-enable normal compression attempts.
+	memset(page, 'A', sizeof(page));
+	for (; page_index < 128; page_index++) {
+		CHECK(memfs_node_write(file, page, (uint64_t)page_index * MEMFS_PAGE_SIZE, sizeof(page), false, false,
+							   &transferred) == MEMFS_OK);
+	}
+
+	CHECK(file->compression_score < MEMFS_COMPRESSION_SKIP_SCORE);
+
+	group = file->page_groups[0].group;
+	CHECK(group != NULL);
+	if (group && group->page_count == 128) {
+		CHECK(0 != (group->pages[127]->flags & MEMFS_PAGE_COMPRESSED));
+	}
+
+	memset(verify, 0, sizeof(verify));
+	CHECK(memfs_node_read(file, verify, 127ULL * MEMFS_PAGE_SIZE, sizeof(verify), &transferred) == MEMFS_OK);
+	CHECK(memcmp(page, verify, sizeof(page)) == 0);
 
 	CHECK(memfs_node_unlink(file) == MEMFS_OK);
 	memfs_node_close(file);
@@ -466,9 +657,9 @@ static void test_encryption(void) {
 
 	CHECK(memfs_node_write(file, &value, 0, 1, false, false, &transferred) == MEMFS_OK);
 	CHECK(transferred == 1);
-	CHECK(file->small_capacity == MEMFS_SMALL_GRANULE);
-	CHECK(file->small_page != NULL);
-	CHECK(file->resident_bytes < MEMFS_ALLOCATION_UNIT);
+	CHECK(file->small_capacity == 1);
+	CHECK(!file->small_inline);
+	CHECK(memfs_node_resident_bytes(file) == sizeof(MemfsPage) + sizeof(uint64_t) + 1U + 16U);
 
 	if (file->small_page) {
 		CHECK(0 != (file->small_page->flags & MEMFS_PAGE_ENCRYPTED));
@@ -523,13 +714,13 @@ static void test_compression_encryption(void) {
 
 	CHECK(memfs_node_write(file, input, 0, sizeof(input), false, false, &transferred) == MEMFS_OK);
 
-	group = file->page_groups ? file->page_groups[0] : NULL;
+	group = file->page_group_count ? file->page_groups[0].group : NULL;
 	CHECK(group != NULL);
 	if (group && group->pages[0]) {
 		CHECK(0 != (group->pages[0]->flags & MEMFS_PAGE_COMPRESSED));
 		CHECK(0 != (group->pages[0]->flags & MEMFS_PAGE_ENCRYPTED));
 	}
-	CHECK(file->resident_bytes < 2048);
+	CHECK(memfs_node_resident_bytes(file) < 2048);
 
 	memset(output, 0, sizeof(output));
 	CHECK(memfs_node_read(file, output, 0, sizeof(output), &transferred) == MEMFS_OK);
@@ -537,6 +728,71 @@ static void test_compression_encryption(void) {
 
 	CHECK(memfs_node_unlink(file) == MEMFS_OK);
 	memfs_node_close(file);
+	memfs_destroy(fs);
+}
+
+static void test_shared_security(void) {
+	enum { FILES = 256 };
+	Memfs* fs = NULL;
+	MemfsNode* dir;
+	MemfsNode* files[FILES] = {0};
+	PSECURITY_DESCRIPTOR alternate = NULL;
+	ULONG alternate_size = 0;
+	MemfsSecurity* shared;
+	LONG before;
+	uint32_t i;
+
+	printf("== shared ACL metadata ==\n");
+
+	CHECK(memfs_create(32ULL * 1024ULL * 1024ULL, L"ACL", &fs) == MEMFS_OK);
+	if (fs == NULL)
+		return;
+
+	CHECK(memfs_node_create(fs, fs->root, L"dir", true, FILE_ATTRIBUTE_DIRECTORY, NULL, 0, &dir) == MEMFS_OK);
+	if (dir == NULL) {
+		memfs_destroy(fs);
+		return;
+	}
+
+	shared = dir->security;
+	CHECK(shared == fs->root->security);
+	before = shared->ref_count;
+
+	for (i = 0; i < FILES; i++) {
+		wchar_t name[32];
+
+		swprintf_s(name, _countof(name), L"f-%03u", i);
+
+		CHECK(memfs_node_create(fs, dir, name, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &files[i]) == MEMFS_OK);
+
+		if (files[i])
+			CHECK(files[i]->security == shared);
+	}
+
+	CHECK(shared->ref_count == before + FILES);
+	CHECK(shared->size > 0);
+
+	CHECK(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"O:BAG:BAD:P(A;;GRGW;;;WD)", SDDL_REVISION_1,
+															   &alternate, &alternate_size));
+
+	if (alternate && files[0]) {
+		CHECK(memfs_node_replace_security(files[0], alternate, alternate_size) == MEMFS_OK);
+		CHECK(files[0]->security != shared);
+		CHECK(shared->ref_count == before + FILES - 1);
+	}
+
+	if (alternate)
+		LocalFree(alternate);
+
+	for (i = 0; i < FILES; i++) {
+		if (files[i]) {
+			CHECK(memfs_node_unlink(files[i]) == MEMFS_OK);
+			memfs_node_close(files[i]);
+		}
+	}
+
+	CHECK(memfs_node_unlink(dir) == MEMFS_OK);
+	memfs_node_close(dir);
 	memfs_destroy(fs);
 }
 
@@ -658,11 +914,14 @@ int main(void) {
 	test_directory_order();
 	test_small_storage();
 	test_sparse_pages();
+	test_very_high_sparse_offset();
 	test_small_to_paged_promotion();
 	test_large_directory();
 	test_compression();
+	test_adaptive_compression();
 	test_encryption();
 	test_compression_encryption();
+	test_shared_security();
 	test_concurrent_files();
 
 	printf("\nchecks=%d failures=%d => %s\n", g_checks, g_failures, g_failures ? "FAIL" : "PASS");

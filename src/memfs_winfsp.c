@@ -55,7 +55,7 @@ static void memfs_fill_file_info(MemfsNode* node, FSP_FSCTL_FILE_INFO* file_info
 	memset(file_info, 0, sizeof(*file_info));
 
 	file_info->FileAttributes = node->attributes;
-	file_info->AllocationSize = node->allocation_size;
+	file_info->AllocationSize = memfs_align_allocation(node->allocation_size);
 	file_info->FileSize = node->file_size;
 	file_info->CreationTime = node->creation_time;
 	file_info->LastAccessTime = node->last_access_time;
@@ -79,14 +79,14 @@ static NTSTATUS memfs_copy_security(MemfsNode* node, PSECURITY_DESCRIPTOR securi
 	if (security_descriptor_size == NULL)
 		return STATUS_SUCCESS;
 
-	if (node->security_size > *security_descriptor_size) {
-		*security_descriptor_size = node->security_size;
+	if (node->security->size > *security_descriptor_size) {
+		*security_descriptor_size = node->security->size;
 		return STATUS_BUFFER_OVERFLOW;
 	}
 
-	*security_descriptor_size = node->security_size;
+	*security_descriptor_size = node->security->size;
 	if (security_descriptor)
-		memcpy(security_descriptor, node->security, node->security_size);
+		memcpy(security_descriptor, node->security->data, node->security->size);
 
 	return STATUS_SUCCESS;
 }
@@ -390,7 +390,7 @@ static NTSTATUS fs_CanDelete(FSP_FILE_SYSTEM* file_system, PVOID file_context, P
 	if (node == instance->store->root)
 		return STATUS_ACCESS_DENIED;
 
-	if (node->dir && node->dir->child_count)
+	if (MEMFS_NODE_IS_DIRECTORY(node) && node->dir->child_count)
 		return STATUS_DIRECTORY_NOT_EMPTY;
 
 	return STATUS_SUCCESS;
@@ -432,7 +432,8 @@ static NTSTATUS fs_SetSecurity(FSP_FILE_SYSTEM* file_system, PVOID file_context,
 
 	(void)file_system;
 
-	status = FspSetSecurityDescriptor(node->security, security_information, modification_descriptor, &new_descriptor);
+	status =
+		FspSetSecurityDescriptor(node->security->data, security_information, modification_descriptor, &new_descriptor);
 	if (!NT_SUCCESS(status))
 		return status;
 
@@ -476,10 +477,10 @@ static NTSTATUS fs_ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_contex
 		}
 	}
 
-	for (node = memfs_dir_first(dir); node; node = memfs_dir_next(node)) {
+	node = marker ? memfs_dir_upper_bound(dir, marker) : memfs_dir_first(dir);
+
+	for (; node; node = memfs_dir_next(node)) {
 		if (node->deleted)
-			continue;
-		if (marker && _wcsicmp(node->name, marker) <= 0)
 			continue;
 
 		if (!memfs_add_dir_info(node, node->name, buffer, length, bytes_transferred)) {
