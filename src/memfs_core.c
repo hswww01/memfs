@@ -1931,17 +1931,7 @@ static MemfsResult memfs_node_alloc(Memfs* fs, MemfsNode* parent, const wchar_t*
 
 	node->attributes = attributes;
 	node->index_number = fs->next_index++;
-	{
-		MemfsNodeMetaValue* meta = calloc(1, sizeof(*meta));
-		if (meta) {
-			meta->creation_time = node->creation_time;
-			meta->last_access_time = node->last_access_time;
-			meta->last_write_time = node->last_write_time;
-			meta->change_time = node->change_time;
-			memfs_meta_table_insert(fs->meta_table, node->index_number, meta);
-		}
-	}
-	node->creation_time = memfs_now();
+node->creation_time = memfs_now();
 	node->last_access_time = node->creation_time;
 	node->last_write_time = node->creation_time;
 	node->change_time = node->creation_time;
