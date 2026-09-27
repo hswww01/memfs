@@ -58,7 +58,8 @@ find_file(WINFSP_RUNTIME
 add_library(memfs_core STATIC
 	src/memfs_core.c
 	src/memfs_alloc.c
-	src/memfs_object.c)
+	src/memfs_object.c
+	src/memfs_meta_table.c)
 
 target_include_directories(memfs_core
 	PUBLIC

@@ -1,5 +1,6 @@
 #include "memfs_core.h"
 #include "memfs_object.h"
+#include "memfs_meta_table.h"
 
 #include <intrin.h>
 #include <sddl.h>
@@ -2007,6 +2008,13 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 		return MEMFS_ERR_NO_MEMORY;
 	}
 
+	fs->meta_table = memfs_meta_table_create(1024);
+	if (fs->meta_table == NULL) {
+		memfs_allocator_destroy(&fs->allocator);
+		free(fs);
+		return MEMFS_ERR_NO_MEMORY;
+	}
+
 	fs->capacity = options->capacity;
 	fs->next_index = 1;
 	randombytes_buf(&fs->treap_seed, sizeof(fs->treap_seed));
@@ -2096,6 +2104,8 @@ void memfs_destroy(Memfs* fs) {
 		(void)sodium_munlock(fs->encryption_key, MEMFS_ENCRYPTION_KEY_SIZE);
 	}
 
+	if (fs->meta_table != NULL)
+		memfs_meta_table_destroy(fs->meta_table, NULL);
 	memfs_allocator_destroy(&fs->allocator);
 	free(fs);
 }

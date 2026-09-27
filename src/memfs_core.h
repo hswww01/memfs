@@ -52,6 +52,7 @@ typedef enum MemfsResult {
 
 typedef struct Memfs Memfs;
 typedef struct MemfsNode MemfsNode;
+typedef struct MemfsMetaTable MemfsMetaTable;
 typedef struct MemfsDir MemfsDir;
 typedef struct MemfsDirHash MemfsDirHash;
 typedef struct MemfsSecurity MemfsSecurity;
@@ -169,6 +170,7 @@ struct MemfsNode {
 
 struct Memfs {
 	MemfsAllocator allocator;
+	MemfsMetaTable* meta_table;
 
 	MemfsNode* root;
 
