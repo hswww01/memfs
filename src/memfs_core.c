@@ -10,24 +10,41 @@
 
 #define MEMFS_DEFAULT_SDDL L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)"
 
+typedef struct MemfsNodeMetaValue {
+	MemfsSecurity* security;
+	uint64_t creation_time;
+	uint64_t last_access_time;
+	uint64_t last_write_time;
+	uint64_t change_time;
+} MemfsNodeMetaValue;
+
+static MemfsNodeMetaValue* memfs_meta_lookup(MemfsNode* node) {
+	return node && node->fs ? (MemfsNodeMetaValue*)memfs_meta_table_lookup(node->fs->meta_table, node->index_number)
+							: NULL;
+}
 MemfsSecurity* memfs_node_get_security(MemfsNode* node) {
-	return node ? node->security : NULL;
+	MemfsNodeMetaValue* meta = memfs_meta_lookup(node);
+	return meta && meta->security ? meta->security : (node ? node->security : NULL);
 }
 
 uint64_t memfs_node_get_creation_time(const MemfsNode* node) {
-	return node ? node->creation_time : 0;
+	MemfsNodeMetaValue* meta = memfs_meta_lookup((MemfsNode*)node);
+	return meta && meta->creation_time ? meta->creation_time : (node ? node->creation_time : 0);
 }
 
 uint64_t memfs_node_get_last_access_time(const MemfsNode* node) {
-	return node ? node->last_access_time : 0;
+	MemfsNodeMetaValue* meta = memfs_meta_lookup((MemfsNode*)node);
+	return meta && meta->last_access_time ? meta->last_access_time : (node ? node->last_access_time : 0);
 }
 
 uint64_t memfs_node_get_last_write_time(const MemfsNode* node) {
-	return node ? node->last_write_time : 0;
+	MemfsNodeMetaValue* meta = memfs_meta_lookup((MemfsNode*)node);
+	return meta && meta->last_write_time ? meta->last_write_time : (node ? node->last_write_time : 0);
 }
 
 uint64_t memfs_node_get_change_time(const MemfsNode* node) {
-	return node ? node->change_time : 0;
+	MemfsNodeMetaValue* meta = memfs_meta_lookup((MemfsNode*)node);
+	return meta && meta->change_time ? meta->change_time : (node ? node->change_time : 0);
 }
 void memfs_node_set_creation_time(MemfsNode* node, uint64_t value) {
 	if (node)
@@ -1329,6 +1346,11 @@ static void memfs_node_free(MemfsNode* node) {
 	}
 
 	memfs_atomic_sub_clamped(&fs->used_bytes, node->file_size);
+	{
+		MemfsNodeMetaValue* meta = memfs_meta_table_remove(fs->meta_table, node->index_number);
+		if (meta)
+			free(meta);
+	}
 	memfs_security_release(node->security);
 	memfs_object_free_name(fs, node->name);
 	memfs_object_free_node(fs, node);
@@ -1877,6 +1899,16 @@ static MemfsResult memfs_node_alloc(Memfs* fs, MemfsNode* parent, const wchar_t*
 
 	node->attributes = attributes;
 	node->index_number = fs->next_index++;
+	{
+		MemfsNodeMetaValue* meta = calloc(1, sizeof(*meta));
+		if (meta) {
+			meta->creation_time = node->creation_time;
+			meta->last_access_time = node->last_access_time;
+			meta->last_write_time = node->last_write_time;
+			meta->change_time = node->change_time;
+			memfs_meta_table_insert(fs->meta_table, node->index_number, meta);
+		}
+	}
 	node->creation_time = memfs_now();
 	node->last_access_time = node->creation_time;
 	node->last_write_time = node->creation_time;
