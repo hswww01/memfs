@@ -113,6 +113,16 @@ struct MemfsPageGroupEntry {
 	MemfsPageGroup* group;
 };
 
+MemfsSecurity* memfs_node_get_security(MemfsNode* node);
+uint64_t memfs_node_get_creation_time(const MemfsNode* node);
+uint64_t memfs_node_get_last_access_time(const MemfsNode* node);
+uint64_t memfs_node_get_last_write_time(const MemfsNode* node);
+uint64_t memfs_node_get_change_time(const MemfsNode* node);
+void memfs_node_set_creation_time(MemfsNode* node, uint64_t value);
+void memfs_node_set_last_access_time(MemfsNode* node, uint64_t value);
+void memfs_node_set_last_write_time(MemfsNode* node, uint64_t value);
+void memfs_node_set_change_time(MemfsNode* node, uint64_t value);
+
 struct MemfsNode {
 	Memfs* fs;
 	MemfsNode* parent;

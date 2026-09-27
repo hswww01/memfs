@@ -57,10 +57,10 @@ static void memfs_fill_file_info(MemfsNode* node, FSP_FSCTL_FILE_INFO* file_info
 	file_info->FileAttributes = node->attributes;
 	file_info->AllocationSize = memfs_align_allocation(node->allocation_size);
 	file_info->FileSize = node->file_size;
-	file_info->CreationTime = node->creation_time;
-	file_info->LastAccessTime = node->last_access_time;
-	file_info->LastWriteTime = node->last_write_time;
-	file_info->ChangeTime = node->change_time;
+	file_info->CreationTime = memfs_node_get_creation_time(node);
+	file_info->LastAccessTime = memfs_node_get_last_access_time(node);
+	file_info->LastWriteTime = memfs_node_get_last_write_time(node);
+	file_info->ChangeTime = memfs_node_get_change_time(node);
 	file_info->IndexNumber = node->index_number;
 }
 
@@ -79,14 +79,14 @@ static NTSTATUS memfs_copy_security(MemfsNode* node, PSECURITY_DESCRIPTOR securi
 	if (security_descriptor_size == NULL)
 		return STATUS_SUCCESS;
 
-	if (node->security->size > *security_descriptor_size) {
-		*security_descriptor_size = node->security->size;
+	if (memfs_node_get_security(node)->size > *security_descriptor_size) {
+		*security_descriptor_size = memfs_node_get_security(node)->size;
 		return STATUS_BUFFER_OVERFLOW;
 	}
 
-	*security_descriptor_size = node->security->size;
+	*security_descriptor_size = memfs_node_get_security(node)->size;
 	if (security_descriptor)
-		memcpy(security_descriptor, node->security->data, node->security->size);
+		memcpy(security_descriptor, memfs_node_get_security(node)->data, memfs_node_get_security(node)->size);
 
 	return STATUS_SUCCESS;
 }
@@ -242,7 +242,7 @@ static NTSTATUS fs_Overwrite(FSP_FILE_SYSTEM* file_system, PVOID file_context, U
 
 	node->attributes = memfs_normalize_attributes(node, node->attributes);
 	node->attributes |= FILE_ATTRIBUTE_ARCHIVE;
-	node->change_time = memfs_now();
+	memfs_node_set_change_time(node, memfs_now());
 
 	memfs_fill_file_info(node, file_info);
 	return STATUS_SUCCESS;
@@ -263,11 +263,11 @@ static VOID fs_Cleanup(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR f
 	if (flags & FspCleanupSetArchiveBit)
 		node->attributes |= FILE_ATTRIBUTE_ARCHIVE;
 	if (flags & FspCleanupSetLastAccessTime)
-		node->last_access_time = now;
+		memfs_node_set_last_access_time(node, now);
 	if (flags & FspCleanupSetLastWriteTime)
-		node->last_write_time = now;
+		memfs_node_set_last_write_time(node, now);
 	if (flags & FspCleanupSetChangeTime)
-		node->change_time = now;
+		memfs_node_set_change_time(node, now);
 
 	if (flags & FspCleanupDelete)
 		memfs_node_unlink(node);
@@ -350,13 +350,13 @@ static NTSTATUS fs_SetBasicInfo(FSP_FILE_SYSTEM* file_system, PVOID file_context
 	}
 
 	if (creation_time)
-		node->creation_time = creation_time;
+		memfs_node_set_creation_time(node, creation_time);
 	if (last_access_time)
-		node->last_access_time = last_access_time;
+		memfs_node_set_last_access_time(node, last_access_time);
 	if (last_write_time)
-		node->last_write_time = last_write_time;
+		memfs_node_set_last_write_time(node, last_write_time);
 	if (change_time)
-		node->change_time = change_time;
+		memfs_node_set_change_time(node, change_time);
 
 	memfs_fill_file_info(node, file_info);
 	return STATUS_SUCCESS;
@@ -432,8 +432,8 @@ static NTSTATUS fs_SetSecurity(FSP_FILE_SYSTEM* file_system, PVOID file_context,
 
 	(void)file_system;
 
-	status =
-		FspSetSecurityDescriptor(node->security->data, security_information, modification_descriptor, &new_descriptor);
+	status = FspSetSecurityDescriptor(memfs_node_get_security(node)->data, security_information,
+									  modification_descriptor, &new_descriptor);
 	if (!NT_SUCCESS(status))
 		return status;
 

@@ -9,6 +9,42 @@
 
 #define MEMFS_DEFAULT_SDDL L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)"
 
+MemfsSecurity* memfs_node_get_security(MemfsNode* node) {
+	return node ? node->security : NULL;
+}
+
+uint64_t memfs_node_get_creation_time(const MemfsNode* node) {
+	return node ? node->creation_time : 0;
+}
+
+uint64_t memfs_node_get_last_access_time(const MemfsNode* node) {
+	return node ? node->last_access_time : 0;
+}
+
+uint64_t memfs_node_get_last_write_time(const MemfsNode* node) {
+	return node ? node->last_write_time : 0;
+}
+
+uint64_t memfs_node_get_change_time(const MemfsNode* node) {
+	return node ? node->change_time : 0;
+}
+void memfs_node_set_creation_time(MemfsNode* node, uint64_t value) {
+	if (node)
+		node->creation_time = value;
+}
+void memfs_node_set_last_access_time(MemfsNode* node, uint64_t value) {
+	if (node)
+		node->last_access_time = value;
+}
+void memfs_node_set_last_write_time(MemfsNode* node, uint64_t value) {
+	if (node)
+		node->last_write_time = value;
+}
+void memfs_node_set_change_time(MemfsNode* node, uint64_t value) {
+	if (node)
+		node->change_time = value;
+}
+
 static void memfs_dir_destroy(MemfsDir* dir) {
 	if (dir == NULL)
 		return;
