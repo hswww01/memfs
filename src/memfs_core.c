@@ -74,6 +74,16 @@ static MemfsNodeMetaValue* memfs_meta_get_or_create(MemfsNode* node) {
 	return meta;
 }
 
+static bool memfs_node_set_security_meta(MemfsNode* node, MemfsSecurity* security) {
+	MemfsNodeMetaValue* meta = memfs_meta_get_or_create(node);
+	if (meta == NULL)
+		return false;
+	meta->security = security;
+	if (node)
+		node->security = security;
+	return true;
+}
+
 void memfs_node_set_creation_time(MemfsNode* node, uint64_t value) {
 	MemfsNodeMetaValue* meta = memfs_meta_get_or_create(node);
 	if (meta)
@@ -1380,10 +1390,12 @@ static void memfs_node_free(MemfsNode* node) {
 	memfs_atomic_sub_clamped(&fs->used_bytes, node->file_size);
 	{
 		MemfsNodeMetaValue* meta = memfs_meta_table_remove(fs->meta_table, node->index_number);
-		if (meta)
+		if (meta) {
+			memfs_security_release(meta->security);
 			free(meta);
+		}
 	}
-	memfs_security_release(node->security);
+
 	memfs_object_free_name(fs, node->name);
 	memfs_object_free_node(fs, node);
 }
@@ -1906,19 +1918,35 @@ static MemfsResult memfs_node_alloc(Memfs* fs, MemfsNode* parent, const wchar_t*
 	node->name_hash = memfs_name_hash(node->name);
 
 	if (security) {
-		if (parent && memfs_security_equal(parent->security, security)) {
-			node->security = parent->security;
-			memfs_security_retain(node->security);
+		if (parent && memfs_security_equal(memfs_node_get_security(parent), security)) {
+			memfs_security_retain(memfs_node_get_security(parent));
+			memfs_node_set_security_meta(node, memfs_node_get_security(parent));
+			node->security = memfs_node_get_security(parent);
 			result = MEMFS_OK;
 		} else {
-			result = memfs_security_create(security, &node->security);
+			{
+			MemfsSecurity* created = NULL;
+			result = memfs_security_create(security, &created);
+			if (result == MEMFS_OK) {
+				memfs_node_set_security_meta(node, created);
+				node->security = created;
+			}
 		}
-	} else if (parent && parent->security) {
-		node->security = parent->security;
-		memfs_security_retain(node->security);
+		}
+	} else if (parent && memfs_node_get_security(parent)) {
+		memfs_security_retain(memfs_node_get_security(parent));
+		memfs_node_set_security_meta(node, memfs_node_get_security(parent));
+			node->security = memfs_node_get_security(parent);
 		result = MEMFS_OK;
 	} else {
-		result = memfs_default_security(&node->security);
+		{
+			MemfsSecurity* created = NULL;
+			result = memfs_default_security(&created);
+			if (result == MEMFS_OK) {
+				memfs_node_set_security_meta(node, created);
+				node->security = created;
+			}
+		}
 	}
 
 	if (result != MEMFS_OK) {
@@ -2681,15 +2709,18 @@ MemfsResult memfs_node_replace_security(MemfsNode* node, PSECURITY_DESCRIPTOR se
 	if (GetSecurityDescriptorLength(security) != security_size)
 		return MEMFS_ERR_INVALID;
 
-	if (memfs_security_equal(node->security, security))
+	if (memfs_security_equal(memfs_node_get_security(node), security))
 		return MEMFS_OK;
 
 	result = memfs_security_create(security, &replacement);
 	if (result != MEMFS_OK)
 		return result;
 
-	old = node->security;
-	node->security = replacement;
+	old = memfs_node_get_security(node);
+	if (!memfs_node_set_security_meta(node, replacement)) {
+		memfs_security_release(replacement);
+		return MEMFS_ERR_NO_MEMORY;
+	}
 	memfs_security_release(old);
 
 	memfs_node_set_change_time(node, memfs_now());
