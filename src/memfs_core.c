@@ -2433,7 +2433,7 @@ MemfsResult memfs_node_unlink(MemfsNode* node) {
 	parent = node->parent;
 	memfs_dir_remove(node);
 	node->deleted = true;
-	node->change_time = memfs_now();
+	memfs_node_set_change_time(node, memfs_now());
 	memfs_touch_directory(parent);
 
 	if (node->open_count == 0)
@@ -2496,7 +2496,7 @@ MemfsResult memfs_node_rename(MemfsNode* node, MemfsNode* new_parent, const wcha
 	node->name_hash = memfs_name_hash(node->name);
 	memfs_dir_insert(new_parent, node);
 
-	node->change_time = memfs_now();
+	memfs_node_set_change_time(node, memfs_now());
 	memfs_touch_directory(old_parent);
 	if (new_parent != old_parent)
 		memfs_touch_directory(new_parent);
@@ -2522,7 +2522,7 @@ MemfsResult memfs_node_set_allocation_size(MemfsNode* node, uint64_t new_size) {
 
 	result = memfs_resize_allocation(node, new_size);
 	if (result == MEMFS_OK)
-		node->change_time = memfs_now();
+		memfs_node_set_change_time(node, memfs_now());
 
 	return result;
 }
@@ -2554,7 +2554,7 @@ MemfsResult memfs_node_set_file_size(MemfsNode* node, uint64_t new_size) {
 		node->allocation_size = new_size;
 
 	node->file_size = new_size;
-	node->change_time = memfs_now();
+	memfs_node_set_change_time(node, memfs_now());
 	return MEMFS_OK;
 }
 
@@ -2586,7 +2586,7 @@ MemfsResult memfs_node_read(MemfsNode* node, void* buffer, uint64_t offset, uint
 	}
 
 	*bytes_read = (uint32_t)(end - offset);
-	node->last_access_time = memfs_now();
+	memfs_node_set_last_access_time(node, memfs_now());
 	return MEMFS_OK;
 }
 
@@ -2663,8 +2663,8 @@ MemfsResult memfs_node_write(MemfsNode* node, const void* buffer, uint64_t offse
 		node->file_size = end;
 
 	*bytes_written = (uint32_t)write_length;
-	node->last_write_time = memfs_now();
-	node->change_time = node->last_write_time;
+	memfs_node_set_last_write_time(node, memfs_now());
+	memfs_node_set_change_time(node, memfs_node_get_last_write_time(node));
 	node->attributes |= FILE_ATTRIBUTE_ARCHIVE;
 	return MEMFS_OK;
 }
@@ -2692,6 +2692,6 @@ MemfsResult memfs_node_replace_security(MemfsNode* node, PSECURITY_DESCRIPTOR se
 	node->security = replacement;
 	memfs_security_release(old);
 
-	node->change_time = memfs_now();
+	memfs_node_set_change_time(node, memfs_now());
 	return MEMFS_OK;
 }
