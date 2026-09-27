@@ -544,7 +544,7 @@ static MemfsPageGroupEntry* memfs_storage_groups(MemfsNode* node) {
 	return node ? node->page_groups : NULL;
 }static uint32_t memfs_storage_group_position(MemfsNode* node, uint64_t group_index, bool* found) {
 	uint32_t lo = 0;
-	uint32_t hi = node->page_group_count;
+	uint32_t hi = memfs_storage_group_count(node);
 
 	while (lo < hi) {
 		uint32_t mid = lo + (hi - lo) / 2U;
@@ -557,7 +557,7 @@ static MemfsPageGroupEntry* memfs_storage_groups(MemfsNode* node) {
 	}
 
 	if (found) {
-		*found = lo < node->page_group_count && node->page_groups[lo].index == group_index;
+		*found = lo < memfs_storage_group_count(node) && memfs_storage_groups(node)[lo].index == group_index;
 	}
 
 	return lo;
