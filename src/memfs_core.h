@@ -146,14 +146,7 @@ struct MemfsNode {
 	uint64_t file_size;
 	uint64_t allocation_size;
 
-	MemfsSecurity* security;
-
 	uint64_t index_number;
-	uint64_t creation_time;
-	uint64_t last_access_time;
-	uint64_t last_write_time;
-	uint64_t change_time;
-
 	uint32_t page_group_count;
 	uint32_t page_group_capacity;
 	uint32_t attributes;

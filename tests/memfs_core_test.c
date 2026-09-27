@@ -754,8 +754,8 @@ static void test_shared_security(void) {
 		return;
 	}
 
-	shared = dir->security;
-	CHECK(shared == fs->root->security);
+	shared = memfs_node_get_security(dir);
+	CHECK(shared == memfs_node_get_security(fs->root));
 	before = shared->ref_count;
 
 	for (i = 0; i < FILES; i++) {
@@ -766,7 +766,7 @@ static void test_shared_security(void) {
 		CHECK(memfs_node_create(fs, dir, name, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &files[i]) == MEMFS_OK);
 
 		if (files[i])
-			CHECK(files[i]->security == shared);
+			CHECK(memfs_node_get_security(files[i]) == shared);
 	}
 
 	CHECK(shared->ref_count == before + FILES);
@@ -777,7 +777,7 @@ static void test_shared_security(void) {
 
 	if (alternate && files[0]) {
 		CHECK(memfs_node_replace_security(files[0], alternate, alternate_size) == MEMFS_OK);
-		CHECK(files[0]->security != shared);
+		CHECK(memfs_node_get_security(files[0]) != shared);
 		CHECK(shared->ref_count == before + FILES - 1);
 	}
 
