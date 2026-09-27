@@ -531,7 +531,18 @@ static void memfs_group_try_shrink(MemfsPageGroup* group) {
 	}
 }
 
-static uint32_t memfs_storage_group_position(MemfsNode* node, uint64_t group_index, bool* found) {
+
+static uint32_t memfs_storage_group_count(MemfsNode* node) {
+	return node ? node->page_group_count : 0;
+}
+
+static uint32_t memfs_storage_group_capacity(MemfsNode* node) {
+	return node ? node->page_group_capacity : 0;
+}
+
+static MemfsPageGroupEntry* memfs_storage_groups(MemfsNode* node) {
+	return node ? node->page_groups : NULL;
+}static uint32_t memfs_storage_group_position(MemfsNode* node, uint64_t group_index, bool* found) {
 	uint32_t lo = 0;
 	uint32_t hi = node->page_group_count;
 
