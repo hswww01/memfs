@@ -46,21 +46,53 @@ uint64_t memfs_node_get_change_time(const MemfsNode* node) {
 	MemfsNodeMetaValue* meta = memfs_meta_lookup((MemfsNode*)node);
 	return meta && meta->change_time ? meta->change_time : (node ? node->change_time : 0);
 }
+static MemfsNodeMetaValue* memfs_meta_get_or_create(MemfsNode* node) {
+	MemfsNodeMetaValue* meta;
+
+	if (node == NULL || node->fs == NULL)
+		return NULL;
+
+	meta = memfs_meta_lookup(node);
+	if (meta != NULL)
+		return meta;
+
+	meta = calloc(1, sizeof(*meta));
+	if (meta == NULL)
+		return NULL;
+
+	meta->security = node->security;
+	meta->creation_time = node->creation_time;
+	meta->last_access_time = node->last_access_time;
+	meta->last_write_time = node->last_write_time;
+	meta->change_time = node->change_time;
+
+	if (!memfs_meta_table_insert(node->fs->meta_table, node->index_number, meta)) {
+		free(meta);
+		return (MemfsNodeMetaValue*)memfs_meta_lookup(node);
+	}
+
+	return meta;
+}
+
 void memfs_node_set_creation_time(MemfsNode* node, uint64_t value) {
-	if (node)
-		node->creation_time = value;
+	MemfsNodeMetaValue* meta = memfs_meta_get_or_create(node);
+	if (meta)
+		meta->creation_time = value;
 }
 void memfs_node_set_last_access_time(MemfsNode* node, uint64_t value) {
-	if (node)
-		node->last_access_time = value;
+	MemfsNodeMetaValue* meta = memfs_meta_get_or_create(node);
+	if (meta)
+		meta->last_access_time = value;
 }
 void memfs_node_set_last_write_time(MemfsNode* node, uint64_t value) {
-	if (node)
-		node->last_write_time = value;
+	MemfsNodeMetaValue* meta = memfs_meta_get_or_create(node);
+	if (meta)
+		meta->last_write_time = value;
 }
 void memfs_node_set_change_time(MemfsNode* node, uint64_t value) {
-	if (node)
-		node->change_time = value;
+	MemfsNodeMetaValue* meta = memfs_meta_get_or_create(node);
+	if (meta)
+		meta->change_time = value;
 }
 
 static void memfs_dir_destroy(MemfsDir* dir) {
