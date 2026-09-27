@@ -227,11 +227,26 @@ static bool memfs_buffer_is_zero(const uint8_t* data, uint32_t size) {
 #define MEMFS_COMPRESSION_SKIP_SCORE 4
 #define MEMFS_COMPRESSION_PROBE_MASK 15ULL
 
+static int8_t memfs_storage_get_compression_score(MemfsNode* node) {
+	return node ? node->compression_score : 0;
+}
+
+static void memfs_storage_adjust_compression_score(MemfsNode* node, bool useful) {
+	if (node == NULL)
+		return;
+	if (useful) {
+		if (node->compression_score > -8)
+			node->compression_score--;
+	} else if (node->compression_score < 8) {
+		node->compression_score++;
+	}
+}
+
 static bool memfs_compression_should_try(MemfsNode* node, uint64_t storage_index, uint16_t plain_size) {
 	if (!node->fs->compression_enabled || plain_size < 128U)
 		return false;
 
-	if (node->compression_score < MEMFS_COMPRESSION_SKIP_SCORE)
+	if (memfs_storage_get_compression_score(node) < MEMFS_COMPRESSION_SKIP_SCORE)
 		return true;
 
 	// Tiny blobs are cheap and infrequently rewritten, so always sample them.
@@ -243,12 +258,7 @@ static bool memfs_compression_should_try(MemfsNode* node, uint64_t storage_index
 }
 
 static void memfs_compression_feedback(MemfsNode* node, bool useful) {
-	if (useful) {
-		if (node->compression_score > -8)
-			node->compression_score--;
-	} else if (node->compression_score < 8) {
-		node->compression_score++;
-	}
+	memfs_storage_adjust_compression_score(node, useful);
 }
 
 static MemfsResult memfs_page_encode(MemfsNode* node, uint64_t storage_index, const uint8_t* plain, uint16_t plain_size,
