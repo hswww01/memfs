@@ -1343,6 +1343,57 @@ static void check_node_invariant(MemfsNode* node) {
 	}
 }
 
+
+static void test_storage_group_churn_stress(void) {
+	enum { ROUNDS = 4, GROUPS = 8, SLOTS = 16 };
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	uint8_t block[4096];
+	uint32_t transferred;
+	uint32_t round;
+	uint32_t group;
+	uint32_t slot;
+	uint32_t i;
+
+	printf("== storage group churn stress ==\n");
+
+	CHECK(memfs_create(64ULL * 1024ULL * 1024ULL, L"CHURN", &fs) == MEMFS_OK);
+	if (fs == NULL)
+		return;
+
+	for (i = 0; i < sizeof(block); i++)
+		block[i] = (uint8_t)(i ^ 0x5aU);
+
+	for (round = 0; round < ROUNDS; round++) {
+		CHECK(memfs_node_create(fs, fs->root, L"churn.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+		if (file == NULL)
+			break;
+
+		for (group = 0; group < GROUPS; group++) {
+			uint64_t group_base = (uint64_t)group * MEMFS_PAGE_GROUP_BYTES;
+
+			for (slot = 0; slot < SLOTS; slot++) {
+				uint64_t offset = group_base + (uint64_t)slot * 4096U + (uint64_t)(round + group + slot) % 4096U;
+				uint8_t value = (uint8_t)(0x10U + round + group + slot);
+
+				CHECK(memfs_node_write(file, &value, offset, 1, false, false, &transferred) == MEMFS_OK);
+				CHECK(transferred == 1);
+				CHECK(memfs_node_write(file, block, offset, sizeof(block), false, false, &transferred) == MEMFS_OK);
+				CHECK(transferred == sizeof(block));
+			}
+		}
+
+		CHECK(memfs_node_set_file_size(file, 1024) == MEMFS_OK);
+		CHECK(memfs_node_set_allocation_size(file, 1024) == MEMFS_OK);
+		CHECK(memfs_node_unlink(file) == MEMFS_OK);
+		memfs_node_close(file);
+		CHECK((uint64_t)fs->used_bytes == 0);
+		CHECK((uint64_t)fs->resident_bytes == 0);
+	}
+
+	memfs_destroy(fs);
+}
+
 static void test_storage_state_invariants(void) {
 	Memfs* fs = NULL;
 	MemfsNode* file;
@@ -1389,6 +1440,7 @@ int main(void) {
 	test_concurrent_files();
 	test_allocator_reclaim();
 	test_allocator_stress();
+	test_storage_group_churn_stress();
 	test_storage_state_invariants();
 	test_open_delete_lifetime();
 	test_rename_delete_lifetime();
