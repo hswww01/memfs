@@ -1552,6 +1552,12 @@ static void test_constrained_io_eof_bounds(void) {
 	CHECK(transferred == 0);
 	CHECK(file->file_size == sizeof(input));
 	CHECK(file->allocation_size == sizeof(input));
+	// A constrained write fully inside the current EOF writes the full length.
+	CHECK(memfs_node_write(file, input, 0, 8, false, true, &transferred) == MEMFS_OK);
+	CHECK(transferred == 8);
+	CHECK(file->file_size == sizeof(input));
+	CHECK(file->allocation_size == sizeof(input));
+	check_node_invariant(file);
 
 	// write_to_end with constrained_io resolves to EOF first, then writes zero bytes.
 	CHECK(memfs_node_write(file, input, 0, sizeof(input), true, true, &transferred) == MEMFS_OK);
