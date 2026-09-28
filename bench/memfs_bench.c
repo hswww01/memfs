@@ -18,7 +18,8 @@ typedef enum BenchMode {
 	BENCH_MODE_COMPARE = 0,
 	BENCH_MODE_PLAIN,
 	BENCH_MODE_COMPRESSION,
-	BENCH_MODE_ENCRYPTION
+	BENCH_MODE_ENCRYPTION,
+	BENCH_MODE_COMBINED
 } BenchMode;
 
 typedef struct BenchConfig {
@@ -461,9 +462,10 @@ static int run_suite(const BenchConfig* config, const char* label, LARGE_INTEGER
 	memfs_destroy(fs);
 	return 0;
 }
-static void print_comparison(const BenchResult* plain, const BenchResult* compression, const BenchResult* encryption) {
-	const BenchResult* modes[3];
-	const char* names[3];
+static void print_comparison(const BenchResult* plain, const BenchResult* compression, const BenchResult* encryption,
+								const BenchResult* combined) {
+	const BenchResult* modes[4];
+	const char* names[4];
 	uint32_t i;
 
 	modes[0] = plain;
@@ -472,6 +474,8 @@ static void print_comparison(const BenchResult* plain, const BenchResult* compre
 	names[1] = "compression";
 	modes[2] = encryption;
 	names[2] = "encryption";
+	modes[3] = combined;
+	names[3] = "combined";
 
 	printf("\n[comparison]\n");
 	printf("%-12s %-10s %12s %12s %12s %12s\n", "mode", "suite", "create_ops/s", "delete_ops/s", "used_after", "resident_after");
@@ -480,7 +484,7 @@ static void print_comparison(const BenchResult* plain, const BenchResult* compre
 							  128U, 256U, 512U, 4096U};
 		uint32_t j;
 
-		for (j = 0; j < 3; j++) {
+		for (j = 0; j < 4; j++) {
 			double create_ops = modes[j][i].create_seconds > 0.0 ? (double)counts[i] / modes[j][i].create_seconds : 0.0;
 			double delete_ops = modes[j][i].delete_seconds > 0.0 ? (double)counts[i] / modes[j][i].delete_seconds : 0.0;
 
@@ -491,12 +495,13 @@ static void print_comparison(const BenchResult* plain, const BenchResult* compre
 	}
 }
 static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* compression, BenchConfig* encryption,
-					  BenchMode* mode) {
+					  BenchConfig* combined, BenchMode* mode) {
 	int i;
 
 	memset(plain, 0, sizeof(*plain));
 	memset(compression, 0, sizeof(*compression));
 	memset(encryption, 0, sizeof(*encryption));
+	memset(combined, 0, sizeof(*combined));
 
 	plain->compression_level = 1;
 
@@ -505,6 +510,10 @@ static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* co
 
 	encryption->encryption_enabled = true;
 	encryption->compression_level = 1;
+
+	combined->compression_enabled = true;
+	combined->compression_level = 1;
+	combined->encryption_enabled = true;
 
 	*mode = BENCH_MODE_COMPARE;
 
@@ -515,6 +524,8 @@ static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* co
 			*mode = BENCH_MODE_COMPRESSION;
 		} else if (strcmp(argv[i], "--encryption") == 0) {
 			*mode = BENCH_MODE_ENCRYPTION;
+		} else if (strcmp(argv[i], "--combined") == 0) {
+			*mode = BENCH_MODE_COMBINED;
 		} else if (strcmp(argv[i], "--compare") == 0) {
 			*mode = BENCH_MODE_COMPARE;
 		} else if (strcmp(argv[i], "--compression-level") == 0) {
@@ -529,6 +540,7 @@ static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* co
 			printf("  --plain              run plain mode only\n");
 			printf("  --compression        run compression mode only\n");
 			printf("  --encryption         run encryption mode only\n");
+			printf("  --combined           run compression+encryption combined mode only\n");
 			printf("  --compression-level N set compression level for compression mode\n");
 			return 2;
 		} else {
@@ -544,9 +556,11 @@ int main(int argc, char** argv) {
 	BenchConfig plain;
 	BenchConfig compression;
 	BenchConfig encryption;
+	BenchConfig combined;
 	BenchResult plain_results[8];
 	BenchResult compression_results[8];
 	BenchResult encryption_results[8];
+	BenchResult combined_results[8];
 	BenchMode mode;
 	int rc;
 
@@ -555,7 +569,7 @@ int main(int argc, char** argv) {
 		return 2;
 	}
 
-	rc = parse_args(argc, argv, &plain, &compression, &encryption, &mode);
+	rc = parse_args(argc, argv, &plain, &compression, &encryption, &combined, &mode);
 	if (rc == 2)
 		return 0;
 	if (rc != 0)
@@ -577,13 +591,20 @@ int main(int argc, char** argv) {
 			return rc;
 		}
 
-		print_comparison(plain_results, compression_results, encryption_results);
+		rc = run_suite(&combined, "combined", frequency, combined_results);
+		if (rc != 0) {
+			return rc;
+		}
+
+		print_comparison(plain_results, compression_results, encryption_results, combined_results);
 	} else if (mode == BENCH_MODE_PLAIN) {
 		rc = run_suite(&plain, "plain", frequency, plain_results);
 	} else if (mode == BENCH_MODE_COMPRESSION) {
 		rc = run_suite(&compression, "compression", frequency, compression_results);
-	} else {
+	} else if (mode == BENCH_MODE_ENCRYPTION) {
 		rc = run_suite(&encryption, "encryption", frequency, encryption_results);
+	} else if (mode == BENCH_MODE_COMBINED) {
+		rc = run_suite(&combined, "combined", frequency, combined_results);
 	}
 
 	return rc;
