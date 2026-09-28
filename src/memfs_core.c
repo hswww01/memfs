@@ -552,7 +552,17 @@ static void memfs_storage_set_group_count(MemfsNode* node, uint32_t value) {
 static void memfs_storage_set_group_capacity(MemfsNode* node, uint32_t value) {
 	if (node)
 		node->page_group_capacity = value;
-}static MemfsPageGroup* memfs_storage_group_at(MemfsNode* node, uint32_t index) {
+}
+
+static void memfs_storage_clear_group_array(MemfsNode* node) {
+	if (node == NULL)
+		return;
+	free(node->page_groups);
+	node->page_groups = NULL;
+	memfs_storage_set_group_count(node, 0);
+	memfs_storage_set_group_capacity(node, 0);
+}
+static MemfsPageGroup* memfs_storage_group_at(MemfsNode* node, uint32_t index) {
 	if (node == NULL || index >= memfs_storage_group_count(node))
 		return NULL;
 	return memfs_storage_groups(node)[index].group;
@@ -631,9 +641,7 @@ static void memfs_storage_group_try_shrink(MemfsNode* node) {
 	uint32_t target;
 
 	if (node->page_group_count == 0) {
-		free(node->page_groups);
-		node->page_groups = NULL;
-		node->page_group_capacity = 0;
+		memfs_storage_clear_group_array(node);
 		return;
 	}
 
@@ -944,9 +952,7 @@ rollback:
 	if (node->page_group_count)
 		memfs_storage_destroy_pages(node);
 	else {
-		free(node->page_groups);
-		node->page_groups = NULL;
-		node->page_group_capacity = 0;
+		memfs_storage_clear_group_array(node);
 	}
 
 	if (old_inline)
