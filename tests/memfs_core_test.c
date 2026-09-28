@@ -1243,6 +1243,95 @@ static void test_encryption(void) {
 	memfs_destroy(fs);
 }
 
+static void test_encryption_rewrite_truncate_regrow(void) {
+	MemfsOptions options = {0};
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	uint8_t key[MEMFS_ENCRYPTION_KEY_SIZE];
+	uint8_t input[3 * MEMFS_PAGE_SIZE + 123];
+	uint8_t output[3 * MEMFS_PAGE_SIZE + 123];
+	uint32_t transferred;
+	uint32_t i;
+	uint32_t round;
+	uint64_t regrow_size = sizeof(input);
+	uint64_t smaller_size = MEMFS_PAGE_SIZE;
+
+	printf("== encryption rewrite/truncate/regrow integrity ==\n");
+
+	for (i = 0; i < sizeof(key); i++)
+		key[i] = (uint8_t)(0x5aU + i * 11U);
+
+	options.capacity = 64ULL * 1024ULL * 1024ULL;
+	options.volume_label = L"CRYPTRW";
+	options.encryption_enabled = true;
+	options.encryption_key = key;
+	options.encryption_key_size = sizeof(key);
+
+	CHECK(memfs_create_ex(&options, &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	CHECK(memfs_node_create(fs, fs->root, L"crypt-rewrite.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(file != NULL);
+	if (fs == NULL || file == NULL) {
+		if (fs)
+			memfs_destroy(fs);
+		return;
+	}
+
+	for (round = 0; round < 4; round++) {
+		for (i = 0; i < sizeof(input); i++)
+			input[i] = (uint8_t)(0x10U + round * 17U + (i % 251U));
+
+		CHECK(memfs_node_write(file, input, 0, sizeof(input), false, false, &transferred) == MEMFS_OK);
+		CHECK(transferred == sizeof(input));
+		CHECK(file->file_size == regrow_size);
+		CHECK(file->allocation_size == regrow_size);
+		CHECK((uint64_t)fs->used_bytes == regrow_size);
+		CHECK(memfs_free_bytes(fs) == options.capacity - regrow_size);
+		CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+
+		memset(output, 0xff, sizeof(output));
+		CHECK(memfs_node_read(file, output, 0, sizeof(output), &transferred) == MEMFS_OK);
+		CHECK(transferred == sizeof(output));
+		CHECK(memcmp(input, output, sizeof(input)) == 0);
+
+		CHECK(memfs_node_set_file_size(file, smaller_size) == MEMFS_OK);
+		CHECK(file->file_size == smaller_size);
+		CHECK(memfs_node_set_allocation_size(file, smaller_size) == MEMFS_OK);
+		CHECK(file->allocation_size == smaller_size);
+		CHECK((uint64_t)fs->used_bytes == smaller_size);
+		CHECK(memfs_free_bytes(fs) == options.capacity - smaller_size);
+		CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+
+		memset(output, 0xff, sizeof(output));
+		CHECK(memfs_node_read(file, output, 0, smaller_size, &transferred) == MEMFS_OK);
+		CHECK(transferred == (uint32_t)smaller_size);
+		CHECK(memcmp(input, output, smaller_size) == 0);
+
+		CHECK(memfs_node_set_file_size(file, regrow_size) == MEMFS_OK);
+		CHECK(file->file_size == regrow_size);
+		CHECK(memfs_node_set_allocation_size(file, regrow_size) == MEMFS_OK);
+		CHECK(file->allocation_size == regrow_size);
+		CHECK((uint64_t)fs->used_bytes == regrow_size);
+		CHECK(memfs_free_bytes(fs) == options.capacity - regrow_size);
+		CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+
+		memset(output, 0xff, sizeof(output));
+		CHECK(memfs_node_read(file, output, smaller_size, regrow_size - smaller_size, &transferred) == MEMFS_OK);
+		CHECK(transferred == (uint32_t)(regrow_size - smaller_size));
+		for (i = 0; i < regrow_size - smaller_size; i++)
+			CHECK(output[i] == 0);
+	}
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+	CHECK(memfs_free_bytes(fs) == options.capacity);
+	CHECK(memfs_resident_bytes(fs) == 0);
+
+	memfs_destroy(fs);
+}
+
 static void test_compression_encryption(void) {
 	MemfsOptions options = {0};
 	Memfs* fs = NULL;
@@ -2121,6 +2210,7 @@ int main(void) {
 	test_compression_incompressible_page_fallback();
 	test_encryption();
 	test_compression_encryption();
+	test_encryption_rewrite_truncate_regrow();
 	test_shared_security();
 	test_concurrent_files();
 	test_allocator_reclaim();
