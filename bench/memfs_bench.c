@@ -372,6 +372,14 @@ static int run_suite(const BenchConfig* config, const char* label, LARGE_INTEGER
 	printf("allocator live:     %llu objects / %.2f MiB\n", (unsigned long long)stats.live_objects,
 		   (double)stats.live_bytes / (1024.0 * 1024.0));
 	printf("allocator slabs:    %u\n", stats.slab_count);
+	{
+		uint64_t waste_bytes = stats.reserved_bytes > stats.live_bytes ? stats.reserved_bytes - stats.live_bytes : 0;
+		double waste_percent = stats.reserved_bytes > 0 ? (double)waste_bytes * 100.0 / (double)stats.reserved_bytes : 0.0;
+		printf("allocator reserved_bytes: %llu B\n", (unsigned long long)stats.reserved_bytes);
+		printf("allocator live_bytes:     %llu B\n", (unsigned long long)stats.live_bytes);
+		printf("allocator waste_bytes:    %llu B\n", (unsigned long long)waste_bytes);
+		printf("allocator waste_percent:  %.2f%%\n", waste_percent);
+	}
 	print_fs_state(fs, "final");
 
 	memfs_destroy(fs);
