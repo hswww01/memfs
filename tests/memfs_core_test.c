@@ -436,6 +436,97 @@ static void test_sparse_pages(void) {
 	memfs_destroy(fs);
 }
 
+static void test_sparse_multi_group_truncate_reclaim(void) {
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	uint8_t values[3] = {0x11, 0x22, 0x33};
+	uint8_t buffer[32];
+	uint32_t transferred;
+	uint32_t i;
+	uint64_t capacity = 64ULL * 1024ULL * 1024ULL;
+	uint64_t offsets[3] = {0x123ULL, 2ULL * MEMFS_PAGE_GROUP_BYTES + 0x456ULL, 4ULL * MEMFS_PAGE_GROUP_BYTES + 0x789ULL};
+	uint64_t keep_size = 2ULL * MEMFS_PAGE_GROUP_BYTES + 0x456ULL + 32;
+	uint64_t group0 = (offsets[0] >> MEMFS_PAGE_SHIFT) >> MEMFS_PAGE_GROUP_SHIFT;
+	uint64_t group1 = (offsets[1] >> MEMFS_PAGE_SHIFT) >> MEMFS_PAGE_GROUP_SHIFT;
+	uint64_t group2 = (offsets[2] >> MEMFS_PAGE_SHIFT) >> MEMFS_PAGE_GROUP_SHIFT;
+	uint64_t resident_before;
+	uint64_t used_before;
+
+	printf("== sparse multi group truncate reclaim ==\n");
+
+	CHECK(memfs_create(capacity, L"SPARSE", &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	CHECK(memfs_node_create(fs, fs->root, L"sparse-multi.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(file != NULL);
+	if (fs == NULL || file == NULL) {
+		if (fs)
+			memfs_destroy(fs);
+		return;
+	}
+
+	for (i = 0; i < 3; i++) {
+		CHECK(memfs_node_write(file, &values[i], offsets[i], 1, false, false, &transferred) == MEMFS_OK);
+		CHECK(transferred == 1);
+	}
+
+	CHECK(memfs_node_page_group_count(file) == 3);
+	CHECK(memfs_node_page_group_capacity(file) >= 3);
+	CHECK(memfs_node_page_group_index(file, 0) == group0);
+	CHECK(memfs_node_page_group_index(file, 1) == group1);
+	CHECK(memfs_node_page_group_index(file, 2) == group2);
+	CHECK(memfs_node_resident_bytes(file) > 0);
+	CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+	resident_before = memfs_node_resident_bytes(file);
+	used_before = fs->used_bytes;
+
+	memset(buffer, 0xcc, sizeof(buffer));
+	CHECK(memfs_node_read(file, buffer, offsets[0] - 8, sizeof(buffer), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(buffer));
+	CHECK(buffer[8] == values[0]);
+	for (i = 0; i < sizeof(buffer); i++) {
+		if (i != 8)
+			CHECK(buffer[i] == 0);
+	}
+
+	memset(buffer, 0xcc, sizeof(buffer));
+	CHECK(memfs_node_read(file, buffer, offsets[1] - 8, sizeof(buffer), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(buffer));
+	CHECK(buffer[8] == values[1]);
+
+	CHECK(memfs_node_set_file_size(file, keep_size) == MEMFS_OK);
+	CHECK(file->file_size == keep_size);
+	CHECK(memfs_node_set_allocation_size(file, keep_size) == MEMFS_OK);
+	CHECK(file->allocation_size == keep_size);
+	CHECK((uint64_t)fs->used_bytes < used_before);
+	CHECK(memfs_node_page_group_count(file) == 2);
+	CHECK(memfs_node_page_group_capacity(file) >= 2);
+	CHECK(memfs_node_page_group_index(file, 0) == group0);
+	CHECK(memfs_node_page_group_index(file, 1) == group1);
+	CHECK(memfs_node_resident_bytes(file) < resident_before);
+	CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+
+	memset(buffer, 0xcc, sizeof(buffer));
+	CHECK(memfs_node_read(file, buffer, offsets[0] - 8, sizeof(buffer), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(buffer));
+	CHECK(buffer[8] == values[0]);
+	for (i = 0; i < sizeof(buffer); i++) {
+		if (i != 8)
+			CHECK(buffer[i] == 0);
+	}
+
+	memset(buffer, 0xcc, sizeof(buffer));
+	CHECK(memfs_node_read(file, buffer, offsets[1] - 8, sizeof(buffer), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(buffer));
+	CHECK(buffer[8] == values[1]);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+	CHECK(memfs_free_bytes(fs) == capacity);
+	memfs_destroy(fs);
+}
+
 static void test_very_high_sparse_offset(void) {
 	Memfs* fs = NULL;
 	MemfsNode* file;
@@ -1707,6 +1798,7 @@ int main(void) {
 	test_directory_order();
 	test_small_storage();
 	test_sparse_pages();
+	test_sparse_multi_group_truncate_reclaim();
 	test_very_high_sparse_offset();
 	test_small_to_paged_promotion();
 	test_truncate_regrow_zero_fill();
