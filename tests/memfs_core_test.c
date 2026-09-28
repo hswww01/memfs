@@ -944,6 +944,39 @@ static void test_allocator_reclaim(void) {
 	memfs_destroy(fs);
 }
 
+
+static void test_open_delete_lifetime(void) {
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	uint8_t data = 0x42;
+	uint8_t out = 0;
+	uint32_t transferred;
+	uint32_t i;
+
+	printf("== open/delete lifetime ==\n");
+
+	CHECK(memfs_create(8ULL * 1024ULL * 1024ULL, L"LIFE", &fs) == MEMFS_OK);
+
+	for (i = 0; i < 1000; i++) {
+		CHECK(memfs_node_create(fs, fs->root, L"held.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+		memfs_node_open(file); // simulate an additional WinFsp handle
+		CHECK(memfs_node_write(file, &data, 0, 1, false, false, &transferred) == MEMFS_OK);
+		CHECK(transferred == 1);
+		CHECK(memfs_node_unlink(file) == MEMFS_OK);
+		CHECK(fs->orphan_head == file);
+		CHECK(memfs_node_read(file, &out, 0, 1, &transferred) == MEMFS_OK);
+		CHECK(out == data);
+
+		memfs_node_close(file); // close extra handle
+		CHECK(fs->orphan_head == file);
+		memfs_node_close(file); // close create handle, final free
+		CHECK(fs->orphan_head == NULL);
+	}
+
+	memfs_destroy(fs);
+}
+
+
 int main(void) {
 	setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -964,6 +997,7 @@ int main(void) {
 	test_shared_security();
 	test_concurrent_files();
 	test_allocator_reclaim();
+	test_open_delete_lifetime();
 
 	printf("\nchecks=%d failures=%d => %s\n", g_checks, g_failures, g_failures ? "FAIL" : "PASS");
 
