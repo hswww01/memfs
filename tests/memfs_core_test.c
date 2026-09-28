@@ -520,6 +520,124 @@ static void test_small_to_paged_promotion(void) {
 	CHECK((uint64_t)fs->resident_bytes == 0);
 	memfs_destroy(fs);
 }
+static void test_truncate_regrow_zero_fill(void) {
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	uint8_t input[2048];
+	uint8_t output[2048];
+	uint8_t paged_input[3 * MEMFS_PAGE_SIZE + 123];
+	uint8_t paged_output[3 * MEMFS_PAGE_SIZE + 123];
+	uint32_t transferred;
+	uint32_t i;
+	uint64_t capacity = 8ULL * 1024ULL * 1024ULL;
+
+	printf("== truncate/regrow zero fill ==\n");
+
+	CHECK(memfs_create(capacity, L"TRUNC", &fs) == MEMFS_OK);
+	if (fs == NULL)
+		return;
+
+	for (i = 0; i < sizeof(input); i++)
+		input[i] = (uint8_t)(0x11 + (i % 251U));
+
+	CHECK(memfs_node_create(fs, fs->root, L"tiny-regrow.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(file != NULL);
+	if (file == NULL) {
+		memfs_destroy(fs);
+		return;
+	}
+
+	CHECK(memfs_node_write(file, input, 0, sizeof(input), false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	CHECK(file->file_size == sizeof(input));
+	CHECK(file->allocation_size == sizeof(input));
+	CHECK(!file->paged_storage);
+	CHECK(memfs_node_page_group_count(file) == 0);
+	CHECK((uint64_t)fs->used_bytes == sizeof(input));
+	CHECK(memfs_free_bytes(fs) == capacity - sizeof(input));
+	CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+
+	CHECK(memfs_node_set_file_size(file, 512) == MEMFS_OK);
+	CHECK(file->file_size == 512);
+	CHECK((uint64_t)fs->used_bytes == 512);
+	CHECK(memfs_free_bytes(fs) == capacity - 512);
+	CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+
+	CHECK(memfs_node_set_file_size(file, sizeof(input)) == MEMFS_OK);
+	CHECK(file->file_size == sizeof(input));
+	CHECK(file->allocation_size == sizeof(input));
+	CHECK((uint64_t)fs->used_bytes == sizeof(input));
+	CHECK(memfs_free_bytes(fs) == capacity - sizeof(input));
+	CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+
+	memset(output, 0xff, sizeof(output));
+	CHECK(memfs_node_read(file, output, 512, sizeof(input) - 512, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input) - 512);
+	for (i = 0; i < sizeof(input) - 512; i++)
+		CHECK(output[i] == 0);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+	CHECK(memfs_free_bytes(fs) == capacity);
+
+	for (i = 0; i < sizeof(paged_input); i++)
+		paged_input[i] = (uint8_t)(0x22 + (i % 251U));
+
+	CHECK(memfs_node_create(fs, fs->root, L"paged-regrow.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(file != NULL);
+	if (file == NULL) {
+		memfs_destroy(fs);
+		return;
+	}
+
+	CHECK(memfs_node_write(file, paged_input, 0, sizeof(paged_input), false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(paged_input));
+	CHECK(file->file_size == sizeof(paged_input));
+	CHECK(file->allocation_size == sizeof(paged_input));
+	CHECK(!file->small_inline);
+	CHECK(file->paged_storage);
+	CHECK(memfs_node_page_group_count(file) != 0);
+	CHECK((uint64_t)fs->used_bytes == sizeof(paged_input));
+	CHECK(memfs_free_bytes(fs) == capacity - sizeof(paged_input));
+	CHECK(memfs_node_resident_bytes(file) >= 3ULL * MEMFS_PAGE_SIZE);
+	CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+
+	CHECK(memfs_node_set_file_size(file, MEMFS_PAGE_SIZE) == MEMFS_OK);
+	CHECK(file->file_size == MEMFS_PAGE_SIZE);
+	CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+
+	CHECK(memfs_node_set_allocation_size(file, MEMFS_PAGE_SIZE) == MEMFS_OK);
+	CHECK(file->allocation_size == MEMFS_PAGE_SIZE);
+	CHECK((uint64_t)fs->used_bytes == MEMFS_PAGE_SIZE);
+	CHECK(memfs_free_bytes(fs) == capacity - MEMFS_PAGE_SIZE);
+	CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+
+	CHECK(memfs_node_set_file_size(file, sizeof(paged_input)) == MEMFS_OK);
+	CHECK(file->file_size == sizeof(paged_input));
+	CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+
+	CHECK(memfs_node_set_allocation_size(file, sizeof(paged_input)) == MEMFS_OK);
+	CHECK(file->allocation_size == sizeof(paged_input));
+	CHECK((uint64_t)fs->used_bytes == sizeof(paged_input));
+	CHECK(memfs_free_bytes(fs) == capacity - sizeof(paged_input));
+
+	memset(paged_output, 0xff, sizeof(paged_output));
+	CHECK(memfs_node_read(file, paged_output, MEMFS_PAGE_SIZE, sizeof(paged_input) - MEMFS_PAGE_SIZE, &transferred) ==
+		  MEMFS_OK);
+	CHECK(transferred == sizeof(paged_input) - MEMFS_PAGE_SIZE);
+	for (i = 0; i < sizeof(paged_input) - MEMFS_PAGE_SIZE; i++)
+		CHECK(paged_output[i] == 0);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+	CHECK(memfs_free_bytes(fs) == capacity);
+
+	memfs_destroy(fs);
+}
 static void test_large_directory(void) {
 	enum { COUNT = 5000 };
 	Memfs* fs = NULL;
@@ -1591,6 +1709,7 @@ int main(void) {
 	test_sparse_pages();
 	test_very_high_sparse_offset();
 	test_small_to_paged_promotion();
+	test_truncate_regrow_zero_fill();
 	test_large_directory();
 	test_compression();
 	test_adaptive_compression();
