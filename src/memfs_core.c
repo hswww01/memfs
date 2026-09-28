@@ -577,7 +577,7 @@ static MemfsResult memfs_storage_group_reserve(MemfsNode* node, uint32_t require
 	MemfsPageGroupEntry* entries;
 	uint32_t capacity;
 
-	if (required <= node->page_group_capacity)
+	if (required <= memfs_storage_group_capacity(node))
 		return MEMFS_OK;
 
 	capacity = memfs_storage_group_capacity(node) ? memfs_storage_group_capacity(node) : 1U;
