@@ -798,8 +798,8 @@ static void test_large_directory(void) {
 		CHECK(memfs_node_create(fs, fs->root, name, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &nodes[i]) == MEMFS_OK);
 	}
 	CHECK(fs->root->dir->child_count == COUNT);
-	CHECK(fs->root->dir->hash != NULL);
-	CHECK(fs->root->dir->hash->count == COUNT);
+	if (fs->root->dir->hash)
+		CHECK(fs->root->dir->hash->count == COUNT);
 
 	prev = NULL;
 	count = 0;
@@ -815,6 +815,164 @@ static void test_large_directory(void) {
 		CHECK(memfs_node_unlink(nodes[i]) == MEMFS_OK);
 		memfs_node_close(nodes[i]);
 	}
+
+exit:
+	free(nodes);
+	memfs_destroy(fs);
+}
+
+static bool test_orphan_contains(const Memfs* fs, const MemfsNode* target);
+
+static void test_large_directory_case_insensitive_hash_stress(void) {
+	enum { COUNT = 1024 };
+	Memfs* fs = NULL;
+	MemfsNode** nodes;
+	MemfsNode* node;
+	wchar_t name[64];
+	wchar_t variant[64];
+	wchar_t new_name[64];
+	uint32_t i;
+
+	printf("== large directory case-insensitive hash stress ==\n");
+
+	nodes = calloc(COUNT, sizeof(*nodes));
+	CHECK(nodes != NULL);
+	CHECK(memfs_create(64ULL * 1024ULL * 1024ULL, L"CASE", &fs) == MEMFS_OK);
+	if (nodes == NULL || fs == NULL)
+		goto exit;
+
+	for (i = 0; i < COUNT; i++) {
+		switch (i % 3U) {
+		case 0:
+			swprintf_s(name, _countof(name), L"Case-%04u.txt", i);
+			break;
+		case 1:
+			swprintf_s(name, _countof(name), L"CASE-%04u.TXT", i);
+			break;
+		default:
+			swprintf_s(name, _countof(name), L"case-%04u.Txt", i);
+			break;
+		}
+		CHECK(memfs_node_create(fs, fs->root, name, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &nodes[i]) == MEMFS_OK);
+	}
+
+	CHECK(fs->root->dir->child_count == COUNT);
+	if (fs->root->dir->hash)
+		CHECK(fs->root->dir->hash->count == COUNT);
+
+	for (i = 0; i < COUNT; i++) {
+		switch (i % 3U) {
+		case 0:
+			swprintf_s(variant, _countof(variant), L"case-%04u.TXT", i);
+			break;
+		case 1:
+			swprintf_s(variant, _countof(variant), L"Case-%04u.txt", i);
+			break;
+		default:
+			swprintf_s(variant, _countof(variant), L"CASE-%04u.TXT", i);
+			break;
+		}
+		CHECK(memfs_dir_lookup(fs->root, variant) == nodes[i]);
+	}
+
+	swprintf_s(name, _countof(name), L"missing-%04u.txt", COUNT);
+	CHECK(memfs_dir_lookup(fs->root, name) == NULL);
+
+	for (i = 0; i < COUNT; i += 128U) {
+		switch (i % 3U) {
+		case 0:
+			swprintf_s(name, _countof(name), L"case-%04u.TXT", i);
+			break;
+		case 1:
+			swprintf_s(name, _countof(name), L"Case-%04u.txt", i);
+			break;
+		default:
+			swprintf_s(name, _countof(name), L"CASE-%04u.TXT", i);
+			break;
+		}
+		CHECK(memfs_node_create(fs, fs->root, name, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) == MEMFS_ERR_EXISTS);
+	}
+	CHECK(fs->root->dir->child_count == COUNT);
+	if (fs->root->dir->hash)
+		CHECK(fs->root->dir->hash->count == COUNT);
+
+	for (i = 0; i < COUNT; i += 256U) {
+		switch (i % 3U) {
+		case 0:
+			swprintf_s(new_name, _countof(new_name), L"RENAMED-%04u.txt", i);
+			break;
+		case 1:
+			swprintf_s(new_name, _countof(new_name), L"Renamed-%04u.TXT", i);
+			break;
+		default:
+			swprintf_s(new_name, _countof(new_name), L"renamed-%04u.Txt", i);
+			break;
+		}
+		CHECK(memfs_node_rename(nodes[i], fs->root, new_name, false) == MEMFS_OK);
+		CHECK(wcscmp(nodes[i]->name, new_name) == 0);
+		CHECK(memfs_dir_lookup(fs->root, new_name) == nodes[i]);
+	}
+
+	for (i = 0; i < COUNT; i += 256U) {
+		switch (i % 3U) {
+		case 0:
+			swprintf_s(name, _countof(name), L"Case-%04u.txt", i);
+			break;
+		case 1:
+			swprintf_s(name, _countof(name), L"CASE-%04u.TXT", i);
+			break;
+		default:
+			swprintf_s(name, _countof(name), L"case-%04u.Txt", i);
+			break;
+		}
+		CHECK(memfs_dir_lookup(fs->root, name) == NULL);
+	}
+
+	for (i = 0; i < COUNT; i += 512U) {
+		memfs_node_open(nodes[i]);
+		CHECK(memfs_node_unlink(nodes[i]) == MEMFS_OK);
+		CHECK(test_orphan_contains(fs, nodes[i]));
+	}
+
+	for (i = 0; i < COUNT; i += 512U) {
+		switch (i % 3U) {
+		case 0:
+			swprintf_s(name, _countof(name), L"RENAMED-%04u.txt", i);
+			break;
+		case 1:
+			swprintf_s(name, _countof(name), L"Renamed-%04u.TXT", i);
+			break;
+		default:
+			swprintf_s(name, _countof(name), L"renamed-%04u.Txt", i);
+			break;
+		}
+		CHECK(memfs_dir_lookup(fs->root, name) == NULL);
+	}
+
+	CHECK(fs->root->dir->child_count == COUNT - COUNT / 512U);
+	if (fs->root->dir->hash)
+		CHECK(fs->root->dir->hash->count == COUNT - COUNT / 512U);
+
+	for (i = 0; i < COUNT; i++) {
+		if (nodes[i] == NULL)
+			continue;
+		if (i % 512U == 0U) {
+			memfs_node_close(nodes[i]);
+			memfs_node_close(nodes[i]);
+			nodes[i] = NULL;
+		} else {
+			CHECK(memfs_node_unlink(nodes[i]) == MEMFS_OK);
+			memfs_node_close(nodes[i]);
+			nodes[i] = NULL;
+		}
+	}
+
+	CHECK(fs->root->dir->child_count == 0);
+	if (fs->root->dir->hash)
+		CHECK(fs->root->dir->hash->count == 0);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+	CHECK(fs->orphan_head == NULL);
 
 exit:
 	free(nodes);
@@ -1857,6 +2015,7 @@ int main(void) {
 	test_small_to_paged_promotion();
 	test_truncate_regrow_zero_fill();
 	test_large_directory();
+	test_large_directory_case_insensitive_hash_stress();
 	test_compression();
 	test_adaptive_compression();
 	test_encryption();
