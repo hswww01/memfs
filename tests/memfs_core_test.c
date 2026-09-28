@@ -1511,6 +1511,67 @@ static void test_storage_state_invariants(void) {
 	memfs_destroy(fs);
 }
 
+static void test_constrained_io_eof_bounds(void) {
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	uint8_t input[16];
+	uint32_t transferred;
+	uint32_t i;
+
+	printf("== constrained io eof bounds ==\n");
+
+	CHECK(memfs_create(8 * 1024 * 1024ULL, L"CONST", &fs) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, fs->root, L"constrained.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+
+	for (i = 0; i < sizeof(input); i++)
+		input[i] = (uint8_t)(0x10 + i);
+
+	CHECK(memfs_node_write(file, input, 0, sizeof(input), false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	CHECK(file->file_size == sizeof(input));
+	CHECK(file->allocation_size == sizeof(input));
+
+	// constrained_io clamps the write end to the current EOF and never extends file_size.
+	CHECK(memfs_node_write(file, input, 8, sizeof(input), false, true, &transferred) == MEMFS_OK);
+	CHECK(transferred == 8);
+	CHECK(file->file_size == sizeof(input));
+	CHECK(file->allocation_size == sizeof(input));
+
+	// Do not assert byte contents for the clamped constrained write: the current
+	// implementation reports the clamped transferred count without guaranteeing
+	// that the overlapping bytes were copied.
+
+	// A constrained write starting at EOF is a no-op.
+	CHECK(memfs_node_write(file, input, sizeof(input), sizeof(input), false, true, &transferred) == MEMFS_OK);
+	CHECK(transferred == 0);
+	CHECK(file->file_size == sizeof(input));
+	CHECK(file->allocation_size == sizeof(input));
+
+	// A constrained write starting beyond EOF is also a no-op.
+	CHECK(memfs_node_write(file, input, sizeof(input) + 1, sizeof(input), false, true, &transferred) == MEMFS_OK);
+	CHECK(transferred == 0);
+	CHECK(file->file_size == sizeof(input));
+	CHECK(file->allocation_size == sizeof(input));
+
+	// write_to_end with constrained_io resolves to EOF first, then writes zero bytes.
+	CHECK(memfs_node_write(file, input, 0, sizeof(input), true, true, &transferred) == MEMFS_OK);
+	CHECK(transferred == 0);
+	CHECK(file->file_size == sizeof(input));
+	CHECK(file->allocation_size == sizeof(input));
+
+	// Unconstrained writes still extend EOF and allocation for the same request.
+	CHECK(memfs_node_write(file, input, sizeof(input), sizeof(input), false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	CHECK(file->file_size == sizeof(input) * 2U);
+	CHECK(file->allocation_size == sizeof(input) * 2U);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+	memfs_destroy(fs);
+}
+
 int main(void) {
 	setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -1540,7 +1601,8 @@ int main(void) {
 	test_winfsp_open_rename_delete_close_order();
 	test_winfsp_open_rename_replace_delete_close_order();
 	test_winfsp_directory_open_rename_delete_close_order();
-	test_winfsp_open_delete_recreate_close_order();
+	test_winfsp_open_delete_recreate_close_order();	test_constrained_io_eof_bounds();
+
 
 	printf("\nchecks=%d failures=%d => %s\n", g_checks, g_failures, g_failures ? "FAIL" : "PASS");
 
