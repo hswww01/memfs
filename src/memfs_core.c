@@ -554,6 +554,17 @@ static void memfs_storage_set_group_capacity(MemfsNode* node, uint32_t value) {
 		node->page_group_capacity = value;
 }
 
+static void memfs_storage_group_entry_insert(MemfsNode* node, uint32_t pos, uint64_t index, MemfsPageGroup* group) {
+	MemfsPageGroupEntry* entries = memfs_storage_groups(node);
+	entries[pos].index = index;
+	entries[pos].group = group;
+}
+
+static MemfsPageGroup* memfs_storage_group_entry_get(MemfsNode* node, uint32_t pos) {
+	MemfsPageGroupEntry* entries = memfs_storage_groups(node);
+	return entries ? entries[pos].group : NULL;
+}
+
 static void memfs_storage_clear_group_array(MemfsNode* node) {
 	if (node == NULL)
 		return;
