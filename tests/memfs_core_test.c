@@ -107,6 +107,98 @@ static void test_io_and_resize(void) {
 	memfs_destroy(fs);
 }
 
+static void test_write_to_end_semantics(void) {
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	uint8_t initial[8];
+	uint8_t append1[5];
+	uint8_t append2[7];
+	uint8_t append3[3];
+	uint8_t expected[23];
+	uint8_t output[32];
+	uint32_t transferred;
+	uint32_t i;
+
+	printf("== write_to_end semantics ==\n");
+
+	CHECK(memfs_create(8 * 1024 * 1024ULL, L"APPEND", &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	CHECK(memfs_node_create(fs, fs->root, L"append.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(file != NULL);
+
+	for (i = 0; i < sizeof(initial); i++)
+		initial[i] = (uint8_t)(0x10 + i);
+	for (i = 0; i < sizeof(append1); i++)
+		append1[i] = (uint8_t)(0x20 + i);
+	for (i = 0; i < sizeof(append2); i++)
+		append2[i] = (uint8_t)(0x30 + i);
+	for (i = 0; i < sizeof(append3); i++)
+		append3[i] = (uint8_t)(0x40 + i);
+
+	memcpy(expected, initial, sizeof(initial));
+	memcpy(expected + sizeof(initial), append1, sizeof(append1));
+	memcpy(expected + sizeof(initial) + sizeof(append1), append2, sizeof(append2));
+	memcpy(expected + sizeof(initial) + sizeof(append1) + sizeof(append2), append3, sizeof(append3));
+
+	CHECK(memfs_node_write(file, initial, 0, sizeof(initial), false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(initial));
+	CHECK(file->file_size == sizeof(initial));
+	CHECK(file->allocation_size == sizeof(initial));
+	CHECK((uint64_t)fs->used_bytes == sizeof(initial));
+	CHECK(memfs_free_bytes(fs) == 8 * 1024 * 1024ULL - sizeof(initial));
+
+	memset(output, 0, sizeof(output));
+	CHECK(memfs_node_read(file, output, 0, sizeof(initial), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(initial));
+	CHECK(memcmp(initial, output, sizeof(initial)) == 0);
+
+	CHECK(memfs_node_write(file, append1, 0, sizeof(append1), true, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(append1));
+	CHECK(file->file_size == sizeof(initial) + sizeof(append1));
+	CHECK(file->allocation_size == sizeof(initial) + sizeof(append1));
+	CHECK((uint64_t)fs->used_bytes == sizeof(initial) + sizeof(append1));
+	CHECK(memfs_free_bytes(fs) == 8 * 1024 * 1024ULL - (sizeof(initial) + sizeof(append1)));
+
+	memset(output, 0, sizeof(output));
+	CHECK(memfs_node_read(file, output, 0, sizeof(initial) + sizeof(append1), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(initial) + sizeof(append1));
+	CHECK(memcmp(expected, output, sizeof(initial) + sizeof(append1)) == 0);
+
+	CHECK(memfs_node_write(file, append2, 0, sizeof(append2), true, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(append2));
+	CHECK(file->file_size == sizeof(initial) + sizeof(append1) + sizeof(append2));
+	CHECK(file->allocation_size == sizeof(initial) + sizeof(append1) + sizeof(append2));
+	CHECK((uint64_t)fs->used_bytes == sizeof(initial) + sizeof(append1) + sizeof(append2));
+	CHECK(memfs_free_bytes(fs) == 8 * 1024 * 1024ULL - (sizeof(initial) + sizeof(append1) + sizeof(append2)));
+
+	CHECK(memfs_node_write(file, append3, 0, sizeof(append3), true, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(append3));
+	CHECK(file->file_size == sizeof(expected));
+	CHECK(file->allocation_size == sizeof(expected));
+	CHECK((uint64_t)fs->used_bytes == sizeof(expected));
+	CHECK(memfs_free_bytes(fs) == 8 * 1024 * 1024ULL - sizeof(expected));
+
+	memset(output, 0, sizeof(output));
+	CHECK(memfs_node_read(file, output, 0, sizeof(expected), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(expected));
+	CHECK(memcmp(expected, output, sizeof(expected)) == 0);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	CHECK(file->deleted);
+	CHECK(fs->orphan_head == file);
+	CHECK((uint64_t)fs->used_bytes == sizeof(expected));
+	CHECK(memfs_free_bytes(fs) == 8 * 1024 * 1024ULL - sizeof(expected));
+
+	memfs_node_close(file);
+	CHECK(fs->orphan_head == NULL);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+	CHECK(memfs_free_bytes(fs) == 8 * 1024 * 1024ULL);
+	CHECK(memfs_resident_bytes(fs) == 0);
+
+	memfs_destroy(fs);
+}
+
 static void test_rename_and_delete(void) {
 	Memfs* fs = NULL;
 	MemfsNode* a;
@@ -1424,6 +1516,7 @@ int main(void) {
 
 	test_tree_and_lookup();
 	test_io_and_resize();
+	test_write_to_end_semantics();
 	test_rename_and_delete();
 	test_capacity();
 	test_directory_order();
