@@ -1379,6 +1379,157 @@ static void test_compression_encryption(void) {
 	memfs_destroy(fs);
 }
 
+static void test_compression_encryption_sparse_rewrite_truncate_regrow(void) {
+	MemfsOptions options = {0};
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	uint8_t key[MEMFS_ENCRYPTION_KEY_SIZE];
+	uint8_t output[1024];
+	uint32_t transferred;
+	uint32_t i;
+	uint32_t round;
+	uint64_t capacity = 256ULL * 1024ULL * 1024ULL;
+	uint64_t offsets[3] = {0x123ULL, 2ULL * MEMFS_PAGE_GROUP_BYTES + 0x456ULL, 4ULL * MEMFS_PAGE_GROUP_BYTES + 0x789ULL};
+	uint64_t keep_size = 2ULL * MEMFS_PAGE_GROUP_BYTES + 0x456ULL + 128;
+	uint64_t regrow_size = 4ULL * MEMFS_PAGE_GROUP_BYTES + 0x789ULL + 128;
+	uint64_t used_before;
+	uint64_t resident_before;
+
+	printf("== compression + encryption sparse rewrite/truncate/regrow ==\n");
+
+	for (i = 0; i < sizeof(key); i++)
+		key[i] = (uint8_t)(0x77U + i * 13U);
+
+	options.capacity = capacity;
+	options.volume_label = L"COMPCRYPT";
+	options.compression_enabled = true;
+	options.compression_level = 1;
+	options.encryption_enabled = true;
+	options.encryption_key = key;
+	options.encryption_key_size = sizeof(key);
+
+	CHECK(memfs_create_ex(&options, &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	CHECK(memfs_node_create(fs, fs->root, L"comp-crypt-sparse.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) ==
+		  MEMFS_OK);
+	CHECK(file != NULL);
+	if (fs == NULL || file == NULL) {
+		if (fs)
+			memfs_destroy(fs);
+		return;
+	}
+
+	for (round = 0; round < 4; round++) {
+		uint8_t sparse_data[3][128];
+		uint8_t rewrite_data[3][128];
+		uint32_t j;
+
+		for (i = 0; i < 3; i++) {
+			uint64_t offset = offsets[i];
+			uint64_t end = offset + sizeof(sparse_data[i]);
+
+			for (j = 0; j < sizeof(sparse_data[i]); j++)
+				sparse_data[i][j] = (uint8_t)(0x20U + round * 29U + (j % 191U) + j * 3U);
+
+			CHECK(memfs_node_write(file, sparse_data[i], offset, sizeof(sparse_data[i]), false, false, &transferred) ==
+				  MEMFS_OK);
+			CHECK(transferred == sizeof(sparse_data[i]));
+			CHECK(file->file_size >= end);
+			CHECK(file->allocation_size >= end);
+			CHECK((uint64_t)fs->used_bytes == file->file_size);
+			CHECK(memfs_free_bytes(fs) == capacity - file->file_size);
+			CHECK(memfs_node_resident_bytes(file) > 0);
+			CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+		}
+
+		CHECK(memfs_node_page_group_count(file) == 3);
+		CHECK(memfs_node_page_group_index(file, 0) == (offsets[0] >> MEMFS_PAGE_SHIFT) >> MEMFS_PAGE_GROUP_SHIFT);
+		CHECK(memfs_node_page_group_index(file, 1) == (offsets[1] >> MEMFS_PAGE_SHIFT) >> MEMFS_PAGE_GROUP_SHIFT);
+		CHECK(memfs_node_page_group_index(file, 2) == (offsets[2] >> MEMFS_PAGE_SHIFT) >> MEMFS_PAGE_GROUP_SHIFT);
+
+		for (i = 0; i < 3; i++) {
+			memset(output, 0xcc, sizeof(output));
+			CHECK(memfs_node_read(file, output, offsets[i], sizeof(sparse_data[i]), &transferred) == MEMFS_OK);
+			CHECK(transferred == sizeof(sparse_data[i]));
+			CHECK(memcmp(sparse_data[i], output, sizeof(sparse_data[i])) == 0);
+		}
+
+		used_before = fs->used_bytes;
+		resident_before = memfs_node_resident_bytes(file);
+
+		for (i = 0; i < 3; i++) {
+			for (j = 0; j < sizeof(rewrite_data[i]); j++)
+				rewrite_data[i][j] = (uint8_t)(0x40U + round * 31U + (j % 211U) + j * 5U);
+
+			CHECK(memfs_node_write(file, rewrite_data[i], offsets[i], sizeof(rewrite_data[i]), false, false,
+								   &transferred) == MEMFS_OK);
+			CHECK(transferred == sizeof(rewrite_data[i]));
+		}
+
+		CHECK(file->file_size >= regrow_size);
+		CHECK((uint64_t)fs->used_bytes == file->file_size);
+		CHECK(memfs_free_bytes(fs) == capacity - file->file_size);
+		CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+
+		for (i = 0; i < 3; i++) {
+			memset(output, 0xcc, sizeof(output));
+			CHECK(memfs_node_read(file, output, offsets[i], sizeof(rewrite_data[i]), &transferred) == MEMFS_OK);
+			CHECK(transferred == sizeof(rewrite_data[i]));
+			CHECK(memcmp(rewrite_data[i], output, sizeof(rewrite_data[i])) == 0);
+		}
+
+		CHECK(memfs_node_set_file_size(file, keep_size) == MEMFS_OK);
+		CHECK(file->file_size == keep_size);
+		CHECK(memfs_node_set_allocation_size(file, keep_size) == MEMFS_OK);
+		CHECK(file->allocation_size == keep_size);
+		CHECK((uint64_t)fs->used_bytes == keep_size);
+		CHECK(memfs_free_bytes(fs) == capacity - keep_size);
+		CHECK((uint64_t)fs->used_bytes < used_before);
+		CHECK(memfs_node_resident_bytes(file) < resident_before);
+		CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+		CHECK(memfs_node_page_group_count(file) == 2);
+		CHECK(memfs_node_page_group_index(file, 0) == (offsets[0] >> MEMFS_PAGE_SHIFT) >> MEMFS_PAGE_GROUP_SHIFT);
+		CHECK(memfs_node_page_group_index(file, 1) == (offsets[1] >> MEMFS_PAGE_SHIFT) >> MEMFS_PAGE_GROUP_SHIFT);
+
+		for (i = 0; i < 2; i++) {
+			memset(output, 0xcc, sizeof(output));
+			CHECK(memfs_node_read(file, output, offsets[i], sizeof(rewrite_data[i]), &transferred) == MEMFS_OK);
+			CHECK(transferred == sizeof(rewrite_data[i]));
+			CHECK(memcmp(rewrite_data[i], output, sizeof(rewrite_data[i])) == 0);
+		}
+
+		CHECK(memfs_node_set_file_size(file, regrow_size) == MEMFS_OK);
+		CHECK(file->file_size == regrow_size);
+		CHECK(memfs_node_set_allocation_size(file, regrow_size) == MEMFS_OK);
+		CHECK(file->allocation_size == regrow_size);
+		CHECK((uint64_t)fs->used_bytes == regrow_size);
+		CHECK(memfs_free_bytes(fs) == capacity - regrow_size);
+		CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+
+		for (i = 0; i < 2; i++) {
+			memset(output, 0xcc, sizeof(output));
+			CHECK(memfs_node_read(file, output, offsets[i], sizeof(rewrite_data[i]), &transferred) == MEMFS_OK);
+			CHECK(transferred == sizeof(rewrite_data[i]));
+			CHECK(memcmp(rewrite_data[i], output, sizeof(rewrite_data[i])) == 0);
+		}
+
+		memset(output, 0xff, sizeof(output));
+		CHECK(memfs_node_read(file, output, keep_size, sizeof(output), &transferred) == MEMFS_OK);
+		CHECK(transferred == sizeof(output));
+		for (i = 0; i < sizeof(output); i++)
+			CHECK(output[i] == 0);
+	}
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+	CHECK(memfs_free_bytes(fs) == capacity);
+	CHECK(memfs_resident_bytes(fs) == 0);
+
+	memfs_destroy(fs);
+}
+
 static void test_shared_security(void) {
 	enum { FILES = 256 };
 	Memfs* fs = NULL;
@@ -2211,6 +2362,7 @@ int main(void) {
 	test_encryption();
 	test_compression_encryption();
 	test_encryption_rewrite_truncate_regrow();
+	test_compression_encryption_sparse_rewrite_truncate_regrow();
 	test_shared_security();
 	test_concurrent_files();
 	test_allocator_reclaim();
