@@ -1498,6 +1498,60 @@ static void test_winfsp_open_rename_replace_delete_close_order(void) {
 	memfs_node_close(dir);
 	memfs_destroy(fs);
 }
+static void test_rename_replace_open_target_lifetime(void) {
+	Memfs* fs = NULL;
+	MemfsNode* dir;
+	MemfsNode* old_file;
+	MemfsNode* new_file;
+	MemfsNode* found;
+	uint8_t old_data = 0x31;
+	uint8_t new_data = 0x32;
+	uint8_t out = 0;
+	uint32_t transferred;
+
+	printf("== rename replace open target lifetime ==\n");
+
+	CHECK(memfs_create(8ULL * 1024ULL * 1024ULL, L"REPLACE", &fs) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, fs->root, L"dir", true, FILE_ATTRIBUTE_DIRECTORY, NULL, 0, &dir) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, dir, L"target.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &old_file) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, dir, L"source.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &new_file) == MEMFS_OK);
+
+	CHECK(memfs_node_write(old_file, &old_data, 0, 1, false, false, &transferred) == MEMFS_OK);
+	CHECK(memfs_node_write(new_file, &new_data, 0, 1, false, false, &transferred) == MEMFS_OK);
+
+	// Keep the replacement target open while the source replaces it.
+	memfs_node_open(old_file);
+	CHECK(old_file->open_count > 0);
+	CHECK(new_file->open_count > 0);
+
+	CHECK(memfs_node_rename(new_file, dir, L"target.bin", true) == MEMFS_OK);
+	CHECK(memfs_lookup_path(fs, L"\\dir\\source.bin", &found) == MEMFS_ERR_NOT_FOUND);
+	CHECK(memfs_lookup_path(fs, L"\\dir\\target.bin", &found) == MEMFS_OK);
+	CHECK(found == new_file);
+	CHECK(old_file->deleted);
+	CHECK(test_orphan_contains(fs, old_file));
+
+	CHECK(memfs_node_read(old_file, &out, 0, 1, &transferred) == MEMFS_OK);
+	CHECK(out == old_data);
+	CHECK(memfs_node_write(old_file, &old_data, 0, 1, false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == 1);
+
+	CHECK(memfs_node_read(new_file, &out, 0, 1, &transferred) == MEMFS_OK);
+	CHECK(out == new_data);
+
+	while (old_file->open_count > 0) {
+		memfs_node_close(old_file);
+	}
+	CHECK(!test_orphan_contains(fs, old_file));
+
+	memfs_node_close(new_file);
+	CHECK(fs->orphan_head == NULL);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+
+	memfs_node_unlink(dir);
+	memfs_node_close(dir);
+	memfs_destroy(fs);
+}
 static void test_winfsp_directory_open_rename_delete_close_order(void) {
 	Memfs* fs = NULL;
 	MemfsNode* parent;
@@ -1817,6 +1871,7 @@ int main(void) {
 	test_rename_delete_lifetime();
 	test_winfsp_open_rename_delete_close_order();
 	test_winfsp_open_rename_replace_delete_close_order();
+	test_rename_replace_open_target_lifetime();
 	test_winfsp_directory_open_rename_delete_close_order();
 	test_winfsp_open_delete_recreate_close_order();	test_constrained_io_eof_bounds();
 
