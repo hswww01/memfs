@@ -4,6 +4,7 @@
 #include <psapi.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define BENCH_SMALL_FILE_COUNT 100000U
 #define BENCH_4KB_FILE_COUNT 10000U
@@ -12,6 +13,31 @@
 #define BENCH_1MB_SIZE (1ULL * 1024ULL * 1024ULL)
 #define BENCH_4KB_SIZE 4096U
 #define BENCH_1B_SIZE 1U
+
+typedef enum BenchMode {
+	BENCH_MODE_COMPARE = 0,
+	BENCH_MODE_PLAIN,
+	BENCH_MODE_COMPRESSION,
+	BENCH_MODE_ENCRYPTION
+} BenchMode;
+
+typedef struct BenchConfig {
+	bool compression_enabled;
+	bool encryption_enabled;
+	int compression_level;
+	uint8_t encryption_key[MEMFS_ENCRYPTION_KEY_SIZE];
+	bool has_encryption_key;
+} BenchConfig;
+
+typedef struct BenchResult {
+	const char* label;
+	double create_seconds;
+	double delete_seconds;
+	uint64_t used_after_create;
+	uint64_t resident_after_create;
+	uint64_t used_after_delete;
+	uint64_t resident_after_delete;
+} BenchResult;
 
 static double seconds_between(LARGE_INTEGER start, LARGE_INTEGER end, LARGE_INTEGER frequency) {
 	return (double)(end.QuadPart - start.QuadPart) / (double)frequency.QuadPart;
@@ -43,7 +69,30 @@ static int fail(Memfs* fs, const char* message, uint32_t index) {
 	memfs_destroy(fs);
 	return 1;
 }
-static int bench_small_files(Memfs* fs, uint32_t count, LARGE_INTEGER frequency) {
+
+static void print_config(const BenchConfig* config) {
+	printf("compression:      %s level=%d\n", config->compression_enabled ? "enabled" : "disabled",
+		   config->compression_level);
+	printf("encryption:       %s\n", config->encryption_enabled ? "enabled" : "disabled");
+}
+
+static int create_fs(const BenchConfig* config, Memfs** out_fs) {
+	MemfsOptions options;
+
+	memset(&options, 0, sizeof(options));
+	options.capacity = 4ULL * 1024ULL * 1024ULL * 1024ULL;
+	options.volume_label = L"BENCH";
+	options.compression_enabled = config->compression_enabled;
+	options.compression_level = config->compression_level;
+	options.encryption_enabled = config->encryption_enabled;
+	if (config->has_encryption_key) {
+		options.encryption_key = config->encryption_key;
+		options.encryption_key_size = sizeof(config->encryption_key);
+	}
+
+	return memfs_create_ex(&options, out_fs);
+}
+static int bench_small_files(Memfs* fs, uint32_t count, LARGE_INTEGER frequency, BenchResult* result) {
 	uint8_t one_byte = 0x5a;
 	LARGE_INTEGER start;
 	LARGE_INTEGER end;
@@ -67,7 +116,10 @@ static int bench_small_files(Memfs* fs, uint32_t count, LARGE_INTEGER frequency)
 		memfs_node_close(node);
 	}
 	QueryPerformanceCounter(&end);
-	print_rate("create+1B", count, seconds_between(start, end, frequency));
+	result->create_seconds = seconds_between(start, end, frequency);
+	print_rate("create+1B", count, result->create_seconds);
+	result->used_after_create = (uint64_t)fs->used_bytes;
+	result->resident_after_create = (uint64_t)fs->resident_bytes;
 	print_fs_state(fs, "after-create");
 
 	QueryPerformanceCounter(&start);
@@ -80,13 +132,15 @@ static int bench_small_files(Memfs* fs, uint32_t count, LARGE_INTEGER frequency)
 		}
 	}
 	QueryPerformanceCounter(&end);
-	print_rate("delete", count, seconds_between(start, end, frequency));
+	result->delete_seconds = seconds_between(start, end, frequency);
+	print_rate("delete", count, result->delete_seconds);
+	result->used_after_delete = (uint64_t)fs->used_bytes;
+	result->resident_after_delete = (uint64_t)fs->resident_bytes;
 	print_fs_state(fs, "after-delete");
 
 	return 0;
 }
-
-static int bench_4kb_files(Memfs* fs, uint32_t count, LARGE_INTEGER frequency) {
+static int bench_4kb_files(Memfs* fs, uint32_t count, LARGE_INTEGER frequency, BenchResult* result) {
 	uint8_t payload[BENCH_4KB_SIZE];
 	LARGE_INTEGER start;
 	LARGE_INTEGER end;
@@ -115,7 +169,10 @@ static int bench_4kb_files(Memfs* fs, uint32_t count, LARGE_INTEGER frequency) {
 		memfs_node_close(node);
 	}
 	QueryPerformanceCounter(&end);
-	print_rate("create+4KB", count, seconds_between(start, end, frequency));
+	result->create_seconds = seconds_between(start, end, frequency);
+	print_rate("create+4KB", count, result->create_seconds);
+	result->used_after_create = (uint64_t)fs->used_bytes;
+	result->resident_after_create = (uint64_t)fs->resident_bytes;
 	print_fs_state(fs, "after-create");
 
 	QueryPerformanceCounter(&start);
@@ -128,12 +185,15 @@ static int bench_4kb_files(Memfs* fs, uint32_t count, LARGE_INTEGER frequency) {
 		}
 	}
 	QueryPerformanceCounter(&end);
-	print_rate("delete", count, seconds_between(start, end, frequency));
+	result->delete_seconds = seconds_between(start, end, frequency);
+	print_rate("delete", count, result->delete_seconds);
+	result->used_after_delete = (uint64_t)fs->used_bytes;
+	result->resident_after_delete = (uint64_t)fs->resident_bytes;
 	print_fs_state(fs, "after-delete");
 
 	return 0;
 }
-static int bench_1mb_sparse_write(Memfs* fs, uint32_t count, LARGE_INTEGER frequency) {
+static int bench_1mb_sparse_write(Memfs* fs, uint32_t count, LARGE_INTEGER frequency, BenchResult* result) {
 	uint8_t page[BENCH_4KB_SIZE];
 	LARGE_INTEGER start;
 	LARGE_INTEGER end;
@@ -169,7 +229,10 @@ static int bench_1mb_sparse_write(Memfs* fs, uint32_t count, LARGE_INTEGER frequ
 		memfs_node_close(node);
 	}
 	QueryPerformanceCounter(&end);
-	print_rate("create+sparse", count, seconds_between(start, end, frequency));
+	result->create_seconds = seconds_between(start, end, frequency);
+	print_rate("create+sparse", count, result->create_seconds);
+	result->used_after_create = (uint64_t)fs->used_bytes;
+	result->resident_after_create = (uint64_t)fs->resident_bytes;
 	print_fs_state(fs, "after-create");
 
 	QueryPerformanceCounter(&start);
@@ -182,12 +245,15 @@ static int bench_1mb_sparse_write(Memfs* fs, uint32_t count, LARGE_INTEGER frequ
 		}
 	}
 	QueryPerformanceCounter(&end);
-	print_rate("delete", count, seconds_between(start, end, frequency));
+	result->delete_seconds = seconds_between(start, end, frequency);
+	print_rate("delete", count, result->delete_seconds);
+	result->used_after_delete = (uint64_t)fs->used_bytes;
+	result->resident_after_delete = (uint64_t)fs->resident_bytes;
 	print_fs_state(fs, "after-delete");
 
 	return 0;
 }
-static int bench_random_rewrite(Memfs* fs, uint32_t count, LARGE_INTEGER frequency) {
+static int bench_random_rewrite(Memfs* fs, uint32_t count, LARGE_INTEGER frequency, BenchResult* result) {
 	uint8_t page[BENCH_4KB_SIZE];
 	LARGE_INTEGER start;
 	LARGE_INTEGER end;
@@ -228,7 +294,10 @@ static int bench_random_rewrite(Memfs* fs, uint32_t count, LARGE_INTEGER frequen
 		memfs_node_close(node);
 	}
 	QueryPerformanceCounter(&end);
-	print_rate("create+rewrite", count, seconds_between(start, end, frequency));
+	result->create_seconds = seconds_between(start, end, frequency);
+	print_rate("create+rewrite", count, result->create_seconds);
+	result->used_after_create = (uint64_t)fs->used_bytes;
+	result->resident_after_create = (uint64_t)fs->resident_bytes;
 	print_fs_state(fs, "after-create");
 
 	QueryPerformanceCounter(&start);
@@ -241,26 +310,26 @@ static int bench_random_rewrite(Memfs* fs, uint32_t count, LARGE_INTEGER frequen
 		}
 	}
 	QueryPerformanceCounter(&end);
-	print_rate("delete", count, seconds_between(start, end, frequency));
+	result->delete_seconds = seconds_between(start, end, frequency);
+	print_rate("delete", count, result->delete_seconds);
+	result->used_after_delete = (uint64_t)fs->used_bytes;
+	result->resident_after_delete = (uint64_t)fs->resident_bytes;
 	print_fs_state(fs, "after-delete");
 
 	return 0;
 }
-int main(int argc, char** argv) {
+static int run_suite(const BenchConfig* config, const char* label, LARGE_INTEGER frequency, BenchResult* results) {
 	Memfs* fs = NULL;
-	LARGE_INTEGER frequency;
 	uint64_t private_before;
 	uint64_t private_after;
 	MemfsAllocatorStats stats;
 	int rc;
 
-	if (!QueryPerformanceFrequency(&frequency)) {
-		fprintf(stderr, "QueryPerformanceFrequency failed\n");
-		return 2;
-	}
+	printf("\n=== mode: %s ===\n", label);
+	print_config(config);
 
-	if (memfs_create(4ULL * 1024ULL * 1024ULL * 1024ULL, L"BENCH", &fs) != MEMFS_OK) {
-		fprintf(stderr, "memfs_create failed\n");
+	if (create_fs(config, &fs) != MEMFS_OK) {
+		fprintf(stderr, "memfs_create_ex failed for %s\n", label);
 		return 1;
 	}
 
@@ -270,22 +339,26 @@ int main(int argc, char** argv) {
 
 	private_before = private_bytes();
 
-	rc = bench_small_files(fs, BENCH_SMALL_FILE_COUNT, frequency);
+	results[0].label = "small";
+	rc = bench_small_files(fs, BENCH_SMALL_FILE_COUNT, frequency, &results[0]);
 	if (rc != 0) {
 		return rc;
 	}
 
-	rc = bench_4kb_files(fs, BENCH_4KB_FILE_COUNT, frequency);
+	results[1].label = "4kb";
+	rc = bench_4kb_files(fs, BENCH_4KB_FILE_COUNT, frequency, &results[1]);
 	if (rc != 0) {
 		return rc;
 	}
 
-	rc = bench_1mb_sparse_write(fs, BENCH_1MB_FILE_COUNT, frequency);
+	results[2].label = "1mb";
+	rc = bench_1mb_sparse_write(fs, BENCH_1MB_FILE_COUNT, frequency, &results[2]);
 	if (rc != 0) {
 		return rc;
 	}
 
-	rc = bench_random_rewrite(fs, BENCH_RANDOM_REWRITE_COUNT, frequency);
+	results[3].label = "rewrite";
+	rc = bench_random_rewrite(fs, BENCH_RANDOM_REWRITE_COUNT, frequency, &results[3]);
 	if (rc != 0) {
 		return rc;
 	}
@@ -293,7 +366,7 @@ int main(int argc, char** argv) {
 	private_after = private_bytes();
 	memfs_allocator_get_stats(&fs->allocator, &stats);
 
-	printf("\n[summary]\n");
+	printf("\n[summary %s]\n", label);
 	printf("private delta:      %.2f MiB\n", (double)(private_after - private_before) / (1024.0 * 1024.0));
 	printf("allocator reserved: %.2f MiB\n", (double)stats.reserved_bytes / (1024.0 * 1024.0));
 	printf("allocator live:     %llu objects / %.2f MiB\n", (unsigned long long)stats.live_objects,
@@ -303,4 +376,130 @@ int main(int argc, char** argv) {
 
 	memfs_destroy(fs);
 	return 0;
+}
+static void print_comparison(const BenchResult* plain, const BenchResult* compression, const BenchResult* encryption) {
+	const BenchResult* modes[3];
+	const char* names[3];
+	uint32_t i;
+
+	modes[0] = plain;
+	names[0] = "plain";
+	modes[1] = compression;
+	names[1] = "compression";
+	modes[2] = encryption;
+	names[2] = "encryption";
+
+	printf("\n[comparison]\n");
+	printf("%-12s %-10s %12s %12s %12s %12s\n", "mode", "suite", "create_ops/s", "delete_ops/s", "used_after", "resident_after");
+	for (i = 0; i < 4; i++) {
+		uint32_t counts[4] = {BENCH_SMALL_FILE_COUNT, BENCH_4KB_FILE_COUNT, BENCH_1MB_FILE_COUNT, BENCH_RANDOM_REWRITE_COUNT};
+		uint32_t j;
+
+		for (j = 0; j < 3; j++) {
+			double create_ops = modes[j][i].create_seconds > 0.0 ? (double)counts[i] / modes[j][i].create_seconds : 0.0;
+			double delete_ops = modes[j][i].delete_seconds > 0.0 ? (double)counts[i] / modes[j][i].delete_seconds : 0.0;
+
+			printf("%-12s %-10s %12.0f %12.0f %12llu %12llu\n", names[j], modes[j][i].label, create_ops, delete_ops,
+				   (unsigned long long)modes[j][i].used_after_create,
+				   (unsigned long long)modes[j][i].resident_after_create);
+		}
+	}
+}
+static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* compression, BenchConfig* encryption,
+					  BenchMode* mode) {
+	int i;
+
+	memset(plain, 0, sizeof(*plain));
+	memset(compression, 0, sizeof(*compression));
+	memset(encryption, 0, sizeof(*encryption));
+
+	plain->compression_level = 1;
+
+	compression->compression_enabled = true;
+	compression->compression_level = 1;
+
+	encryption->encryption_enabled = true;
+	encryption->compression_level = 1;
+
+	*mode = BENCH_MODE_COMPARE;
+
+	for (i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--plain") == 0) {
+			*mode = BENCH_MODE_PLAIN;
+		} else if (strcmp(argv[i], "--compression") == 0) {
+			*mode = BENCH_MODE_COMPRESSION;
+		} else if (strcmp(argv[i], "--encryption") == 0) {
+			*mode = BENCH_MODE_ENCRYPTION;
+		} else if (strcmp(argv[i], "--compare") == 0) {
+			*mode = BENCH_MODE_COMPARE;
+		} else if (strcmp(argv[i], "--compression-level") == 0) {
+			if (i + 1 >= argc) {
+				fprintf(stderr, "--compression-level requires a value\n");
+				return 1;
+			}
+			compression->compression_level = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+			printf("usage: memfs_bench [--compare | --plain | --compression | --encryption]\n");
+			printf("  --compare            run plain, compression, encryption and print comparison (default)\n");
+			printf("  --plain              run plain mode only\n");
+			printf("  --compression        run compression mode only\n");
+			printf("  --encryption         run encryption mode only\n");
+			printf("  --compression-level N set compression level for compression mode\n");
+			return 2;
+		} else {
+			fprintf(stderr, "unknown argument: %s\n", argv[i]);
+			return 1;
+		}
+	}
+
+	return 0;
+}
+int main(int argc, char** argv) {
+	LARGE_INTEGER frequency;
+	BenchConfig plain;
+	BenchConfig compression;
+	BenchConfig encryption;
+	BenchResult plain_results[4];
+	BenchResult compression_results[4];
+	BenchResult encryption_results[4];
+	BenchMode mode;
+	int rc;
+
+	if (!QueryPerformanceFrequency(&frequency)) {
+		fprintf(stderr, "QueryPerformanceFrequency failed\n");
+		return 2;
+	}
+
+	rc = parse_args(argc, argv, &plain, &compression, &encryption, &mode);
+	if (rc == 2)
+		return 0;
+	if (rc != 0)
+		return rc;
+
+	if (mode == BENCH_MODE_COMPARE) {
+		rc = run_suite(&plain, "plain", frequency, plain_results);
+		if (rc != 0) {
+			return rc;
+		}
+
+		rc = run_suite(&compression, "compression", frequency, compression_results);
+		if (rc != 0) {
+			return rc;
+		}
+
+		rc = run_suite(&encryption, "encryption", frequency, encryption_results);
+		if (rc != 0) {
+			return rc;
+		}
+
+		print_comparison(plain_results, compression_results, encryption_results);
+	} else if (mode == BENCH_MODE_PLAIN) {
+		rc = run_suite(&plain, "plain", frequency, plain_results);
+	} else if (mode == BENCH_MODE_COMPRESSION) {
+		rc = run_suite(&compression, "compression", frequency, compression_results);
+	} else {
+		rc = run_suite(&encryption, "encryption", frequency, encryption_results);
+	}
+
+	return rc;
 }

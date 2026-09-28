@@ -1064,6 +1064,263 @@ static void test_rename_delete_lifetime(void) {
 	memfs_node_close(dir);
 	memfs_destroy(fs);
 }
+static bool test_orphan_contains(const Memfs* fs, const MemfsNode* target) {
+	const MemfsNode* node;
+
+	for (node = fs ? fs->orphan_head : NULL; node; node = node->tree_right) {
+		if (node == target)
+			return true;
+	}
+
+	return false;
+}
+
+static void test_winfsp_open_rename_delete_close_order(void) {
+	Memfs* fs = NULL;
+	MemfsNode* dir;
+	MemfsNode* file;
+	MemfsNode* found;
+	uint8_t data = 0x3c;
+	uint8_t out = 0;
+	uint32_t transferred;
+
+	printf("== WinFsp open/rename/delete/close order ==\n");
+
+	CHECK(memfs_create(8ULL * 1024ULL * 1024ULL, L"WINFSP", &fs) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, fs->root, L"dir", true, FILE_ATTRIBUTE_DIRECTORY, NULL, 0, &dir) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, dir, L"open.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+
+	// WinFsp Create/Open returns FileContext with open_count = 1.
+	CHECK(file->open_count == 1);
+	CHECK(memfs_node_write(file, &data, 0, 1, false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == 1);
+
+	// Rename while open: namespace moves, FileContext remains valid.
+	CHECK(memfs_node_rename(file, fs->root, L"renamed.bin", false) == MEMFS_OK);
+	CHECK(memfs_lookup_path(fs, L"\\dir\\open.bin", &found) == MEMFS_ERR_NOT_FOUND);
+	CHECK(memfs_lookup_path(fs, L"\\renamed.bin", &found) == MEMFS_OK);
+	CHECK(found == file);
+	CHECK(wcscmp(file->name, L"renamed.bin") == 0);
+	CHECK(file->open_count == 1);
+	CHECK(memfs_node_read(file, &out, 0, 1, &transferred) == MEMFS_OK);
+	CHECK(out == data);
+
+	// Delete-on-cleanup removes the namespace entry but keeps the open FileContext alive.
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	CHECK(file->deleted);
+	CHECK(test_orphan_contains(fs, file));
+	CHECK(memfs_lookup_path(fs, L"\\renamed.bin", &found) == MEMFS_ERR_NOT_FOUND);
+	CHECK(memfs_node_read(file, &out, 0, 1, &transferred) == MEMFS_OK);
+	CHECK(out == data);
+	CHECK(memfs_node_write(file, &data, 0, 1, false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == 1);
+
+	// Final close releases the orphan node.
+	memfs_node_close(file);
+	CHECK(fs->orphan_head == NULL);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+
+	CHECK(memfs_node_unlink(dir) == MEMFS_OK);
+	memfs_node_close(dir);
+	memfs_destroy(fs);
+}
+static void test_winfsp_open_rename_replace_delete_close_order(void) {
+	Memfs* fs = NULL;
+	MemfsNode* dir;
+	MemfsNode* old_file;
+	MemfsNode* new_file;
+	MemfsNode* found;
+	uint8_t old_data = 0x11;
+	uint8_t new_data = 0x22;
+	uint8_t out = 0;
+	uint32_t transferred;
+
+	printf("== WinFsp open/rename-replace/delete/close order ==\n");
+
+	CHECK(memfs_create(8ULL * 1024ULL * 1024ULL, L"WINFSP", &fs) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, fs->root, L"dir", true, FILE_ATTRIBUTE_DIRECTORY, NULL, 0, &dir) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, dir, L"target.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &old_file) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, dir, L"source.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &new_file) == MEMFS_OK);
+
+	CHECK(memfs_node_write(old_file, &old_data, 0, 1, false, false, &transferred) == MEMFS_OK);
+	CHECK(memfs_node_write(new_file, &new_data, 0, 1, false, false, &transferred) == MEMFS_OK);
+
+	// Open both handles before rename.
+	memfs_node_open(old_file);
+	memfs_node_open(new_file);
+	CHECK(old_file->open_count == 2);
+	CHECK(new_file->open_count == 2);
+
+	// Replace rename: source becomes target, old target becomes orphan while open.
+	CHECK(memfs_node_rename(new_file, dir, L"target.bin", true) == MEMFS_OK);
+	CHECK(memfs_lookup_path(fs, L"\\dir\\source.bin", &found) == MEMFS_ERR_NOT_FOUND);
+	CHECK(memfs_lookup_path(fs, L"\\dir\\target.bin", &found) == MEMFS_OK);
+	CHECK(found == new_file);
+	CHECK(old_file->deleted);
+	CHECK(test_orphan_contains(fs, old_file));
+
+	// Old open handle still reads/writes its orphaned storage.
+	CHECK(memfs_node_read(old_file, &out, 0, 1, &transferred) == MEMFS_OK);
+	CHECK(out == old_data);
+	CHECK(memfs_node_write(old_file, &old_data, 0, 1, false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == 1);
+
+	// New open handle reads/writes the renamed storage.
+	CHECK(memfs_node_read(new_file, &out, 0, 1, &transferred) == MEMFS_OK);
+	CHECK(out == new_data);
+	CHECK(memfs_node_write(new_file, &new_data, 0, 1, false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == 1);
+
+	// Delete the new target while both handles remain open.
+	CHECK(memfs_node_unlink(new_file) == MEMFS_OK);
+	CHECK(new_file->deleted);
+	CHECK(test_orphan_contains(fs, new_file));
+	CHECK(memfs_lookup_path(fs, L"\\dir\\target.bin", &found) == MEMFS_ERR_NOT_FOUND);
+	CHECK(memfs_node_read(new_file, &out, 0, 1, &transferred) == MEMFS_OK);
+	CHECK(out == new_data);
+
+	// Close order: extra handle first, then create handle.
+	memfs_node_close(old_file);
+	CHECK(test_orphan_contains(fs, old_file));
+	memfs_node_close(old_file);
+	CHECK(test_orphan_contains(fs, new_file));
+
+	memfs_node_close(new_file);
+	CHECK(test_orphan_contains(fs, new_file));
+	memfs_node_close(new_file);
+	CHECK(fs->orphan_head == NULL);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+
+	CHECK(memfs_node_unlink(dir) == MEMFS_OK);
+	memfs_node_close(dir);
+	memfs_destroy(fs);
+}
+static void test_winfsp_directory_open_rename_delete_close_order(void) {
+	Memfs* fs = NULL;
+	MemfsNode* parent;
+	MemfsNode* child_dir;
+	MemfsNode* file;
+	MemfsNode* found;
+	uint8_t data = 0x55;
+	uint8_t out = 0;
+	uint32_t transferred;
+
+	printf("== WinFsp directory open/rename/delete/close order ==\n");
+
+	CHECK(memfs_create(8ULL * 1024ULL * 1024ULL, L"WINFSP", &fs) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, fs->root, L"parent", true, FILE_ATTRIBUTE_DIRECTORY, NULL, 0, &parent) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, parent, L"child", true, FILE_ATTRIBUTE_DIRECTORY, NULL, 0, &child_dir) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, child_dir, L"file.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+
+	CHECK(memfs_node_write(file, &data, 0, 1, false, false, &transferred) == MEMFS_OK);
+
+	// Open directory and file handles.
+	memfs_node_open(child_dir);
+	memfs_node_open(file);
+	CHECK(child_dir->open_count == 2);
+	CHECK(file->open_count == 2);
+
+	// Rename directory while open.
+	CHECK(memfs_node_rename(child_dir, fs->root, L"moved", false) == MEMFS_OK);
+	CHECK(memfs_lookup_path(fs, L"\\parent\\child", &found) == MEMFS_ERR_NOT_FOUND);
+	CHECK(memfs_lookup_path(fs, L"\\moved", &found) == MEMFS_OK);
+	CHECK(found == child_dir);
+	CHECK(memfs_lookup_path(fs, L"\\moved\\file.bin", &found) == MEMFS_OK);
+	CHECK(found == file);
+	CHECK(memfs_node_read(file, &out, 0, 1, &transferred) == MEMFS_OK);
+	CHECK(out == data);
+
+	// Delete file while open, then delete directory while open.
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	CHECK(file->deleted);
+	CHECK(test_orphan_contains(fs, file));
+	CHECK(memfs_lookup_path(fs, L"\\moved\\file.bin", &found) == MEMFS_ERR_NOT_FOUND);
+	CHECK(memfs_node_read(file, &out, 0, 1, &transferred) == MEMFS_OK);
+	CHECK(out == data);
+
+	CHECK(memfs_node_unlink(child_dir) == MEMFS_OK);
+	CHECK(child_dir->deleted);
+	CHECK(test_orphan_contains(fs, child_dir));
+	CHECK(memfs_lookup_path(fs, L"\\moved", &found) == MEMFS_ERR_NOT_FOUND);
+
+	// Close file handle, then directory handle.
+	memfs_node_close(file);
+	CHECK(test_orphan_contains(fs, file));
+	memfs_node_close(file);
+	CHECK(test_orphan_contains(fs, child_dir));
+
+	memfs_node_close(child_dir);
+	CHECK(test_orphan_contains(fs, child_dir));
+	memfs_node_close(child_dir);
+	CHECK(fs->orphan_head == NULL);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+
+	CHECK(memfs_node_unlink(parent) == MEMFS_OK);
+	memfs_node_close(parent);
+	memfs_destroy(fs);
+}
+static void test_winfsp_open_delete_recreate_close_order(void) {
+	Memfs* fs = NULL;
+	MemfsNode* old_file;
+	MemfsNode* new_file;
+	MemfsNode* found;
+	uint8_t old_data = 0x99;
+	uint8_t new_data = 0x88;
+	uint8_t out = 0;
+	uint32_t transferred;
+
+	printf("== WinFsp open/delete/recreate/close order ==\n");
+
+	CHECK(memfs_create(8ULL * 1024ULL * 1024ULL, L"WINFSP", &fs) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, fs->root, L"same.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &old_file) == MEMFS_OK);
+	CHECK(memfs_node_write(old_file, &old_data, 0, 1, false, false, &transferred) == MEMFS_OK);
+
+	// Keep the original handle open while deleting and recreating the same name.
+	memfs_node_open(old_file);
+	CHECK(old_file->open_count == 2);
+	CHECK(memfs_node_unlink(old_file) == MEMFS_OK);
+	CHECK(old_file->deleted);
+	CHECK(test_orphan_contains(fs, old_file));
+	CHECK(memfs_lookup_path(fs, L"\\same.bin", &found) == MEMFS_ERR_NOT_FOUND);
+
+	CHECK(memfs_node_create(fs, fs->root, L"same.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &new_file) == MEMFS_OK);
+	CHECK(new_file != old_file);
+	CHECK(memfs_lookup_path(fs, L"\\same.bin", &found) == MEMFS_OK);
+	CHECK(found == new_file);
+	CHECK(memfs_node_write(new_file, &new_data, 0, 1, false, false, &transferred) == MEMFS_OK);
+
+	// Old handle still sees old storage; new handle sees new storage.
+	CHECK(memfs_node_read(old_file, &out, 0, 1, &transferred) == MEMFS_OK);
+	CHECK(out == old_data);
+	CHECK(memfs_node_read(new_file, &out, 0, 1, &transferred) == MEMFS_OK);
+	CHECK(out == new_data);
+
+	// Delete new file while both handles are open.
+	CHECK(memfs_node_unlink(new_file) == MEMFS_OK);
+	CHECK(new_file->deleted);
+	CHECK(test_orphan_contains(fs, new_file));
+	CHECK(memfs_lookup_path(fs, L"\\same.bin", &found) == MEMFS_ERR_NOT_FOUND);
+	CHECK(memfs_node_read(new_file, &out, 0, 1, &transferred) == MEMFS_OK);
+	CHECK(out == new_data);
+
+	// Close old handle first, then new handle.
+	memfs_node_close(old_file);
+	CHECK(test_orphan_contains(fs, old_file));
+	memfs_node_close(old_file);
+	CHECK(test_orphan_contains(fs, new_file));
+
+	// new_file only has its create handle (open_count == 1), so one close frees it.
+	memfs_node_close(new_file);
+	CHECK(fs->orphan_head == NULL);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+
+	memfs_destroy(fs);
+}
+
 static void check_node_invariant(MemfsNode* node) {
 	CHECK(node != NULL);
 	if (node == NULL)
@@ -1135,6 +1392,10 @@ int main(void) {
 	test_storage_state_invariants();
 	test_open_delete_lifetime();
 	test_rename_delete_lifetime();
+	test_winfsp_open_rename_delete_close_order();
+	test_winfsp_open_rename_replace_delete_close_order();
+	test_winfsp_directory_open_rename_delete_close_order();
+	test_winfsp_open_delete_recreate_close_order();
 
 	printf("\nchecks=%d failures=%d => %s\n", g_checks, g_failures, g_failures ? "FAIL" : "PASS");
 
