@@ -978,6 +978,46 @@ static void test_open_delete_lifetime(void) {
 
 
 
+static void test_rename_delete_lifetime(void) {
+	Memfs* fs = NULL;
+	MemfsNode* dir;
+	MemfsNode* file;
+	MemfsNode* found;
+	uint8_t data = 0x77;
+	uint8_t out = 0;
+	uint32_t transferred;
+
+	printf("== rename/delete lifetime ==\n");
+
+	CHECK(memfs_create(8ULL * 1024ULL * 1024ULL, L"RLIFE", &fs) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, fs->root, L"dir", true, FILE_ATTRIBUTE_DIRECTORY, NULL, 0, &dir) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, dir, L"old.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+
+	memfs_node_open(file);
+	CHECK(memfs_node_write(file, &data, 0, 1, false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == 1);
+
+	CHECK(memfs_node_rename(file, fs->root, L"new.bin", false) == MEMFS_OK);
+	CHECK(memfs_lookup_path(fs, L"\\dir\\old.bin", &found) == MEMFS_ERR_NOT_FOUND);
+	CHECK(memfs_lookup_path(fs, L"\\new.bin", &found) == MEMFS_OK);
+	CHECK(found == file);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	CHECK(fs->orphan_head == file);
+	CHECK(memfs_node_read(file, &out, 0, 1, &transferred) == MEMFS_OK);
+	CHECK(out == data);
+	CHECK(memfs_node_write(file, &data, 0, 1, false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == 1);
+
+	memfs_node_close(file);
+	CHECK(fs->orphan_head == file);
+	memfs_node_close(file);
+	CHECK(fs->orphan_head == NULL);
+
+	CHECK(memfs_node_unlink(dir) == MEMFS_OK);
+	memfs_node_close(dir);
+	memfs_destroy(fs);
+}
 static void check_node_invariant(MemfsNode* node) {
 	CHECK(node != NULL);
 	if (node == NULL)
@@ -1047,6 +1087,7 @@ int main(void) {
 	test_allocator_reclaim();
 	test_storage_state_invariants();
 	test_open_delete_lifetime();
+	test_rename_delete_lifetime();
 
 	printf("\nchecks=%d failures=%d => %s\n", g_checks, g_failures, g_failures ? "FAIL" : "PASS");
 
