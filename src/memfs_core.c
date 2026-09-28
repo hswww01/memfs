@@ -1,4 +1,4 @@
-#include "memfs_core.h"
+﻿#include "memfs_core.h"
 #include "memfs_object.h"
 #include "memfs_meta_table.h"
 
@@ -580,7 +580,7 @@ static MemfsResult memfs_storage_group_reserve(MemfsNode* node, uint32_t require
 	if (required <= node->page_group_capacity)
 		return MEMFS_OK;
 
-	capacity = node->page_group_capacity ? node->page_group_capacity : 1U;
+	capacity = memfs_storage_group_capacity(node) ? memfs_storage_group_capacity(node) : 1U;
 
 	while (capacity < required) {
 		if (capacity > UINT32_MAX / 2U) {
