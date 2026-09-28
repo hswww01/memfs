@@ -32,6 +32,7 @@ typedef struct BenchConfig {
 typedef struct BenchResult {
 	const char* label;
 	double create_seconds;
+	double lookup_seconds;
 	double delete_seconds;
 	uint64_t used_after_create;
 	uint64_t resident_after_create;
@@ -318,6 +319,68 @@ static int bench_random_rewrite(Memfs* fs, uint32_t count, LARGE_INTEGER frequen
 
 	return 0;
 }
+static int bench_large_dir(Memfs* fs, uint32_t count, LARGE_INTEGER frequency, BenchResult* result) {
+	uint8_t one_byte = 0x5a;
+	LARGE_INTEGER start;
+	LARGE_INTEGER end;
+	uint32_t i;
+	wchar_t name[32];
+
+	printf("\n[large dir create/lookup/delete]\n");
+	printf("files:            %u\n", count);
+
+	QueryPerformanceCounter(&start);
+	for (i = 0; i < count; i++) {
+		MemfsNode* node = NULL;
+		swprintf_s(name, _countof(name), L"ld%07u", i);
+		if (memfs_node_create(fs, fs->root, name, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) != MEMFS_OK) {
+			return fail(fs, "large dir create failed", i);
+		}
+		if (memfs_node_write(node, &one_byte, 0, BENCH_1B_SIZE, false, false, &(uint32_t){0}) != MEMFS_OK) {
+			memfs_node_close(node);
+			return fail(fs, "large dir write failed", i);
+		}
+		memfs_node_close(node);
+	}
+	QueryPerformanceCounter(&end);
+	result->create_seconds = seconds_between(start, end, frequency);
+	print_rate("create+1B", count, result->create_seconds);
+	result->used_after_create = (uint64_t)fs->used_bytes;
+	result->resident_after_create = (uint64_t)fs->resident_bytes;
+	print_fs_state(fs, "after-create");
+
+
+	QueryPerformanceCounter(&start);
+	for (i = 0; i < count; i++) {
+		MemfsNode* node;
+		swprintf_s(name, _countof(name), L"ld%07u", i);
+		node = memfs_dir_lookup(fs->root, name);
+		if (node == NULL) {
+			return fail(fs, "large dir lookup failed", i);
+		}
+	}
+	QueryPerformanceCounter(&end);
+	result->lookup_seconds = seconds_between(start, end, frequency);
+	print_rate("lookup", count, result->lookup_seconds);
+
+	QueryPerformanceCounter(&start);
+	for (i = 0; i < count; i++) {
+		MemfsNode* node;
+		swprintf_s(name, _countof(name), L"ld%07u", i);
+		node = memfs_dir_lookup(fs->root, name);
+		if (node == NULL || memfs_node_unlink(node) != MEMFS_OK) {
+			return fail(fs, "large dir delete failed", i);
+		}
+	}
+	QueryPerformanceCounter(&end);
+	result->delete_seconds = seconds_between(start, end, frequency);
+	print_rate("delete", count, result->delete_seconds);
+	result->used_after_delete = (uint64_t)fs->used_bytes;
+	result->resident_after_delete = (uint64_t)fs->resident_bytes;
+	print_fs_state(fs, "after-delete");
+
+	return 0;
+}
 static int run_suite(const BenchConfig* config, const char* label, LARGE_INTEGER frequency, BenchResult* results) {
 	Memfs* fs = NULL;
 	uint64_t private_before;
@@ -363,6 +426,19 @@ static int run_suite(const BenchConfig* config, const char* label, LARGE_INTEGER
 		return rc;
 	}
 
+	{
+		static const uint32_t large_dir_counts[4] = {128U, 256U, 512U, 4096U};
+		static const char* large_dir_labels[4] = {"dir128", "dir256", "dir512", "dir4096"};
+		uint32_t k;
+		for (k = 0; k < 4; k++) {
+			results[4 + k].label = large_dir_labels[k];
+			rc = bench_large_dir(fs, large_dir_counts[k], frequency, &results[4 + k]);
+			if (rc != 0) {
+				return rc;
+			}
+		}
+	}
+
 	private_after = private_bytes();
 	memfs_allocator_get_stats(&fs->allocator, &stats);
 
@@ -399,8 +475,9 @@ static void print_comparison(const BenchResult* plain, const BenchResult* compre
 
 	printf("\n[comparison]\n");
 	printf("%-12s %-10s %12s %12s %12s %12s\n", "mode", "suite", "create_ops/s", "delete_ops/s", "used_after", "resident_after");
-	for (i = 0; i < 4; i++) {
-		uint32_t counts[4] = {BENCH_SMALL_FILE_COUNT, BENCH_4KB_FILE_COUNT, BENCH_1MB_FILE_COUNT, BENCH_RANDOM_REWRITE_COUNT};
+	for (i = 0; i < 8; i++) {
+		uint32_t counts[8] = {BENCH_SMALL_FILE_COUNT, BENCH_4KB_FILE_COUNT, BENCH_1MB_FILE_COUNT, BENCH_RANDOM_REWRITE_COUNT,
+							  128U, 256U, 512U, 4096U};
 		uint32_t j;
 
 		for (j = 0; j < 3; j++) {
@@ -467,9 +544,9 @@ int main(int argc, char** argv) {
 	BenchConfig plain;
 	BenchConfig compression;
 	BenchConfig encryption;
-	BenchResult plain_results[4];
-	BenchResult compression_results[4];
-	BenchResult encryption_results[4];
+	BenchResult plain_results[8];
+	BenchResult compression_results[8];
+	BenchResult encryption_results[8];
 	BenchMode mode;
 	int rc;
 
