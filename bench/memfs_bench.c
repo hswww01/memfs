@@ -494,10 +494,41 @@ static void print_comparison(const BenchResult* plain, const BenchResult* compre
 		}
 	}
 }
+static void print_comparison_csv(const BenchResult* plain, const BenchResult* compression, const BenchResult* encryption,
+								  const BenchResult* combined) {
+	const BenchResult* modes[4];
+	const char* names[4];
+	uint32_t i;
+	uint32_t counts[8] = {BENCH_SMALL_FILE_COUNT, BENCH_4KB_FILE_COUNT, BENCH_1MB_FILE_COUNT, BENCH_RANDOM_REWRITE_COUNT,
+						  128U, 256U, 512U, 4096U};
+
+	modes[0] = plain;
+	names[0] = "plain";
+	modes[1] = compression;
+	names[1] = "compression";
+	modes[2] = encryption;
+	names[2] = "encryption";
+	modes[3] = combined;
+	names[3] = "combined";
+
+	printf("\n[comparison-csv]\n");
+	printf("mode,suite,create_ops_per_s,delete_ops_per_s,used_after_create,resident_after_create\n");
+	for (i = 0; i < 8; i++) {
+		uint32_t j;
+		for (j = 0; j < 4; j++) {
+			double create_ops = modes[j][i].create_seconds > 0.0 ? (double)counts[i] / modes[j][i].create_seconds : 0.0;
+			double delete_ops = modes[j][i].delete_seconds > 0.0 ? (double)counts[i] / modes[j][i].delete_seconds : 0.0;
+			printf("%s,%s,%.0f,%.0f,%llu,%llu\n", names[j], modes[j][i].label, create_ops, delete_ops,
+				   (unsigned long long)modes[j][i].used_after_create,
+				   (unsigned long long)modes[j][i].resident_after_create);
+		}
+	}
+}
 static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* compression, BenchConfig* encryption,
-					  BenchConfig* combined, BenchMode* mode) {
+					  BenchConfig* combined, BenchMode* mode, bool* csv_enabled) {
 	int i;
 
+	*csv_enabled = false;
 	memset(plain, 0, sizeof(*plain));
 	memset(compression, 0, sizeof(*compression));
 	memset(encryption, 0, sizeof(*encryption));
@@ -528,6 +559,8 @@ static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* co
 			*mode = BENCH_MODE_COMBINED;
 		} else if (strcmp(argv[i], "--compare") == 0) {
 			*mode = BENCH_MODE_COMPARE;
+		} else if (strcmp(argv[i], "--csv") == 0) {
+			*csv_enabled = true;
 		} else if (strcmp(argv[i], "--compression-level") == 0) {
 			if (i + 1 >= argc) {
 				fprintf(stderr, "--compression-level requires a value\n");
@@ -542,6 +575,7 @@ static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* co
 			printf("  --encryption         run encryption mode only\n");
 			printf("  --combined           run compression+encryption combined mode only\n");
 			printf("  --compression-level N set compression level for compression mode\n");
+			printf("  --csv                append CSV comparison data after --compare table\n");
 			return 2;
 		} else {
 			fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -562,6 +596,7 @@ int main(int argc, char** argv) {
 	BenchResult encryption_results[8];
 	BenchResult combined_results[8];
 	BenchMode mode;
+	bool csv_enabled = false;
 	int rc;
 
 	if (!QueryPerformanceFrequency(&frequency)) {
@@ -569,7 +604,7 @@ int main(int argc, char** argv) {
 		return 2;
 	}
 
-	rc = parse_args(argc, argv, &plain, &compression, &encryption, &combined, &mode);
+	rc = parse_args(argc, argv, &plain, &compression, &encryption, &combined, &mode, &csv_enabled);
 	if (rc == 2)
 		return 0;
 	if (rc != 0)
@@ -597,6 +632,9 @@ int main(int argc, char** argv) {
 		}
 
 		print_comparison(plain_results, compression_results, encryption_results, combined_results);
+		if (csv_enabled) {
+			print_comparison_csv(plain_results, compression_results, encryption_results, combined_results);
+		}
 	} else if (mode == BENCH_MODE_PLAIN) {
 		rc = run_suite(&plain, "plain", frequency, plain_results);
 	} else if (mode == BENCH_MODE_COMPRESSION) {
