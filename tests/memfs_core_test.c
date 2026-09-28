@@ -977,6 +977,54 @@ static void test_open_delete_lifetime(void) {
 }
 
 
+
+static void check_node_invariant(MemfsNode* node) {
+	CHECK(node != NULL);
+	if (node == NULL)
+		return;
+
+	if (memfs_node_is_directory(node)) {
+		CHECK(node->dir != NULL);
+		return;
+	}
+
+	if (node->paged_storage) {
+		CHECK(!node->small_inline);
+		CHECK(node->small_capacity == 0);
+		CHECK(node->storage_meta != NULL);
+	}
+
+	if (node->small_inline) {
+		CHECK(!node->paged_storage);
+		CHECK(node->small_capacity != 0);
+	}
+}
+
+static void test_storage_state_invariants(void) {
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	uint8_t data[4096];
+	uint32_t transferred;
+
+	printf("== storage state invariants ==\\n");
+	memset(data, 0x5a, sizeof(data));
+
+	CHECK(memfs_create(16ULL * 1024ULL * 1024ULL, L"INV", &fs) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, fs->root, L"state.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+
+	check_node_invariant(file);
+	CHECK(memfs_node_write(file, data, 0, 8, false, false, &transferred) == MEMFS_OK);
+	check_node_invariant(file);
+	CHECK(memfs_node_write(file, data, 0, sizeof(data), false, false, &transferred) == MEMFS_OK);
+	check_node_invariant(file);
+	CHECK(memfs_node_set_file_size(file, 1) == MEMFS_OK);
+	check_node_invariant(file);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	memfs_destroy(fs);
+}
+
 int main(void) {
 	setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -997,6 +1045,7 @@ int main(void) {
 	test_shared_security();
 	test_concurrent_files();
 	test_allocator_reclaim();
+	test_storage_state_invariants();
 	test_open_delete_lifetime();
 
 	printf("\nchecks=%d failures=%d => %s\n", g_checks, g_failures, g_failures ? "FAIL" : "PASS");
