@@ -945,6 +945,52 @@ static void test_allocator_reclaim(void) {
 }
 
 
+static void test_allocator_stress(void) {
+	enum { FILES = 4096, ROUNDS = 8 };
+	Memfs* fs = NULL;
+	MemfsNode* node;
+	MemfsAllocatorStats before;
+	MemfsAllocatorStats after;
+	uint32_t round;
+	uint32_t i;
+	wchar_t name[32];
+
+	printf("== allocator stress ==\n");
+
+	CHECK(memfs_create(64ULL * 1024ULL * 1024ULL, L"STRESS", &fs) == MEMFS_OK);
+	if (fs == NULL)
+		return;
+
+	for (round = 0; round < ROUNDS; round++) {
+		for (i = 0; i < FILES; i++) {
+			swprintf_s(name, _countof(name), L"stress-%03u-%04u", round, i);
+			CHECK(memfs_node_create(fs, fs->root, name, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) == MEMFS_OK);
+			if (node) {
+				CHECK(memfs_node_unlink(node) == MEMFS_OK);
+				memfs_node_close(node);
+			}
+		}
+	}
+
+	memfs_allocator_get_stats(&fs->allocator, &before);
+	CHECK(before.live_objects > 0);
+	CHECK(before.reserved_bytes > 0);
+
+	for (i = 0; i < FILES; i++) {
+		swprintf_s(name, _countof(name), L"stress-%03u-%04u", ROUNDS - 1U, i);
+		node = memfs_dir_lookup(fs->root, name);
+		CHECK(node == NULL);
+	}
+
+	memfs_allocator_get_stats(&fs->allocator, &after);
+	CHECK(after.live_objects <= before.live_objects);
+	CHECK(after.reserved_bytes <= before.reserved_bytes);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+
+	memfs_destroy(fs);
+}
+
 static void test_open_delete_lifetime(void) {
 	Memfs* fs = NULL;
 	MemfsNode* file;
@@ -1085,6 +1131,7 @@ int main(void) {
 	test_shared_security();
 	test_concurrent_files();
 	test_allocator_reclaim();
+	test_allocator_stress();
 	test_storage_state_invariants();
 	test_open_delete_lifetime();
 	test_rename_delete_lifetime();
