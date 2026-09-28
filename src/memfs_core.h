@@ -52,7 +52,7 @@ typedef enum MemfsResult {
 
 typedef struct Memfs Memfs;
 typedef struct MemfsNode MemfsNode;
-typedef struct MemfsMetaTable MemfsMetaTable;
+typedef struct MemfsStorageMeta MemfsStorageMeta;
 typedef struct MemfsDir MemfsDir;
 typedef struct MemfsDirHash MemfsDirHash;
 typedef struct MemfsSecurity MemfsSecurity;
@@ -124,6 +124,12 @@ void memfs_node_set_last_access_time(MemfsNode* node, uint64_t value);
 void memfs_node_set_last_write_time(MemfsNode* node, uint64_t value);
 void memfs_node_set_change_time(MemfsNode* node, uint64_t value);
 
+uint32_t memfs_node_page_group_count(const MemfsNode* node);
+uint32_t memfs_node_page_group_capacity(const MemfsNode* node);
+uint64_t memfs_node_page_group_index(const MemfsNode* node, uint32_t position);
+MemfsPageGroup* memfs_node_page_group(const MemfsNode* node, uint32_t position);
+int8_t memfs_node_compression_score(const MemfsNode* node);
+
 struct MemfsNode {
 	Memfs* fs;
 	MemfsNode* parent;
@@ -140,22 +146,27 @@ struct MemfsNode {
 		MemfsDir* dir;
 		MemfsPage* small_page;
 		uint8_t small_inline_data[sizeof(MemfsPage*)];
-		MemfsPageGroupEntry* page_groups;
+		MemfsStorageMeta* storage_meta;
 	};
 
 	uint64_t file_size;
 	uint64_t allocation_size;
 
+	MemfsSecurity* security;
 	uint64_t index_number;
-	uint32_t page_group_count;
-	uint32_t page_group_capacity;
+	uint64_t creation_time;
+	uint64_t last_access_time;
+	uint64_t last_write_time;
+	uint64_t change_time;
+
 	uint32_t attributes;
 	uint32_t open_count;
 	uint32_t name_hash;
 	uint16_t small_capacity;
 	uint8_t small_inline : 1;
 	uint8_t deleted : 1;
-	uint8_t reserved_flags : 6;
+	uint8_t paged_storage : 1;
+	uint8_t reserved_flags : 5;
 	int8_t compression_score;
 };
 
@@ -163,7 +174,6 @@ struct MemfsNode {
 
 struct Memfs {
 	MemfsAllocator allocator;
-	MemfsMetaTable* meta_table;
 
 	MemfsNode* root;
 

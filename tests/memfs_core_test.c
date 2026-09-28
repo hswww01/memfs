@@ -226,7 +226,7 @@ static void test_small_storage(void) {
 	CHECK(memfs_node_write(file, &value, 0, 1, false, false, &transferred) == MEMFS_OK);
 	CHECK(transferred == 1);
 	CHECK(file->small_inline);
-	CHECK(file->page_group_count == 0);
+	CHECK(memfs_node_page_group_count(file) == 0);
 	CHECK(file->small_capacity == 1);
 	CHECK(memfs_node_resident_bytes(file) == 0);
 	CHECK((uint64_t)fs->resident_bytes == 0);
@@ -295,18 +295,18 @@ static void test_sparse_pages(void) {
 	CHECK(memfs_node_resident_bytes(file) < MEMFS_PAGE_SIZE + 64U);
 	CHECK((uint64_t)fs->resident_bytes >= MEMFS_PAGE_SIZE);
 	CHECK((uint64_t)fs->resident_bytes < MEMFS_PAGE_SIZE + 64U);
-	CHECK(file->page_group_count != 0);
+	CHECK(memfs_node_page_group_count(file) != 0);
 	CHECK(sizeof(MemfsPageGroup) <= 64U);
-	if (file->page_group_count != 0) {
+	if (memfs_node_page_group_count(file) != 0) {
 		uint64_t group_index = (write_offset >> MEMFS_PAGE_SHIFT) >> MEMFS_PAGE_GROUP_SHIFT;
 		MemfsPageGroup* group = NULL;
 
-		CHECK(file->page_group_count == 1);
-		CHECK(file->page_group_capacity == 1);
-		CHECK(file->page_groups[0].index == group_index);
+		CHECK(memfs_node_page_group_count(file) == 1);
+		CHECK(memfs_node_page_group_capacity(file) == 1);
+		CHECK(memfs_node_page_group_index(file, 0) == group_index);
 
-		if (file->page_group_count == 1)
-			group = file->page_groups[0].group;
+		if (memfs_node_page_group_count(file) == 1)
+			group = memfs_node_page_group(file, 0);
 
 		CHECK(group != NULL);
 		if (group) {
@@ -362,16 +362,16 @@ static void test_very_high_sparse_offset(void) {
 	CHECK(memfs_node_write(file, &value, offset, 1, false, false, &transferred) == MEMFS_OK);
 	CHECK(transferred == 1);
 
-	CHECK(file->page_group_count == 1);
-	CHECK(file->page_group_capacity == 1);
-	CHECK(file->page_group_count != 0);
+	CHECK(memfs_node_page_group_count(file) == 1);
+	CHECK(memfs_node_page_group_capacity(file) == 1);
+	CHECK(memfs_node_page_group_count(file) != 0);
 
-	if (file->page_group_count != 0) {
-		CHECK(file->page_groups[0].index == expected_group);
-		CHECK(file->page_groups[0].group != NULL);
-		if (file->page_groups[0].group) {
-			CHECK(file->page_groups[0].group->page_count == 1);
-			CHECK(file->page_groups[0].group->page_capacity == 1);
+	if (memfs_node_page_group_count(file) != 0) {
+		CHECK(memfs_node_page_group_index(file, 0) == expected_group);
+		CHECK(memfs_node_page_group(file, 0) != NULL);
+		if (memfs_node_page_group(file, 0)) {
+			CHECK(memfs_node_page_group(file, 0)->page_count == 1);
+			CHECK(memfs_node_page_group(file, 0)->page_capacity == 1);
 		}
 	}
 
@@ -409,7 +409,7 @@ static void test_small_to_paged_promotion(void) {
 	CHECK(memfs_node_write(file, &value, 2ULL * MEMFS_PAGE_SIZE + 17, 1, false, false, &transferred) == MEMFS_OK);
 
 	CHECK(file->small_capacity == 0);
-	CHECK(file->page_group_count != 0);
+	CHECK(memfs_node_page_group_count(file) != 0);
 	CHECK(memfs_node_resident_bytes(file) >= 2ULL * MEMFS_PAGE_SIZE);
 	CHECK(memfs_node_resident_bytes(file) < 2ULL * MEMFS_PAGE_SIZE + 128U);
 
@@ -419,7 +419,7 @@ static void test_small_to_paged_promotion(void) {
 
 	CHECK(memfs_node_set_file_size(file, 1024) == MEMFS_OK);
 	CHECK(!file->small_inline);
-	CHECK(file->page_group_count == 0);
+	CHECK(memfs_node_page_group_count(file) == 0);
 	CHECK(memfs_node_resident_bytes(file) >= 1024);
 	CHECK(memfs_node_resident_bytes(file) < 1088);
 
@@ -457,7 +457,7 @@ static void test_large_directory(void) {
 	CHECK(fs->root->dir->child_count == COUNT);
 	CHECK(fs->root->dir->hash != NULL);
 	CHECK(sizeof(MemfsDir) <= 24);
-	CHECK(sizeof(MemfsNode) <= 144);
+	CHECK(sizeof(MemfsNode) <= 136);
 	CHECK(fs->root->dir->hash->count == COUNT);
 
 	for (i = 0; i < COUNT; i += 97U) {
@@ -542,9 +542,9 @@ static void test_compression(void) {
 
 	CHECK(memfs_node_write(file, input, 0, sizeof(input), false, false, &transferred) == MEMFS_OK);
 	CHECK(transferred == sizeof(input));
-	CHECK(file->page_group_count != 0);
+	CHECK(memfs_node_page_group_count(file) != 0);
 
-	group = file->page_groups[0].group;
+	group = memfs_node_page_group(file, 0);
 	CHECK(group != NULL);
 	if (group) {
 		CHECK(group->pages[0] != NULL);
@@ -603,7 +603,7 @@ static void test_adaptive_compression(void) {
 							   &transferred) == MEMFS_OK);
 	}
 
-	CHECK(file->compression_score >= MEMFS_COMPRESSION_SKIP_SCORE);
+	CHECK(memfs_node_compression_score(file) >= MEMFS_COMPRESSION_SKIP_SCORE);
 
 	// Data becomes compressible. Periodic probes must discover this and
 	// re-enable normal compression attempts.
@@ -613,9 +613,9 @@ static void test_adaptive_compression(void) {
 							   &transferred) == MEMFS_OK);
 	}
 
-	CHECK(file->compression_score < MEMFS_COMPRESSION_SKIP_SCORE);
+	CHECK(memfs_node_compression_score(file) < MEMFS_COMPRESSION_SKIP_SCORE);
 
-	group = file->page_groups[0].group;
+	group = memfs_node_page_group(file, 0);
 	CHECK(group != NULL);
 	if (group && group->page_count == 128) {
 		CHECK(0 != (group->pages[127]->flags & MEMFS_PAGE_COMPRESSED));
@@ -714,7 +714,7 @@ static void test_compression_encryption(void) {
 
 	CHECK(memfs_node_write(file, input, 0, sizeof(input), false, false, &transferred) == MEMFS_OK);
 
-	group = file->page_group_count ? file->page_groups[0].group : NULL;
+	group = memfs_node_page_group_count(file) ? memfs_node_page_group(file, 0) : NULL;
 	CHECK(group != NULL);
 	if (group && group->pages[0]) {
 		CHECK(0 != (group->pages[0]->flags & MEMFS_PAGE_COMPRESSED));

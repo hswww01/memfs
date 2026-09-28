@@ -27,6 +27,8 @@ static void print_rate(const char* label, uint32_t count, double seconds) {
 
 int main(int argc, char** argv) {
 	uint32_t count = 1000000U;
+	uint32_t payload_size = 0;
+	uint8_t payload[MEMFS_SMALL_LIMIT];
 	Memfs* fs = NULL;
 	MemfsNode* node = NULL;
 	MemfsAllocatorStats stats;
@@ -48,6 +50,16 @@ int main(int argc, char** argv) {
 		count = (uint32_t)requested;
 	}
 
+	if (argc > 2) {
+		unsigned long requested = strtoul(argv[2], NULL, 10);
+		if (requested > MEMFS_SMALL_LIMIT) {
+			fprintf(stderr, "invalid payload size: %s\n", argv[2]);
+			return 2;
+		}
+		payload_size = (uint32_t)requested;
+	}
+	memset(payload, 0x5a, sizeof(payload));
+
 	if (!QueryPerformanceFrequency(&frequency)) {
 		fprintf(stderr, "QueryPerformanceFrequency failed\n");
 		return 2;
@@ -57,6 +69,9 @@ int main(int argc, char** argv) {
 		fprintf(stderr, "memfs_create failed\n");
 		return 1;
 	}
+
+	printf("MemfsNode:          %zu B\n", sizeof(MemfsNode));
+	printf("payload/file:       %u B\n", payload_size);
 
 	private_before = private_bytes();
 
@@ -68,6 +83,16 @@ int main(int argc, char** argv) {
 			fprintf(stderr, "create failed at %u\n", i);
 			memfs_destroy(fs);
 			return 1;
+		}
+
+		if (payload_size != 0) {
+			uint32_t written = 0;
+			if (memfs_node_write(node, payload, 0, payload_size, false, false, &written) != MEMFS_OK ||
+				written != payload_size) {
+				fprintf(stderr, "write failed at %u\n", i);
+				memfs_destroy(fs);
+				return 1;
+			}
 		}
 
 		memfs_node_close(node);

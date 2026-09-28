@@ -1,6 +1,5 @@
 ﻿#include "memfs_core.h"
 #include "memfs_object.h"
-#include "memfs_meta_table.h"
 
 #include <intrin.h>
 #include <sddl.h>
@@ -10,92 +9,50 @@
 
 #define MEMFS_DEFAULT_SDDL L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)"
 
-typedef struct MemfsNodeMetaValue {
-	MemfsSecurity* security;
-	uint64_t creation_time;
-	uint64_t last_access_time;
-	uint64_t last_write_time;
-	uint64_t change_time;
-} MemfsNodeMetaValue;
+struct MemfsStorageMeta {
+	MemfsPageGroupEntry* groups;
+	uint32_t count;
+	uint32_t capacity;
+};
 
-static MemfsNodeMetaValue* memfs_meta_lookup(MemfsNode* node) {
-	return node && node->fs ? (MemfsNodeMetaValue*)memfs_meta_table_lookup(node->fs->meta_table, node->index_number)
-							: NULL;
-}
 MemfsSecurity* memfs_node_get_security(MemfsNode* node) {
-	MemfsNodeMetaValue* meta = memfs_meta_lookup(node);
-	return meta ? meta->security : NULL;
+	return node ? node->security : NULL;
 }
 
 uint64_t memfs_node_get_creation_time(const MemfsNode* node) {
-	MemfsNodeMetaValue* meta = memfs_meta_lookup((MemfsNode*)node);
-	return meta ? meta->creation_time : 0;
+	return node ? node->creation_time : 0;
 }
 
 uint64_t memfs_node_get_last_access_time(const MemfsNode* node) {
-	MemfsNodeMetaValue* meta = memfs_meta_lookup((MemfsNode*)node);
-	return meta ? meta->last_access_time : 0;
+	return node ? node->last_access_time : 0;
 }
 
 uint64_t memfs_node_get_last_write_time(const MemfsNode* node) {
-	MemfsNodeMetaValue* meta = memfs_meta_lookup((MemfsNode*)node);
-	return meta ? meta->last_write_time : 0;
+	return node ? node->last_write_time : 0;
 }
 
 uint64_t memfs_node_get_change_time(const MemfsNode* node) {
-	MemfsNodeMetaValue* meta = memfs_meta_lookup((MemfsNode*)node);
-	return meta ? meta->change_time : 0;
-}
-static MemfsNodeMetaValue* memfs_meta_get_or_create(MemfsNode* node) {
-	MemfsNodeMetaValue* meta;
-
-	if (node == NULL || node->fs == NULL)
-		return NULL;
-
-	meta = memfs_meta_lookup(node);
-	if (meta != NULL)
-		return meta;
-
-	meta = calloc(1, sizeof(*meta));
-	if (meta == NULL)
-		return NULL;
-
-
-	if (!memfs_meta_table_insert(node->fs->meta_table, node->index_number, meta)) {
-		free(meta);
-		return (MemfsNodeMetaValue*)memfs_meta_lookup(node);
-	}
-
-	return meta;
-}
-
-static bool memfs_node_set_security_meta(MemfsNode* node, MemfsSecurity* security) {
-	MemfsNodeMetaValue* meta = memfs_meta_get_or_create(node);
-	if (meta == NULL)
-		return false;
-	meta->security = security;
-	return true;
+	return node ? node->change_time : 0;
 }
 
 void memfs_node_set_creation_time(MemfsNode* node, uint64_t value) {
-	MemfsNodeMetaValue* meta = memfs_meta_get_or_create(node);
-	if (meta)
-		meta->creation_time = value;
+	if (node)
+		node->creation_time = value;
 }
+
 void memfs_node_set_last_access_time(MemfsNode* node, uint64_t value) {
-	MemfsNodeMetaValue* meta = memfs_meta_get_or_create(node);
-	if (meta)
-		meta->last_access_time = value;
+	if (node)
+		node->last_access_time = value;
 }
+
 void memfs_node_set_last_write_time(MemfsNode* node, uint64_t value) {
-	MemfsNodeMetaValue* meta = memfs_meta_get_or_create(node);
-	if (meta)
-		meta->last_write_time = value;
+	if (node)
+		node->last_write_time = value;
 }
+
 void memfs_node_set_change_time(MemfsNode* node, uint64_t value) {
-	MemfsNodeMetaValue* meta = memfs_meta_get_or_create(node);
-	if (meta)
-		meta->change_time = value;
+	if (node)
+		node->change_time = value;
 }
 
 static void memfs_dir_destroy(MemfsDir* dir) {
@@ -531,68 +488,125 @@ static void memfs_group_try_shrink(MemfsPageGroup* group) {
 	}
 }
 
-
-static uint32_t memfs_storage_group_count(MemfsNode* node) {
-	return node ? node->page_group_count : 0;
+static MemfsStorageMeta* memfs_storage_meta(MemfsNode* node) {
+	if (node == NULL || !node->paged_storage)
+		return NULL;
+	return node->storage_meta;
 }
 
-static uint32_t memfs_storage_group_capacity(MemfsNode* node) {
-	return node ? node->page_group_capacity : 0;
+static MemfsStorageMeta* memfs_storage_meta_get_or_create(MemfsNode* node) {
+	MemfsStorageMeta* meta;
+
+	if (node == NULL || MEMFS_NODE_IS_DIRECTORY(node) || node->small_capacity != 0)
+		return NULL;
+
+	meta = memfs_storage_meta(node);
+	if (meta != NULL)
+		return meta;
+
+	meta = calloc(1, sizeof(*meta));
+	if (meta == NULL)
+		return NULL;
+
+	node->storage_meta = meta;
+	node->paged_storage = true;
+	return meta;
+}
+
+static uint32_t memfs_storage_group_count(const MemfsNode* node) {
+	MemfsStorageMeta* meta = memfs_storage_meta((MemfsNode*)node);
+	return meta ? meta->count : 0;
+}
+
+static uint32_t memfs_storage_group_capacity(const MemfsNode* node) {
+	MemfsStorageMeta* meta = memfs_storage_meta((MemfsNode*)node);
+	return meta ? meta->capacity : 0;
 }
 
 static MemfsPageGroupEntry* memfs_storage_groups(MemfsNode* node) {
-	return node ? node->page_groups : NULL;
+	MemfsStorageMeta* meta = memfs_storage_meta(node);
+	return meta ? meta->groups : NULL;
 }
 
 static void memfs_storage_set_group_count(MemfsNode* node, uint32_t value) {
-	if (node)
-		node->page_group_count = value;
-}
+	MemfsStorageMeta* meta = memfs_storage_meta(node);
 
-static void memfs_storage_set_group_capacity(MemfsNode* node, uint32_t value) {
-	if (node)
-		node->page_group_capacity = value;
-}
-
-static void memfs_storage_group_entry_insert(MemfsNode* node, uint32_t pos, uint64_t index, MemfsPageGroup* group) {
-	MemfsPageGroupEntry* entries = memfs_storage_groups(node);
-	entries[pos].index = index;
-	entries[pos].group = group;
-}
-
-static MemfsPageGroup* memfs_storage_group_entry_get(MemfsNode* node, uint32_t pos) {
-	MemfsPageGroupEntry* entries = memfs_storage_groups(node);
-	return entries ? entries[pos].group : NULL;
+	if (meta != NULL)
+		meta->count = value;
 }
 
 static void memfs_storage_clear_group_array(MemfsNode* node) {
+	MemfsStorageMeta* meta;
+
 	if (node == NULL)
 		return;
-	free(node->page_groups);
-	node->page_groups = NULL;
-	memfs_storage_set_group_count(node, 0);
-	memfs_storage_set_group_capacity(node, 0);
-}
-static MemfsPageGroup* memfs_storage_group_at(MemfsNode* node, uint32_t index) {
-	if (node == NULL || index >= memfs_storage_group_count(node))
-		return NULL;
-	return memfs_storage_groups(node)[index].group;
+
+	meta = memfs_storage_meta(node);
+	if (meta != NULL) {
+		free(meta->groups);
+		free(meta);
+	}
+
+	node->storage_meta = NULL;
+	node->paged_storage = false;
 }
 
-static void memfs_storage_group_set(MemfsNode* node, uint32_t index, uint64_t group_index, MemfsPageGroup* group) {
-	if (node == NULL || index >= memfs_storage_group_capacity(node))
+static MemfsPageGroup* memfs_storage_group_at(const MemfsNode* node, uint32_t position) {
+	MemfsPageGroupEntry* entries = memfs_storage_groups((MemfsNode*)node);
+
+	if (entries == NULL || position >= memfs_storage_group_count(node))
+		return NULL;
+
+	return entries[position].group;
+}
+
+static uint64_t memfs_storage_group_index_at(MemfsNode* node, uint32_t position) {
+	MemfsPageGroupEntry* entries = memfs_storage_groups(node);
+
+	if (entries == NULL || position >= memfs_storage_group_count(node))
+		return UINT64_MAX;
+
+	return entries[position].index;
+}
+
+static void memfs_storage_group_set(MemfsNode* node, uint32_t position, uint64_t group_index, MemfsPageGroup* group) {
+	MemfsPageGroupEntry* entries = memfs_storage_groups(node);
+
+	if (entries == NULL || position >= memfs_storage_group_capacity(node))
 		return;
-	memfs_storage_groups(node)[index].index = group_index;
-	memfs_storage_groups(node)[index].group = group;
+
+	entries[position].index = group_index;
+	entries[position].group = group;
+}
+
+uint32_t memfs_node_page_group_count(const MemfsNode* node) {
+	return memfs_storage_group_count(node);
+}
+
+uint32_t memfs_node_page_group_capacity(const MemfsNode* node) {
+	return memfs_storage_group_capacity(node);
+}
+
+uint64_t memfs_node_page_group_index(const MemfsNode* node, uint32_t position) {
+	return memfs_storage_group_index_at((MemfsNode*)node, position);
+}
+
+MemfsPageGroup* memfs_node_page_group(const MemfsNode* node, uint32_t position) {
+	return memfs_storage_group_at(node, position);
+}
+
+int8_t memfs_node_compression_score(const MemfsNode* node) {
+	return node ? node->compression_score : 0;
 }
 
 static uint32_t memfs_storage_group_position(MemfsNode* node, uint64_t group_index, bool* found) {
+	MemfsPageGroupEntry* entries = memfs_storage_groups(node);
 	uint32_t lo = 0;
 	uint32_t hi = memfs_storage_group_count(node);
 
 	while (lo < hi) {
 		uint32_t mid = lo + (hi - lo) / 2U;
-		uint64_t current = node->page_groups[mid].index;
+		uint64_t current = entries[mid].index;
 
 		if (current < group_index)
 			lo = mid + 1U;
@@ -600,9 +614,8 @@ static uint32_t memfs_storage_group_position(MemfsNode* node, uint64_t group_ind
 			hi = mid;
 	}
 
-	if (found) {
-		*found = lo < memfs_storage_group_count(node) && memfs_storage_groups(node)[lo].index == group_index;
-	}
+	if (found)
+		*found = lo < memfs_storage_group_count(node) && entries[lo].index == group_index;
 
 	return lo;
 }
@@ -611,21 +624,22 @@ static MemfsPageGroup* memfs_storage_group(MemfsNode* node, uint64_t group_index
 	bool found;
 	uint32_t pos = memfs_storage_group_position(node, group_index, &found);
 
-	if (!found)
-		return NULL;
-
-	return node->page_groups[pos].group;
+	return found ? memfs_storage_group_at(node, pos) : NULL;
 }
 
 static MemfsResult memfs_storage_group_reserve(MemfsNode* node, uint32_t required) {
+	MemfsStorageMeta* meta;
 	MemfsPageGroupEntry* entries;
 	uint32_t capacity;
 
 	if (required <= memfs_storage_group_capacity(node))
 		return MEMFS_OK;
 
-	capacity = memfs_storage_group_capacity(node) ? memfs_storage_group_capacity(node) : 1U;
+	meta = memfs_storage_meta_get_or_create(node);
+	if (meta == NULL)
+		return MEMFS_ERR_NO_MEMORY;
 
+	capacity = meta->capacity ? meta->capacity : 1U;
 	while (capacity < required) {
 		if (capacity > UINT32_MAX / 2U) {
 			capacity = required;
@@ -634,40 +648,45 @@ static MemfsResult memfs_storage_group_reserve(MemfsNode* node, uint32_t require
 		capacity <<= 1;
 	}
 
-	if ((size_t)capacity > SIZE_MAX / sizeof(*entries)) {
+	if ((size_t)capacity > SIZE_MAX / sizeof(*entries))
+		return MEMFS_ERR_NO_MEMORY;
+
+	entries = realloc(meta->groups, (size_t)capacity * sizeof(*entries));
+	if (entries == NULL) {
+		if (meta->count == 0 && meta->capacity == 0)
+			memfs_storage_clear_group_array(node);
 		return MEMFS_ERR_NO_MEMORY;
 	}
 
-	entries = realloc(node->page_groups, (size_t)capacity * sizeof(*entries));
-	if (entries == NULL)
-		return MEMFS_ERR_NO_MEMORY;
-
-	node->page_groups = entries;
-	node->page_group_capacity = capacity;
+	meta->groups = entries;
+	meta->capacity = capacity;
 	return MEMFS_OK;
 }
 
 static void memfs_storage_group_try_shrink(MemfsNode* node) {
+	MemfsStorageMeta* meta = memfs_storage_meta(node);
 	MemfsPageGroupEntry* entries;
 	uint32_t target;
 
-	if (node->page_group_count == 0) {
+	if (meta == NULL)
+		return;
+
+	if (meta->count == 0) {
 		memfs_storage_clear_group_array(node);
 		return;
 	}
 
-	if (node->page_group_capacity <= 1U || node->page_group_count * 2U > node->page_group_capacity) {
+	if (meta->capacity <= 1U || meta->count * 2U > meta->capacity)
 		return;
-	}
 
 	target = 1U;
-	while (target < node->page_group_count)
+	while (target < meta->count)
 		target <<= 1;
 
-	entries = realloc(node->page_groups, (size_t)target * sizeof(*entries));
-	if (entries) {
-		node->page_groups = entries;
-		node->page_group_capacity = target;
+	entries = realloc(meta->groups, (size_t)target * sizeof(*entries));
+	if (entries != NULL) {
+		meta->groups = entries;
+		meta->capacity = target;
 	}
 }
 
@@ -682,8 +701,10 @@ static MemfsPage* memfs_storage_page(MemfsNode* node, uint64_t page_index) {
 }
 
 static MemfsResult memfs_storage_ensure_group(MemfsNode* node, uint64_t group_index, MemfsPageGroup** out_group) {
+	MemfsPageGroupEntry* entries;
 	bool found;
 	uint32_t pos = memfs_storage_group_position(node, group_index, &found);
+	uint32_t count;
 	MemfsPageGroup* group;
 	MemfsResult result;
 
@@ -696,25 +717,27 @@ static MemfsResult memfs_storage_ensure_group(MemfsNode* node, uint64_t group_in
 	if (group == NULL)
 		return MEMFS_ERR_NO_MEMORY;
 
-	result = memfs_storage_group_reserve(node, node->page_group_count + 1U);
+	count = memfs_storage_group_count(node);
+	result = memfs_storage_group_reserve(node, count + 1U);
 	if (result != MEMFS_OK) {
 		memfs_allocator_free_page_group(&node->fs->allocator, group);
 		return result;
 	}
 
-	memmove(node->page_groups + pos + 1U, node->page_groups + pos,
-			(size_t)(node->page_group_count - pos) * sizeof(*node->page_groups));
-
+	entries = memfs_storage_groups(node);
+	memmove(entries + pos + 1U, entries + pos, (size_t)(count - pos) * sizeof(*entries));
 	memfs_storage_group_set(node, pos, group_index, group);
-	memfs_storage_set_group_count(node, node->page_group_count + 1U);
+	memfs_storage_set_group_count(node, count + 1U);
 
 	*out_group = group;
 	return MEMFS_OK;
 }
 
 static void memfs_storage_remove_group(MemfsNode* node, uint64_t group_index) {
+	MemfsPageGroupEntry* entries;
 	bool found;
 	uint32_t pos = memfs_storage_group_position(node, group_index, &found);
+	uint32_t count;
 	MemfsPageGroup* group;
 
 	if (!found)
@@ -724,10 +747,10 @@ static void memfs_storage_remove_group(MemfsNode* node, uint64_t group_index) {
 	free(group->pages);
 	memfs_allocator_free_page_group(&node->fs->allocator, group);
 
-	memmove(node->page_groups + pos, node->page_groups + pos + 1U,
-			(size_t)(node->page_group_count - pos - 1U) * sizeof(*node->page_groups));
-
-	memfs_storage_set_group_count(node, node->page_group_count - 1U);
+	count = memfs_storage_group_count(node);
+	entries = memfs_storage_groups(node);
+	memmove(entries + pos, entries + pos + 1U, (size_t)(count - pos - 1U) * sizeof(*entries));
+	memfs_storage_set_group_count(node, count - 1U);
 	memfs_storage_group_try_shrink(node);
 }
 
@@ -830,10 +853,12 @@ static void memfs_storage_replace_small_inline(MemfsNode* node, const uint8_t* p
 }
 
 static void memfs_storage_destroy_pages(MemfsNode* node) {
+	MemfsPageGroupEntry* entries = memfs_storage_groups(node);
+	uint32_t count = memfs_storage_group_count(node);
 	uint32_t entry_index;
 
-	for (entry_index = 0; entry_index < node->page_group_count; entry_index++) {
-		MemfsPageGroup* group = node->page_groups[entry_index].group;
+	for (entry_index = 0; entry_index < count; entry_index++) {
+		MemfsPageGroup* group = entries[entry_index].group;
 		uint32_t i;
 
 		for (i = 0; i < group->page_count; i++) {
@@ -847,14 +872,11 @@ static void memfs_storage_destroy_pages(MemfsNode* node) {
 		memfs_allocator_free_page_group(&node->fs->allocator, group);
 	}
 
-	free(node->page_groups);
-	node->page_groups = NULL;
-	node->page_group_count = 0;
-	node->page_group_capacity = 0;
+	memfs_storage_clear_group_array(node);
 }
 
 static void memfs_storage_destroy(MemfsNode* node) {
-	if (node->page_group_count != 0) {
+	if (memfs_storage_group_count(node) != 0 || node->paged_storage) {
 		memfs_storage_destroy_pages(node);
 		return;
 	}
@@ -931,14 +953,13 @@ static MemfsResult memfs_storage_promote(MemfsNode* node) {
 	if (old_inline)
 		memcpy(old_inline_data, node->small_inline_data, sizeof(old_inline_data));
 
-	// small storage 与 page_groups 共用 union。切换到 paged mode 前先把
-	// 旧状态保存在局部变量中；如果 metadata 分配失败可以完整恢复。
+	// small storage 与 storage_meta 共用 union。切换到 paged mode 前先把
+	// 旧状态保存在局部变量中；StorageMeta 在首次 group 分配时按需创建。
 	memset(node->small_inline_data, 0, sizeof(node->small_inline_data));
 	node->small_capacity = 0;
 	node->small_inline = false;
-	node->page_groups = NULL;
-	node->page_group_count = 0;
-	node->page_group_capacity = 0;
+	node->paged_storage = false;
+	node->storage_meta = NULL;
 
 	if (new_page) {
 		result = memfs_storage_ensure_group(node, 0, &group);
@@ -960,7 +981,7 @@ static MemfsResult memfs_storage_promote(MemfsNode* node) {
 	return MEMFS_OK;
 
 rollback:
-	if (node->page_group_count)
+	if (memfs_storage_group_count(node) != 0 || node->paged_storage)
 		memfs_storage_destroy_pages(node);
 	else {
 		memfs_storage_clear_group_array(node);
@@ -973,6 +994,7 @@ rollback:
 
 	node->small_capacity = (uint16_t)old_capacity;
 	node->small_inline = old_inline;
+	node->paged_storage = false;
 	free(new_page);
 	return result;
 }
@@ -1053,9 +1075,9 @@ static MemfsResult memfs_storage_trim_pages(MemfsNode* node, uint64_t new_size) 
 		}
 	}
 
-	while (entry_index < node->page_group_count) {
-		uint64_t group_index = node->page_groups[entry_index].index;
-		MemfsPageGroup* group = node->page_groups[entry_index].group;
+	while (entry_index < memfs_storage_group_count(node)) {
+		uint64_t group_index = memfs_storage_group_index_at(node, entry_index);
+		MemfsPageGroup* group = memfs_storage_group_at(node, entry_index);
 		uint32_t slot;
 
 		for (slot = 0; slot < MEMFS_PAGES_PER_GROUP; slot++) {
@@ -1093,7 +1115,7 @@ static void memfs_storage_try_demote(MemfsNode* node, uint64_t new_size) {
 	MemfsPage* first_page;
 	MemfsResult result;
 
-	if (node->page_group_count == 0 || new_size > MEMFS_SMALL_LIMIT) {
+	if (memfs_storage_group_count(node) == 0 || new_size > MEMFS_SMALL_LIMIT) {
 		return;
 	}
 
@@ -1128,7 +1150,7 @@ static void memfs_storage_try_demote(MemfsNode* node, uint64_t new_size) {
 static MemfsResult memfs_storage_trim_data(MemfsNode* node, uint64_t new_size) {
 	MemfsResult result;
 
-	if (node->page_group_count != 0) {
+	if (memfs_storage_group_count(node) != 0) {
 		result = memfs_storage_trim_pages(node, new_size);
 		if (result != MEMFS_OK)
 			return result;
@@ -1146,7 +1168,7 @@ static MemfsResult memfs_storage_read_range(MemfsNode* node, uint8_t* buffer, ui
 	if (length == 0)
 		return MEMFS_OK;
 
-	if (node->page_group_count == 0) {
+	if (memfs_storage_group_count(node) == 0) {
 		uint64_t available = 0;
 		uint8_t plain[MEMFS_SMALL_LIMIT];
 		MemfsResult result;
@@ -1411,7 +1433,7 @@ static MemfsResult memfs_storage_write_range(MemfsNode* node, const uint8_t* buf
 	if (length == 0)
 		return MEMFS_OK;
 
-	if (end <= MEMFS_SMALL_LIMIT && node->page_group_count == 0) {
+	if (end <= MEMFS_SMALL_LIMIT && memfs_storage_group_count(node) == 0) {
 		return memfs_storage_write_small(node, buffer, offset, length);
 	}
 
@@ -1441,13 +1463,7 @@ static void memfs_node_free(MemfsNode* node) {
 	}
 
 	memfs_atomic_sub_clamped(&fs->used_bytes, node->file_size);
-	{
-		MemfsNodeMetaValue* meta = memfs_meta_table_remove(fs->meta_table, node->index_number);
-		if (meta) {
-			memfs_security_release(meta->security);
-			free(meta);
-		}
-	}
+	memfs_security_release(node->security);
 
 	memfs_object_free_name(fs, node->name);
 	memfs_object_free_node(fs, node);
@@ -1969,31 +1985,21 @@ static MemfsResult memfs_node_alloc(Memfs* fs, MemfsNode* parent, const wchar_t*
 	node->index_number = fs->next_index++;
 
 	if (security) {
-		if (parent && memfs_security_equal(memfs_node_get_security(parent), security)) {
-			memfs_security_retain(memfs_node_get_security(parent));
-			memfs_node_set_security_meta(node, memfs_node_get_security(parent));
+		MemfsSecurity* inherited = parent ? memfs_node_get_security(parent) : NULL;
+
+		if (inherited && memfs_security_equal(inherited, security)) {
+			node->security = inherited;
+			memfs_security_retain(node->security);
 			result = MEMFS_OK;
 		} else {
-			{
-			MemfsSecurity* created = NULL;
-			result = memfs_security_create(security, &created);
-			if (result == MEMFS_OK) {
-				memfs_node_set_security_meta(node, created);
-				}
-		}
+			result = memfs_security_create(security, &node->security);
 		}
 	} else if (parent && memfs_node_get_security(parent)) {
-		memfs_security_retain(memfs_node_get_security(parent));
-		memfs_node_set_security_meta(node, memfs_node_get_security(parent));
+		node->security = memfs_node_get_security(parent);
+		memfs_security_retain(node->security);
 		result = MEMFS_OK;
 	} else {
-		{
-			MemfsSecurity* created = NULL;
-			result = memfs_default_security(&created);
-			if (result == MEMFS_OK) {
-				memfs_node_set_security_meta(node, created);
-				}
-		}
+		result = memfs_default_security(&node->security);
 	}
 
 	if (result != MEMFS_OK) {
@@ -2005,10 +2011,10 @@ static MemfsResult memfs_node_alloc(Memfs* fs, MemfsNode* parent, const wchar_t*
 	}
 
 	node->attributes = attributes;
-memfs_node_set_creation_time(node, memfs_now());
-	memfs_node_set_last_access_time(node, memfs_node_get_creation_time(node));
-	memfs_node_set_last_write_time(node, memfs_node_get_creation_time(node));
-	memfs_node_set_change_time(node, memfs_node_get_creation_time(node));
+	node->creation_time = memfs_now();
+	node->last_access_time = node->creation_time;
+	node->last_write_time = node->creation_time;
+	node->change_time = node->creation_time;
 
 	*out_node = node;
 	return MEMFS_OK;
@@ -2095,8 +2101,8 @@ uint64_t memfs_node_resident_bytes(const MemfsNode* node) {
 	if (node->small_capacity && !node->small_inline)
 		resident += memfs_page_heap_size(node->small_page);
 
-	for (entry_index = 0; entry_index < node->page_group_count; entry_index++) {
-		const MemfsPageGroup* group = node->page_groups[entry_index].group;
+	for (entry_index = 0; entry_index < memfs_storage_group_count(node); entry_index++) {
+		const MemfsPageGroup* group = memfs_storage_group_at(node, entry_index);
 		uint32_t i;
 
 		if (group == NULL)
@@ -2132,13 +2138,6 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 		return MEMFS_ERR_NO_MEMORY;
 
 	if (!memfs_allocator_init(&fs->allocator, sizeof(MemfsNode), sizeof(MemfsDir), sizeof(MemfsPageGroup))) {
-		free(fs);
-		return MEMFS_ERR_NO_MEMORY;
-	}
-
-	fs->meta_table = memfs_meta_table_create(1024);
-	if (fs->meta_table == NULL) {
-		memfs_allocator_destroy(&fs->allocator);
 		free(fs);
 		return MEMFS_ERR_NO_MEMORY;
 	}
@@ -2232,8 +2231,6 @@ void memfs_destroy(Memfs* fs) {
 		(void)sodium_munlock(fs->encryption_key, MEMFS_ENCRYPTION_KEY_SIZE);
 	}
 
-	if (fs->meta_table != NULL)
-		memfs_meta_table_destroy(fs->meta_table, NULL);
 	memfs_allocator_destroy(&fs->allocator);
 	free(fs);
 }
@@ -2762,11 +2759,8 @@ MemfsResult memfs_node_replace_security(MemfsNode* node, PSECURITY_DESCRIPTOR se
 	if (result != MEMFS_OK)
 		return result;
 
-	old = memfs_node_get_security(node);
-	if (!memfs_node_set_security_meta(node, replacement)) {
-		memfs_security_release(replacement);
-		return MEMFS_ERR_NO_MEMORY;
-	}
+	old = node->security;
+	node->security = replacement;
 	memfs_security_release(old);
 
 	memfs_node_set_change_time(node, memfs_now());
