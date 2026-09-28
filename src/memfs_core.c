@@ -542,6 +542,16 @@ static uint32_t memfs_storage_group_capacity(MemfsNode* node) {
 
 static MemfsPageGroupEntry* memfs_storage_groups(MemfsNode* node) {
 	return node ? node->page_groups : NULL;
+}
+
+static void memfs_storage_set_group_count(MemfsNode* node, uint32_t value) {
+	if (node)
+		node->page_group_count = value;
+}
+
+static void memfs_storage_set_group_capacity(MemfsNode* node, uint32_t value) {
+	if (node)
+		node->page_group_capacity = value;
 }static uint32_t memfs_storage_group_position(MemfsNode* node, uint64_t group_index, bool* found) {
 	uint32_t lo = 0;
 	uint32_t hi = memfs_storage_group_count(node);
@@ -665,7 +675,7 @@ static MemfsResult memfs_storage_ensure_group(MemfsNode* node, uint64_t group_in
 
 	node->page_groups[pos].index = group_index;
 	node->page_groups[pos].group = group;
-	node->page_group_count++;
+	memfs_storage_set_group_count(node, node->page_group_count + 1U);
 
 	*out_group = group;
 	return MEMFS_OK;
@@ -686,7 +696,7 @@ static void memfs_storage_remove_group(MemfsNode* node, uint64_t group_index) {
 	memmove(node->page_groups + pos, node->page_groups + pos + 1U,
 			(size_t)(node->page_group_count - pos - 1U) * sizeof(*node->page_groups));
 
-	node->page_group_count--;
+	memfs_storage_set_group_count(node, node->page_group_count - 1U);
 	memfs_storage_group_try_shrink(node);
 }
 
