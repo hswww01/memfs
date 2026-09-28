@@ -1089,6 +1089,106 @@ static void test_adaptive_compression(void) {
 	memfs_destroy(fs);
 }
 
+static void test_compression_incompressible_page_fallback(void) {
+	MemfsOptions options = {0};
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	MemfsPageGroup* group;
+	uint8_t page[MEMFS_PAGE_SIZE];
+	uint8_t page2[MEMFS_PAGE_SIZE];
+	uint8_t verify[MEMFS_PAGE_SIZE];
+	uint32_t transferred;
+	uint32_t state;
+	uint32_t i;
+
+	printf("== compression incompressible page fallback ==\n");
+
+	options.capacity = 16ULL * 1024ULL * 1024ULL;
+	options.volume_label = L"COMPFB";
+	options.compression_enabled = true;
+	options.compression_level = 1;
+
+	CHECK(memfs_create_ex(&options, &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	CHECK(memfs_node_create(fs, fs->root, L"incompressible.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) ==
+		  MEMFS_OK);
+	CHECK(file != NULL);
+
+	state = 0x9e3779b9U;
+	for (i = 0; i < sizeof(page); i += sizeof(state)) {
+		state ^= state << 13;
+		state ^= state >> 17;
+		state ^= state << 5;
+		memcpy(page + i, &state, sizeof(state));
+	}
+
+	CHECK(memfs_node_write(file, page, 0, MEMFS_PAGE_SIZE, false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == MEMFS_PAGE_SIZE);
+	CHECK(file->file_size == MEMFS_PAGE_SIZE);
+	CHECK(file->allocation_size == MEMFS_PAGE_SIZE);
+
+	group = memfs_node_page_group(file, 0);
+	if (group) {
+		CHECK(group->page_count == 1);
+		CHECK(group->pages[0] != NULL);
+		if (group->pages[0]) {
+			CHECK(0 == (group->pages[0]->flags & MEMFS_PAGE_COMPRESSED));
+			CHECK(group->pages[0]->plain_size == MEMFS_PAGE_SIZE);
+			CHECK(group->pages[0]->stored_size >= MEMFS_PAGE_SIZE);
+		}
+	}
+
+	CHECK(memfs_node_resident_bytes(file) >= MEMFS_PAGE_SIZE);
+	CHECK(memfs_node_resident_bytes(file) < MEMFS_PAGE_SIZE + 64U);
+	CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+	CHECK((uint64_t)fs->used_bytes == MEMFS_PAGE_SIZE);
+	CHECK(memfs_free_bytes(fs) == options.capacity - MEMFS_PAGE_SIZE);
+
+	memset(verify, 0, sizeof(verify));
+	CHECK(memfs_node_read(file, verify, 0, MEMFS_PAGE_SIZE, &transferred) == MEMFS_OK);
+	CHECK(transferred == MEMFS_PAGE_SIZE);
+	CHECK(memcmp(page, verify, MEMFS_PAGE_SIZE) == 0);
+
+	state = 0x85ebca6bU;
+	for (i = 0; i < sizeof(page2); i += sizeof(state)) {
+		state ^= state << 13;
+		state ^= state >> 17;
+		state ^= state << 5;
+		memcpy(page2 + i, &state, sizeof(state));
+	}
+
+	CHECK(memfs_node_write(file, page2, 0, MEMFS_PAGE_SIZE, false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == MEMFS_PAGE_SIZE);
+	CHECK(file->file_size == MEMFS_PAGE_SIZE);
+	CHECK(file->allocation_size == MEMFS_PAGE_SIZE);
+
+	group = memfs_node_page_group(file, 0);
+	if (group) {
+		CHECK(group->page_count == 1);
+		CHECK(group->pages[0] != NULL);
+		if (group->pages[0])
+			CHECK(0 == (group->pages[0]->flags & MEMFS_PAGE_COMPRESSED));
+	}
+
+	memset(verify, 0, sizeof(verify));
+	CHECK(memfs_node_read(file, verify, 0, MEMFS_PAGE_SIZE, &transferred) == MEMFS_OK);
+	CHECK(transferred == MEMFS_PAGE_SIZE);
+	CHECK(memcmp(page2, verify, MEMFS_PAGE_SIZE) == 0);
+
+	CHECK(memfs_node_resident_bytes(file) < 2ULL * MEMFS_PAGE_SIZE);
+	CHECK((uint64_t)fs->used_bytes == MEMFS_PAGE_SIZE);
+	CHECK((uint64_t)fs->resident_bytes == memfs_node_resident_bytes(file));
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+	CHECK(memfs_free_bytes(fs) == options.capacity);
+	CHECK(memfs_resident_bytes(fs) == 0);
+
+	memfs_destroy(fs);
+}
+
 static void test_encryption(void) {
 	MemfsOptions options = {0};
 	Memfs* fs = NULL;
@@ -2018,6 +2118,7 @@ int main(void) {
 	test_large_directory_case_insensitive_hash_stress();
 	test_compression();
 	test_adaptive_compression();
+	test_compression_incompressible_page_fallback();
 	test_encryption();
 	test_compression_encryption();
 	test_shared_security();
