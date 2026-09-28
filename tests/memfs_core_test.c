@@ -1727,6 +1727,233 @@ static void test_shared_security(void) {
 	memfs_destroy(fs);
 }
 
+static void test_shared_security_inherit_replace_churn(void) {
+	enum { CHURN_ROUNDS = 8, CHURN_FILES = 64, INHERIT_FILES = 8 };
+	Memfs* fs = NULL;
+	MemfsNode* dir = NULL;
+	MemfsNode* sub = NULL;
+	MemfsNode* child_file = NULL;
+	MemfsNode* churn_dir = NULL;
+	MemfsNode* inherit_nodes[INHERIT_FILES] = {0};
+	MemfsNode* churn_nodes[CHURN_FILES] = {0};
+	MemfsSecurity* shared = NULL;
+	PSECURITY_DESCRIPTOR sd_a = NULL;
+	PSECURITY_DESCRIPTOR sd_b = NULL;
+	ULONG sd_a_size = 0;
+	ULONG sd_b_size = 0;
+	LONG before;
+	LONG current;
+	uint32_t i;
+	uint32_t round;
+
+	printf("== shared security inherit/replace/churn ==\n");
+
+	CHECK(memfs_create(64ULL * 1024ULL * 1024ULL, L"ACLCHURN", &fs) == MEMFS_OK);
+	if (fs == NULL)
+		return;
+
+	CHECK(memfs_node_create(fs, fs->root, L"dir", true, FILE_ATTRIBUTE_DIRECTORY, NULL, 0, &dir) == MEMFS_OK);
+	if (dir == NULL) {
+		memfs_destroy(fs);
+		return;
+	}
+
+	shared = memfs_node_get_security(dir);
+	CHECK(shared != NULL);
+	CHECK(shared == memfs_node_get_security(fs->root));
+	if (shared == NULL) {
+		memfs_node_close(dir);
+		memfs_destroy(fs);
+		return;
+	}
+
+	CHECK(memfs_node_create(fs, dir, L"sub", true, FILE_ATTRIBUTE_DIRECTORY, NULL, 0, &sub) == MEMFS_OK);
+	CHECK(sub != NULL);
+	if (sub == NULL)
+		goto cleanup;
+
+	CHECK(memfs_node_create(fs, sub, L"child.txt", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &child_file) == MEMFS_OK);
+	CHECK(child_file != NULL);
+	if (child_file == NULL)
+		goto cleanup;
+
+	CHECK(memfs_node_get_security(sub) == shared);
+	CHECK(memfs_node_get_security(child_file) == shared);
+
+	before = shared->ref_count;
+	for (i = 0; i < INHERIT_FILES; i++) {
+		wchar_t name[32];
+
+		swprintf_s(name, _countof(name), L"inherit-%02u", i);
+		CHECK(memfs_node_create(fs, dir, name, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &inherit_nodes[i]) == MEMFS_OK);
+		if (inherit_nodes[i])
+			CHECK(memfs_node_get_security(inherit_nodes[i]) == shared);
+	}
+	current = shared->ref_count;
+	CHECK(current == before + INHERIT_FILES);
+
+	CHECK(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"O:BAG:BAD:P(A;;GRGW;;;WD)", SDDL_REVISION_1, &sd_a,
+															   &sd_a_size));
+	CHECK(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"O:BAG:BAD:P(A;;GRGW;;;BA)", SDDL_REVISION_1, &sd_b,
+															   &sd_b_size));
+	if (sd_a == NULL || sd_b == NULL)
+		goto cleanup;
+
+	before = shared->ref_count;
+	CHECK(memfs_node_replace_security(sub, sd_a, sd_a_size) == MEMFS_OK);
+	CHECK(memfs_node_get_security(sub) != shared);
+	CHECK(memfs_node_get_security(sub) != NULL);
+	current = shared->ref_count;
+	CHECK(current == before - 1);
+
+	before = shared->ref_count;
+	CHECK(memfs_node_replace_security(child_file, sd_b, sd_b_size) == MEMFS_OK);
+	CHECK(memfs_node_get_security(child_file) != shared);
+	CHECK(memfs_node_get_security(child_file) != NULL);
+	current = shared->ref_count;
+	CHECK(current == before - 1);
+
+	before = shared->ref_count;
+	CHECK(memfs_node_replace_security(child_file, sd_a, sd_a_size) == MEMFS_OK);
+	CHECK(memfs_node_get_security(child_file) != shared);
+	CHECK(memfs_node_get_security(child_file) != NULL);
+	current = shared->ref_count;
+	CHECK(current == before);
+
+	for (i = 0; i < INHERIT_FILES; i++) {
+		if (inherit_nodes[i]) {
+			CHECK(memfs_node_unlink(inherit_nodes[i]) == MEMFS_OK);
+			memfs_node_close(inherit_nodes[i]);
+			inherit_nodes[i] = NULL;
+		}
+	}
+	current = shared->ref_count;
+	CHECK(current == before - INHERIT_FILES);
+
+	CHECK(memfs_node_create(fs, fs->root, L"churn", true, FILE_ATTRIBUTE_DIRECTORY, NULL, 0, &churn_dir) == MEMFS_OK);
+	CHECK(churn_dir != NULL);
+	if (churn_dir == NULL)
+		goto cleanup;
+
+	CHECK(memfs_node_get_security(churn_dir) == shared);
+
+	for (round = 0; round < CHURN_ROUNDS; round++) {
+		before = shared->ref_count;
+
+		for (i = 0; i < CHURN_FILES; i++) {
+			wchar_t name[32];
+
+			swprintf_s(name, _countof(name), L"churn-%02u-%02u", round, i);
+			CHECK(memfs_node_create(fs, churn_dir, name, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &churn_nodes[i]) ==
+				  MEMFS_OK);
+			if (churn_nodes[i])
+				CHECK(memfs_node_get_security(churn_nodes[i]) == shared);
+		}
+		current = shared->ref_count;
+		CHECK(current == before + CHURN_FILES);
+
+		for (i = 0; i < CHURN_FILES / 2U; i++) {
+			if (churn_nodes[i]) {
+				CHECK(memfs_node_unlink(churn_nodes[i]) == MEMFS_OK);
+				memfs_node_close(churn_nodes[i]);
+				churn_nodes[i] = NULL;
+			}
+		}
+		current = shared->ref_count;
+		CHECK(current == before + (LONG)(CHURN_FILES / 2U));
+
+		for (i = CHURN_FILES / 2U; i < CHURN_FILES; i++) {
+			if (churn_nodes[i]) {
+				memfs_node_open(churn_nodes[i]);
+				CHECK(memfs_node_unlink(churn_nodes[i]) == MEMFS_OK);
+			}
+		}
+		current = shared->ref_count;
+		CHECK(current == before + (LONG)(CHURN_FILES / 2U));
+
+		for (i = CHURN_FILES / 2U; i < CHURN_FILES; i++) {
+			if (churn_nodes[i]) {
+				memfs_node_close(churn_nodes[i]);
+				memfs_node_close(churn_nodes[i]);
+				churn_nodes[i] = NULL;
+			}
+		}
+		current = shared->ref_count;
+		CHECK(current == before);
+	}
+
+	CHECK(memfs_node_unlink(churn_dir) == MEMFS_OK);
+	memfs_node_close(churn_dir);
+	churn_dir = NULL;
+
+	CHECK(memfs_node_unlink(child_file) == MEMFS_OK);
+	memfs_node_close(child_file);
+	child_file = NULL;
+
+	CHECK(memfs_node_unlink(sub) == MEMFS_OK);
+	memfs_node_close(sub);
+	sub = NULL;
+
+	CHECK(memfs_node_unlink(dir) == MEMFS_OK);
+	memfs_node_close(dir);
+	dir = NULL;
+
+	if (sd_a)
+		LocalFree(sd_a);
+	if (sd_b)
+		LocalFree(sd_b);
+
+	CHECK(fs->orphan_head == NULL);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+	current = shared->ref_count;
+	CHECK(current >= 1);
+
+	memfs_destroy(fs);
+	return;
+
+cleanup:
+	for (i = 0; i < INHERIT_FILES; i++) {
+		if (inherit_nodes[i]) {
+			memfs_node_unlink(inherit_nodes[i]);
+			memfs_node_close(inherit_nodes[i]);
+			inherit_nodes[i] = NULL;
+		}
+	}
+	for (i = 0; i < CHURN_FILES; i++) {
+		if (churn_nodes[i]) {
+			memfs_node_unlink(churn_nodes[i]);
+			memfs_node_close(churn_nodes[i]);
+			churn_nodes[i] = NULL;
+		}
+	}
+	if (churn_dir) {
+		memfs_node_unlink(churn_dir);
+		memfs_node_close(churn_dir);
+		churn_dir = NULL;
+	}
+	if (child_file) {
+		memfs_node_unlink(child_file);
+		memfs_node_close(child_file);
+		child_file = NULL;
+	}
+	if (sub) {
+		memfs_node_unlink(sub);
+		memfs_node_close(sub);
+		sub = NULL;
+	}
+	if (dir) {
+		memfs_node_unlink(dir);
+		memfs_node_close(dir);
+		dir = NULL;
+	}
+	if (sd_a)
+		LocalFree(sd_a);
+	if (sd_b)
+		LocalFree(sd_b);
+	memfs_destroy(fs);
+}
+
 typedef struct ConcurrentIoArg {
 	MemfsNode* file;
 	uint8_t value;
@@ -2497,6 +2724,7 @@ int main(void) {
 	test_encryption_rewrite_truncate_regrow();
 	test_compression_encryption_sparse_rewrite_truncate_regrow();
 	test_shared_security();
+	test_shared_security_inherit_replace_churn();
 	test_concurrent_files();
 	test_allocator_reclaim();
 	test_allocator_stress();
