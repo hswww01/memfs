@@ -552,7 +552,20 @@ static void memfs_storage_set_group_count(MemfsNode* node, uint32_t value) {
 static void memfs_storage_set_group_capacity(MemfsNode* node, uint32_t value) {
 	if (node)
 		node->page_group_capacity = value;
-}static uint32_t memfs_storage_group_position(MemfsNode* node, uint64_t group_index, bool* found) {
+}static MemfsPageGroup* memfs_storage_group_at(MemfsNode* node, uint32_t index) {
+	if (node == NULL || index >= memfs_storage_group_count(node))
+		return NULL;
+	return memfs_storage_groups(node)[index].group;
+}
+
+static void memfs_storage_group_set(MemfsNode* node, uint32_t index, uint64_t group_index, MemfsPageGroup* group) {
+	if (node == NULL || index >= memfs_storage_group_capacity(node))
+		return;
+	memfs_storage_groups(node)[index].index = group_index;
+	memfs_storage_groups(node)[index].group = group;
+}
+
+static uint32_t memfs_storage_group_position(MemfsNode* node, uint64_t group_index, bool* found) {
 	uint32_t lo = 0;
 	uint32_t hi = memfs_storage_group_count(node);
 
@@ -656,7 +669,7 @@ static MemfsResult memfs_storage_ensure_group(MemfsNode* node, uint64_t group_in
 	MemfsResult result;
 
 	if (found) {
-		*out_group = node->page_groups[pos].group;
+		*out_group = memfs_storage_group_at(node, pos);
 		return MEMFS_OK;
 	}
 
@@ -673,8 +686,7 @@ static MemfsResult memfs_storage_ensure_group(MemfsNode* node, uint64_t group_in
 	memmove(node->page_groups + pos + 1U, node->page_groups + pos,
 			(size_t)(node->page_group_count - pos) * sizeof(*node->page_groups));
 
-	node->page_groups[pos].index = group_index;
-	node->page_groups[pos].group = group;
+	memfs_storage_group_set(node, pos, group_index, group);
 	memfs_storage_set_group_count(node, node->page_group_count + 1U);
 
 	*out_group = group;
@@ -689,7 +701,7 @@ static void memfs_storage_remove_group(MemfsNode* node, uint64_t group_index) {
 	if (!found)
 		return;
 
-	group = node->page_groups[pos].group;
+	group = memfs_storage_group_at(node, pos);
 	free(group->pages);
 	memfs_allocator_free_page_group(&node->fs->allocator, group);
 
