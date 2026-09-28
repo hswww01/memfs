@@ -264,6 +264,138 @@ static void test_capacity(void) {
 	memfs_node_close(b);
 	memfs_destroy(fs);
 }
+static void test_no_space_rollback(void) {
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	uint8_t input[1024];
+	uint8_t output[1024];
+	uint32_t transferred;
+	uint32_t i;
+	uint64_t capacity = 1536;
+	uint64_t file_size_before;
+	uint64_t allocation_size_before;
+	uint64_t used_before;
+	uint64_t resident_before;
+	uint64_t node_resident_before;
+
+	printf("== no space rollback ==\n");
+
+	CHECK(memfs_create(capacity, L"NO_SPACE", &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	CHECK(memfs_node_create(fs, fs->root, L"file", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(file != NULL);
+	if (fs == NULL || file == NULL) {
+		if (fs)
+			memfs_destroy(fs);
+		return;
+	}
+
+	for (i = 0; i < sizeof(input); i++)
+		input[i] = (uint8_t)(0x10 + (i % 251U));
+
+	CHECK(memfs_node_write(file, input, 0, sizeof(input), false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	CHECK(file->file_size == sizeof(input));
+	CHECK(file->allocation_size == sizeof(input));
+	CHECK((uint64_t)fs->used_bytes == sizeof(input));
+	CHECK(memfs_free_bytes(fs) == capacity - sizeof(input));
+
+	memset(output, 0xff, sizeof(output));
+	CHECK(memfs_node_read(file, output, 0, sizeof(input), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	CHECK(memcmp(input, output, sizeof(input)) == 0);
+
+	file_size_before = file->file_size;
+	allocation_size_before = file->allocation_size;
+	used_before = fs->used_bytes;
+	resident_before = fs->resident_bytes;
+	node_resident_before = memfs_node_resident_bytes(file);
+
+	CHECK(memfs_node_write(file, input, sizeof(input), sizeof(input), false, false, &transferred) == MEMFS_ERR_NO_SPACE);
+	CHECK(file->file_size == file_size_before);
+	CHECK(file->allocation_size == allocation_size_before);
+	CHECK((uint64_t)fs->used_bytes == used_before);
+	CHECK((uint64_t)fs->resident_bytes == resident_before);
+	CHECK(memfs_node_resident_bytes(file) == node_resident_before);
+	CHECK(memfs_free_bytes(fs) == capacity - used_before);
+
+	memset(output, 0xff, sizeof(output));
+	CHECK(memfs_node_read(file, output, 0, sizeof(input), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	CHECK(memcmp(input, output, sizeof(input)) == 0);
+
+	CHECK(memfs_node_set_file_size(file, 2048) == MEMFS_ERR_NO_SPACE);
+	CHECK(file->file_size == file_size_before);
+	CHECK(file->allocation_size == allocation_size_before);
+	CHECK((uint64_t)fs->used_bytes == used_before);
+	CHECK((uint64_t)fs->resident_bytes == resident_before);
+	CHECK(memfs_node_resident_bytes(file) == node_resident_before);
+	CHECK(memfs_free_bytes(fs) == capacity - used_before);
+
+	memset(output, 0xff, sizeof(output));
+	CHECK(memfs_node_read(file, output, 0, sizeof(input), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	CHECK(memcmp(input, output, sizeof(input)) == 0);
+
+	CHECK(memfs_node_set_allocation_size(file, 2048) == MEMFS_OK);
+	CHECK(file->file_size == file_size_before);
+	CHECK(file->allocation_size == 2048);
+	CHECK((uint64_t)fs->used_bytes == used_before);
+	CHECK((uint64_t)fs->resident_bytes == resident_before);
+	CHECK(memfs_node_resident_bytes(file) == node_resident_before);
+	CHECK(memfs_free_bytes(fs) == capacity - used_before);
+
+	memset(output, 0xff, sizeof(output));
+	CHECK(memfs_node_read(file, output, 0, sizeof(input), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	CHECK(memcmp(input, output, sizeof(input)) == 0);
+
+	CHECK(memfs_node_set_allocation_size(file, allocation_size_before) == MEMFS_OK);
+	CHECK(file->file_size == file_size_before);
+	CHECK(file->allocation_size == allocation_size_before);
+	CHECK((uint64_t)fs->used_bytes == used_before);
+	CHECK((uint64_t)fs->resident_bytes == resident_before);
+	CHECK(memfs_node_resident_bytes(file) == node_resident_before);
+	CHECK(memfs_free_bytes(fs) == capacity - used_before);
+
+	memset(output, 0xff, sizeof(output));
+	CHECK(memfs_node_read(file, output, 0, sizeof(input), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	CHECK(memcmp(input, output, sizeof(input)) == 0);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+	CHECK(memfs_free_bytes(fs) == capacity);
+
+	CHECK(memfs_node_create(fs, fs->root, L"file", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(file != NULL);
+	if (file == NULL) {
+		memfs_destroy(fs);
+		return;
+	}
+
+	CHECK(memfs_node_write(file, input, 0, sizeof(input), false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	CHECK(file->file_size == sizeof(input));
+	CHECK(file->allocation_size == sizeof(input));
+	CHECK((uint64_t)fs->used_bytes == sizeof(input));
+	CHECK(memfs_free_bytes(fs) == capacity - sizeof(input));
+
+	memset(output, 0xff, sizeof(output));
+	CHECK(memfs_node_read(file, output, 0, sizeof(input), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	CHECK(memcmp(input, output, sizeof(input)) == 0);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK((uint64_t)fs->resident_bytes == 0);
+	CHECK(memfs_free_bytes(fs) == capacity);
+
+	memfs_destroy(fs);
+}
 
 static void test_directory_order(void) {
 	Memfs* fs = NULL;
@@ -2347,6 +2479,7 @@ int main(void) {
 	test_write_to_end_semantics();
 	test_rename_and_delete();
 	test_capacity();
+	test_no_space_rollback();
 	test_directory_order();
 	test_small_storage();
 	test_sparse_pages();
