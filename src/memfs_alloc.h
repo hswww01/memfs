@@ -127,9 +127,10 @@ void memfs_allocator_get_stats(MemfsAllocator* allocator, MemfsAllocatorStats* s
 uint64_t memfs_allocator_scavenge(MemfsAllocator* allocator);
 
 /*
- * Process-wide control allocator for objects that must exist before their own
- * per-filesystem allocator can be initialized (notably Memfs itself).
- * This keeps VirtualAlloc confined to the allocator implementation.
+ * Bootstrap owner allocation for objects that must exist before their own
+ * per-filesystem allocator can be initialized (currently Memfs itself).
+ * This is intentionally a minimal VM-backed singleton path rather than a
+ * second set of size-class pools. VirtualAlloc remains confined to memfs_vm.c.
  */
 void* memfs_allocator_alloc_control(size_t bytes);
 void memfs_allocator_free_control(void* ptr, size_t bytes);

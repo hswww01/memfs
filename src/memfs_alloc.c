@@ -915,30 +915,22 @@ uint64_t memfs_allocator_scavenge(MemfsAllocator* allocator) {
     return released;
 }
 
-static INIT_ONCE g_control_once = INIT_ONCE_STATIC_INIT;
-static MemfsAllocator g_control_allocator;
-
-static BOOL CALLBACK control_allocator_init_once(PINIT_ONCE once, PVOID parameter, PVOID* context) {
-    (void)once;
-    (void)parameter;
-    (void)context;
-    return memfs_allocator_init(&g_control_allocator, sizeof(void*), sizeof(void*), sizeof(void*)) ? TRUE : FALSE;
-}
-
-static bool control_allocator_ready(void) {
-    return !!InitOnceExecuteOnce(&g_control_once, control_allocator_init_once, NULL, NULL);
-}
-
 void* memfs_allocator_alloc_control(size_t bytes) {
-    if (bytes == 0 || !control_allocator_ready())
+    /*
+     * Bootstrap owner allocation.
+     *
+     * Memfs itself must exist before its per-filesystem allocator can be
+     * initialized. Creating a complete 19-class x 8-shard allocator merely to
+     * allocate this single long-lived ~256-byte owner costs more metadata than
+     * the object. Keep the allocation behind the allocator API, but use one
+     * minimal VM region for this bootstrap singleton.
+     */
+    if (bytes == 0)
         return NULL;
-    return allocator_alloc_internal(&g_control_allocator, bytes);
+    return memfs_vm_reserve_commit(bytes);
 }
 
 void memfs_allocator_free_control(void* ptr, size_t bytes) {
-    if (ptr == NULL)
-        return;
-    if (!control_allocator_ready())
-        return;
-    allocator_free_internal(&g_control_allocator, ptr, bytes);
+    (void)bytes;
+    memfs_vm_release(ptr);
 }

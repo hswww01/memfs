@@ -3698,11 +3698,33 @@ cleanup:
 #endif
 
 
+static void test_allocator_bootstrap_control(void) {
+	uint8_t* control;
+	uint32_t i;
+
+	printf("== allocator bootstrap control ==\n");
+
+	CHECK(memfs_allocator_alloc_control(0) == NULL);
+	control = (uint8_t*)memfs_allocator_alloc_control(sizeof(Memfs));
+	CHECK(control != NULL);
+	if (control == NULL)
+		return;
+
+	for (i = 0; i < sizeof(Memfs); ++i)
+		CHECK(control[i] == 0);
+
+	memset(control, 0xA5, sizeof(Memfs));
+	memfs_allocator_free_control(control, sizeof(Memfs));
+	memfs_allocator_free_control(NULL, sizeof(Memfs));
+}
+
+
 int main(void) {
 	setvbuf(stdout, NULL, _IONBF, 0);
 
 	test_tree_and_lookup();
 	test_memory_accounting_layers();	test_allocator_fragmentation_reuse();
+	test_allocator_bootstrap_control();
 #if !defined(NDEBUG)
 	test_allocator_failure_injection_primitives();
 	test_failure_injection_transaction_rollback();
