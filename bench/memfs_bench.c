@@ -934,19 +934,26 @@ static void print_alloc_fragment_stats(const char* phase, uint32_t round, const 
 		   stats->slab_count, stats->dedicated_count);
 }
 
-static bool alloc_fragment_back_to_baseline(
+static bool alloc_fragment_quiescent(
 	const MemfsAllocatorStats* stats, const MemfsAllocatorStats* baseline) {
 	return stats->live_objects == baseline->live_objects &&
 		   stats->live_bytes == baseline->live_bytes &&
-		   stats->reserved_bytes == baseline->reserved_bytes &&
-		   stats->committed_bytes == baseline->committed_bytes &&
 		   stats->physical_bytes == stats->committed_bytes &&
-		   stats->physical_bytes == baseline->physical_bytes &&
 		   stats->slab_count == baseline->slab_count &&
 		   stats->dedicated_count == baseline->dedicated_count &&
+		   stats->dedicated_live_bytes == baseline->dedicated_live_bytes;
+}
+
+static bool alloc_fragment_back_to_baseline(
+	const MemfsAllocatorStats* stats, const MemfsAllocatorStats* baseline) {
+	return alloc_fragment_quiescent(stats, baseline) &&
+		   stats->reserved_bytes == baseline->reserved_bytes &&
+		   stats->committed_bytes == baseline->committed_bytes &&
+		   stats->physical_bytes == baseline->physical_bytes &&
 		   stats->dedicated_reserved_bytes == baseline->dedicated_reserved_bytes &&
 		   stats->dedicated_committed_bytes == baseline->dedicated_committed_bytes &&
-		   stats->dedicated_live_bytes == baseline->dedicated_live_bytes;
+		   stats->area_cached_count == 0U &&
+		   stats->area_cached_bytes == 0U;
 }
 
 static bool alloc_fragment_same_high_water(
@@ -1106,11 +1113,19 @@ static int bench_allocator_fragmentation_reuse(void) {
 		}
 		memfs_allocator_get_stats(&allocator, &mixed_released);
 		print_alloc_fragment_stats("mixed-free", round, &mixed_released);
-		if (!alloc_fragment_back_to_baseline(&mixed_released, &baseline)) {
-			fprintf(stderr, "allocator mixed free did not return to baseline round=%u\n", round);
+		if (!alloc_fragment_quiescent(&mixed_released, &baseline)) {
+			fprintf(stderr, "allocator mixed free left live allocations round=%u\n", round);
 			rc = 1;
 			goto cleanup;
 		}
+	}
+
+	(void)memfs_allocator_scavenge(&allocator);
+	memfs_allocator_get_stats(&allocator, &mixed_released);
+	print_alloc_fragment_stats("scavenged", BENCH_ALLOC_FRAGMENT_ROUNDS, &mixed_released);
+	if (!alloc_fragment_back_to_baseline(&mixed_released, &baseline)) {
+		fprintf(stderr, "allocator scavenge did not return to baseline\n");
+		rc = 1;
 	}
 
 cleanup:
@@ -1137,6 +1152,7 @@ cleanup:
 	printf("allocator fragmentation/reuse: %s\n", rc == 0 ? "pass" : "FAIL");
 	return rc;
 }
+
 
 static int run_suite(const BenchConfig* config, const char* label, LARGE_INTEGER frequency, BenchResult* results) {
 	Memfs* fs = NULL;

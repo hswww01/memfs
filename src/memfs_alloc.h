@@ -86,6 +86,8 @@ typedef struct MemfsAllocatorStats {
     uint64_t dedicated_reserved_bytes;
     uint64_t dedicated_committed_bytes;
     uint64_t dedicated_live_bytes;
+    uint32_t area_cached_count;
+    uint64_t area_cached_bytes;
 
     uint64_t scavenged_bytes;
     uint64_t scavenge_count;

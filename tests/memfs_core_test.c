@@ -1184,6 +1184,7 @@ static void test_allocator_fragmentation_reuse(void) {
 				mixed[i] = NULL;
 			}
 		}
+		(void)memfs_allocator_scavenge(&allocator);
 		memfs_allocator_get_stats(&allocator, &stats);
 		CHECK(stats.live_objects == baseline.live_objects);
 		CHECK(stats.live_bytes == baseline.live_bytes);
@@ -2432,6 +2433,7 @@ static void test_allocator_reclaim(void) {
 			CHECK(memfs_node_unlink(node) == MEMFS_OK);
 	}
 
+	(void)memfs_allocator_scavenge(&fs->allocator);
 	memfs_allocator_get_stats(&fs->allocator, &after_delete);
 	CHECK(after_delete.live_objects == baseline.live_objects);
 	CHECK(after_delete.reserved_bytes == baseline.reserved_bytes);
@@ -2493,6 +2495,12 @@ static void test_allocator_unified_pool_layout(void) {
 	CHECK(after.live_objects == baseline.live_objects);
 	CHECK(after.slab_count == 0U);
 	CHECK(after.dedicated_count == 0U);
+	CHECK(after.area_cached_count >= 1U);
+	CHECK(after.area_cached_bytes > 0U);
+	CHECK(memfs_allocator_scavenge(&allocator) > 0U);
+	memfs_allocator_get_stats(&allocator, &after);
+	CHECK(after.area_cached_count == 0U);
+	CHECK(after.area_cached_bytes == 0U);
 	CHECK(after.reserved_bytes == baseline.reserved_bytes);
 
 #if !defined(NDEBUG)
@@ -2537,6 +2545,66 @@ static void test_allocator_unified_pool_layout(void) {
 	memfs_allocator_destroy(&allocator);
 }
 
+
+
+static void test_allocator_area_cache_reuse(void) {
+	MemfsAllocator allocator;
+	MemfsAllocatorStats baseline;
+	MemfsAllocatorStats cached;
+	MemfsAllocatorStats active;
+	MemfsAllocatorStats after;
+	uint8_t* first;
+	uint8_t* second;
+	size_t i;
+	const size_t bytes = 16U * 1024U;
+
+	printf("== allocator area cache reuse ==\n");
+
+	CHECK(memfs_allocator_init(&allocator, 64U, 64U, 64U));
+	memfs_allocator_get_stats(&allocator, &baseline);
+
+	first = memfs_allocator_alloc(&allocator, bytes);
+	CHECK(first != NULL);
+	if (first == NULL) {
+		memfs_allocator_destroy(&allocator);
+		return;
+	}
+	memset(first, 0xA5, bytes);
+	memfs_allocator_free(&allocator, first, bytes);
+
+	memfs_allocator_get_stats(&allocator, &cached);
+	CHECK(cached.live_objects == baseline.live_objects);
+	CHECK(cached.dedicated_count == 0U);
+	CHECK(cached.area_cached_count == 1U);
+	CHECK(cached.area_cached_bytes > 0U);
+	CHECK(cached.reserved_bytes > baseline.reserved_bytes);
+
+	second = memfs_allocator_alloc_zero(&allocator, bytes);
+	CHECK(second != NULL);
+	CHECK(second == first);
+	if (second != NULL) {
+		for (i = 0; i < bytes; i++)
+			CHECK(second[i] == 0U);
+	}
+
+	memfs_allocator_get_stats(&allocator, &active);
+	CHECK(active.dedicated_count == 1U);
+	CHECK(active.area_cached_count == 0U);
+
+	if (second != NULL)
+		memfs_allocator_free(&allocator, second, bytes);
+	CHECK(memfs_allocator_scavenge(&allocator) > 0U);
+
+	memfs_allocator_get_stats(&allocator, &after);
+	CHECK(after.live_objects == baseline.live_objects);
+	CHECK(after.dedicated_count == 0U);
+	CHECK(after.area_cached_count == 0U);
+	CHECK(after.area_cached_bytes == 0U);
+	CHECK(after.reserved_bytes == baseline.reserved_bytes);
+	CHECK(after.committed_bytes == baseline.committed_bytes);
+
+	memfs_allocator_destroy(&allocator);
+}
 
 static void test_allocator_name_pool_boundaries(void) {
 	MemfsAllocator allocator;
@@ -2690,6 +2758,7 @@ static void test_allocator_generic_size_classes(void) {
 			memfs_allocator_free(&allocator, blocks[i], sizes[i]);
 	}
 
+	(void)memfs_allocator_scavenge(&allocator);
 	memfs_allocator_get_stats(&allocator, &after);
 	CHECK(after.live_objects == before.live_objects);
 	CHECK(after.dedicated_count == 0U);
@@ -2774,6 +2843,7 @@ static void test_allocator_generic_concurrency(void) {
 		CHECK(args[i].failures == 0);
 	}
 
+	(void)memfs_allocator_scavenge(&allocator);
 	memfs_allocator_get_stats(&allocator, &after);
 	CHECK(after.live_objects == before.live_objects);
 	CHECK(after.dedicated_count == 0U);
@@ -3542,6 +3612,7 @@ static void test_allocator_failure_injection_primitives(void) {
 	ptr = memfs_allocator_alloc(&allocator, 64U * 1024U);
 	CHECK(ptr != NULL);
 	memfs_allocator_free(&allocator, ptr, 64U * 1024U);
+	(void)memfs_allocator_scavenge(&allocator);
 	memfs_allocator_get_stats(&allocator, &after);
 	CHECK(failure_stats_equal(&baseline, &after));
 
@@ -3758,6 +3829,7 @@ int main(void) {
 	test_concurrent_files();
 	test_allocator_reclaim();
 	test_allocator_unified_pool_layout();
+	test_allocator_area_cache_reuse();
 	test_allocator_name_pool_boundaries();
 	test_allocator_generic_size_classes();
 	test_allocator_generic_concurrency();

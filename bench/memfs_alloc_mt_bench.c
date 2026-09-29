@@ -60,7 +60,9 @@ static DWORD WINAPI alloc_bench_worker(LPVOID parameter) {
 
 static int run_case(size_t size, int thread_count, uint32_t iterations) {
     MemfsAllocator allocator;
+    MemfsAllocatorStats baseline;
     MemfsAllocatorStats stats;
+    MemfsAllocatorStats after_scavenge;
     AllocBenchThread contexts[ALLOC_BENCH_MAX_THREADS];
     HANDLE threads[ALLOC_BENCH_MAX_THREADS];
     HANDLE start_event = NULL;
@@ -84,6 +86,8 @@ static int run_case(size_t size, int thread_count, uint32_t iterations) {
         fprintf(stderr, "allocator init failed\n");
         return 1;
     }
+
+    memfs_allocator_get_stats(&allocator, &baseline);
 
     start_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (start_event == NULL)
@@ -128,7 +132,8 @@ static int run_case(size_t size, int thread_count, uint32_t iterations) {
     printf(
         "size=%-6llu threads=%-2d iterations/thread=%-7u "
         "ops=%-10llu seconds=%8.4f ops/s=%12.0f "
-        "errors=%llu post_slabs=%u post_areas=%u post_reserved=%llu\n",
+        "errors=%llu post_slabs=%u post_areas=%u post_cached=%u "
+        "post_cached_bytes=%llu post_reserved=%llu",
         (unsigned long long)size,
         thread_count,
         iterations,
@@ -138,14 +143,37 @@ static int run_case(size_t size, int thread_count, uint32_t iterations) {
         (unsigned long long)errors,
         stats.slab_count,
         stats.dedicated_count,
+        stats.area_cached_count,
+        (unsigned long long)stats.area_cached_bytes,
         (unsigned long long)stats.reserved_bytes);
 
-    if (errors != 0 || stats.live_objects != 0 ||
-        stats.slab_count != 0 || stats.dedicated_count != 0) {
+    if (errors != 0 ||
+        stats.live_objects != baseline.live_objects ||
+        stats.live_bytes != baseline.live_bytes ||
+        stats.slab_count != baseline.slab_count ||
+        stats.dedicated_count != baseline.dedicated_count) {
         fprintf(stderr,
-                "allocator benchmark invariant failed size=%llu threads=%d\n",
+                "\nallocator benchmark invariant failed size=%llu threads=%d\n",
                 (unsigned long long)size, thread_count);
         goto cleanup;
+    }
+
+    {
+        uint64_t scavenged = memfs_allocator_scavenge(&allocator);
+        memfs_allocator_get_stats(&allocator, &after_scavenge);
+        printf(" scavenged=%llu\n", (unsigned long long)scavenged);
+
+        if (after_scavenge.area_cached_count != 0U ||
+            after_scavenge.area_cached_bytes != 0U ||
+            after_scavenge.live_objects != baseline.live_objects ||
+            after_scavenge.live_bytes != baseline.live_bytes ||
+            after_scavenge.reserved_bytes != baseline.reserved_bytes ||
+            after_scavenge.committed_bytes != baseline.committed_bytes) {
+            fprintf(stderr,
+                    "allocator benchmark scavenge mismatch size=%llu threads=%d\n",
+                    (unsigned long long)size, thread_count);
+            goto cleanup;
+        }
     }
 
     result = 0;

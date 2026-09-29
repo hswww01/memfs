@@ -8,6 +8,12 @@
 #define MEMFS_SLAB_MAGIC 0x4D46534CU
 #define MEMFS_ALLOC_STATE_MAGIC 0x4D464153U
 #define MEMFS_AREA_MAGIC 0x4D464152U
+#define MEMFS_AREA_CACHED_MAGIC 0x4D464143U
+#define MEMFS_AREA_CACHE_MAX_BLOCKS 32U
+#define MEMFS_AREA_CACHE_MAX_BYTES (4U * 1024U * 1024U)
+#define MEMFS_AREA_CACHE_MAX_BLOCK_BYTES (256U * 1024U)
+#define MEMFS_AREA_CACHE_BLOCKS_PER_SHARD (MEMFS_AREA_CACHE_MAX_BLOCKS / MEMFS_POOL_SHARD_COUNT)
+#define MEMFS_AREA_CACHE_BYTES_PER_SHARD (MEMFS_AREA_CACHE_MAX_BYTES / MEMFS_POOL_SHARD_COUNT)
 #define MEMFS_MIN_SLAB_BYTES (4U * 1024U)
 #define MEMFS_MAX_SLAB_BYTES (64U * 1024U)
 #define MEMFS_ALLOC_ALIGNMENT 16U
@@ -15,6 +21,10 @@
 
 _Static_assert((MEMFS_POOL_SHARD_COUNT & (MEMFS_POOL_SHARD_COUNT - 1U)) == 0,
                "pool shard count must be a power of two");
+_Static_assert(MEMFS_AREA_CACHE_MAX_BLOCKS % MEMFS_POOL_SHARD_COUNT == 0,
+               "area cache block bound must divide evenly across shards");
+_Static_assert(MEMFS_AREA_CACHE_MAX_BYTES % MEMFS_POOL_SHARD_COUNT == 0,
+               "area cache byte bound must divide evenly across shards");
 
 typedef struct MemfsFreeObject {
     struct MemfsFreeObject* next;
@@ -24,6 +34,7 @@ typedef struct MemfsPool MemfsPool;
 typedef struct MemfsPoolShard MemfsPoolShard;
 typedef struct MemfsSlab MemfsSlab;
 typedef struct MemfsAreaBlock MemfsAreaBlock;
+typedef struct MemfsAreaShard MemfsAreaShard;
 
 struct MemfsPoolShard {
     MemfsSlab* slabs;
@@ -62,10 +73,23 @@ struct MemfsAreaBlock {
     MemfsAreaBlock* next;
     MemfsAreaBlock* prev;
     MemfsAllocatorState* owner;
+    MemfsAreaShard* shard;
     uint64_t requested_bytes;
     uint64_t region_bytes;
     uint32_t magic;
     uint32_t reserved;
+};
+
+struct MemfsAreaShard {
+    MemfsAreaBlock* active;
+    MemfsAreaBlock* cached;
+    SRWLOCK lock;
+    uint64_t active_count;
+    uint64_t live_bytes;
+    uint64_t reserved_bytes;
+    uint64_t committed_bytes;
+    uint64_t cached_bytes;
+    uint32_t cached_count;
 };
 
 struct MemfsAllocatorState {
@@ -75,12 +99,7 @@ struct MemfsAllocatorState {
     uint64_t region_bytes;
     MemfsPool pools[MEMFS_ALLOC_CLASS_COUNT];
 
-    SRWLOCK area_lock;
-    MemfsAreaBlock* areas;
-    uint64_t area_count;
-    uint64_t area_live_bytes;
-    uint64_t area_reserved_bytes;
-    uint64_t area_committed_bytes;
+    MemfsAreaShard area_shards[MEMFS_POOL_SHARD_COUNT];
 };
 
 static const size_t g_class_sizes[MEMFS_ALLOC_CLASS_COUNT] = {
@@ -539,10 +558,36 @@ static size_t area_header_size(void) {
     return align_up(sizeof(MemfsAreaBlock), MEMFS_ALLOC_ALIGNMENT);
 }
 
+static void area_list_insert(MemfsAreaBlock** head, MemfsAreaBlock* block) {
+    block->prev = NULL;
+    block->next = *head;
+    if (*head)
+        (*head)->prev = block;
+    *head = block;
+}
+
+static void area_list_remove(MemfsAreaBlock** head, MemfsAreaBlock* block) {
+    if (block->prev)
+        block->prev->next = block->next;
+    else
+        *head = block->next;
+    if (block->next)
+        block->next->prev = block->prev;
+    block->next = NULL;
+    block->prev = NULL;
+}
+
+static MemfsAreaShard* area_current_shard(MemfsAllocatorState* state) {
+    return &state->area_shards[pool_shard_index()];
+}
+
 static void* area_alloc(MemfsAllocatorState* state, size_t bytes) {
+    MemfsAreaShard* shard;
     MemfsAreaBlock* block;
+    MemfsAreaBlock* best = NULL;
     size_t header_size;
     size_t total_size;
+    uint64_t max_region;
 
     if (state == NULL || bytes == 0)
         return NULL;
@@ -551,9 +596,45 @@ static void* area_alloc(MemfsAllocatorState* state, size_t bytes) {
     if (header_size == 0 || bytes > SIZE_MAX - header_size)
         return NULL;
     total_size = header_size + bytes;
+    max_region = total_size <= UINT64_MAX / 2U
+        ? (uint64_t)total_size * 2U
+        : UINT64_MAX;
 
     if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_DEDICATED))
         return NULL;
+
+    shard = area_current_shard(state);
+    AcquireSRWLockExclusive(&shard->lock);
+    for (block = shard->cached; block; block = block->next) {
+        if (block->magic != MEMFS_AREA_CACHED_MAGIC ||
+            block->owner != state ||
+            block->shard != shard ||
+            block->region_bytes < total_size ||
+            block->region_bytes > max_region) {
+            continue;
+        }
+        if (best == NULL || block->region_bytes < best->region_bytes)
+            best = block;
+    }
+
+    if (best != NULL) {
+        area_list_remove(&shard->cached, best);
+        if (shard->cached_count)
+            shard->cached_count--;
+        if (shard->cached_bytes >= best->region_bytes)
+            shard->cached_bytes -= best->region_bytes;
+        else
+            shard->cached_bytes = 0;
+
+        best->requested_bytes = bytes;
+        best->magic = MEMFS_AREA_MAGIC;
+        area_list_insert(&shard->active, best);
+        shard->active_count++;
+        shard->live_bytes += bytes;
+        ReleaseSRWLockExclusive(&shard->lock);
+        return (uint8_t*)best + header_size;
+    }
+    ReleaseSRWLockExclusive(&shard->lock);
 
     block = memfs_vm_reserve_commit(total_size);
     if (block == NULL)
@@ -561,83 +642,85 @@ static void* area_alloc(MemfsAllocatorState* state, size_t bytes) {
 
     memset(block, 0, header_size);
     block->owner = state;
+    block->shard = shard;
     block->requested_bytes = bytes;
     block->region_bytes = memfs_vm_region_bytes(block);
     block->magic = MEMFS_AREA_MAGIC;
 
-    AcquireSRWLockExclusive(&state->area_lock);
-    block->prev = NULL;
-    block->next = state->areas;
-    if (state->areas)
-        state->areas->prev = block;
-    state->areas = block;
-    state->area_count++;
-    state->area_live_bytes += bytes;
-    state->area_reserved_bytes += block->region_bytes;
-    state->area_committed_bytes += block->region_bytes;
-    ReleaseSRWLockExclusive(&state->area_lock);
+    AcquireSRWLockExclusive(&shard->lock);
+    area_list_insert(&shard->active, block);
+    shard->active_count++;
+    shard->live_bytes += bytes;
+    shard->reserved_bytes += block->region_bytes;
+    shard->committed_bytes += block->region_bytes;
+    ReleaseSRWLockExclusive(&shard->lock);
 
     return (uint8_t*)block + header_size;
 }
 
 static void area_free(MemfsAllocatorState* state, void* ptr) {
     MemfsAreaBlock* block;
+    MemfsAreaShard* shard;
     size_t header_size;
+    bool cache_block;
 
     if (state == NULL || ptr == NULL)
         return;
 
     header_size = area_header_size();
     block = (MemfsAreaBlock*)((uint8_t*)ptr - header_size);
-
-    if (block->magic != MEMFS_AREA_MAGIC || block->owner != state)
+    if (block->magic != MEMFS_AREA_MAGIC || block->owner != state || block->shard == NULL)
         return;
 
-    AcquireSRWLockExclusive(&state->area_lock);
+    shard = block->shard;
+    AcquireSRWLockExclusive(&shard->lock);
 
-    if (block->prev)
-        block->prev->next = block->next;
-    else
-        state->areas = block->next;
-    if (block->next)
-        block->next->prev = block->prev;
+    if (block->magic != MEMFS_AREA_MAGIC ||
+        block->owner != state ||
+        block->shard != shard) {
+        ReleaseSRWLockExclusive(&shard->lock);
+        return;
+    }
 
-    if (state->area_count)
-        state->area_count--;
-    if (state->area_live_bytes >= block->requested_bytes)
-        state->area_live_bytes -= block->requested_bytes;
+    area_list_remove(&shard->active, block);
+    if (shard->active_count)
+        shard->active_count--;
+    if (shard->live_bytes >= block->requested_bytes)
+        shard->live_bytes -= block->requested_bytes;
     else
-        state->area_live_bytes = 0;
-    if (state->area_reserved_bytes >= block->region_bytes)
-        state->area_reserved_bytes -= block->region_bytes;
+        shard->live_bytes = 0;
+
+    cache_block =
+        block->region_bytes <= MEMFS_AREA_CACHE_MAX_BLOCK_BYTES &&
+        shard->cached_count < MEMFS_AREA_CACHE_BLOCKS_PER_SHARD &&
+        block->region_bytes <= MEMFS_AREA_CACHE_BYTES_PER_SHARD &&
+        shard->cached_bytes <= MEMFS_AREA_CACHE_BYTES_PER_SHARD - block->region_bytes;
+
+    if (cache_block) {
+        block->requested_bytes = 0;
+        block->magic = MEMFS_AREA_CACHED_MAGIC;
+        area_list_insert(&shard->cached, block);
+        shard->cached_count++;
+        shard->cached_bytes += block->region_bytes;
+        ReleaseSRWLockExclusive(&shard->lock);
+        return;
+    }
+
+    if (shard->reserved_bytes >= block->region_bytes)
+        shard->reserved_bytes -= block->region_bytes;
     else
-        state->area_reserved_bytes = 0;
-    if (state->area_committed_bytes >= block->region_bytes)
-        state->area_committed_bytes -= block->region_bytes;
+        shard->reserved_bytes = 0;
+    if (shard->committed_bytes >= block->region_bytes)
+        shard->committed_bytes -= block->region_bytes;
     else
-        state->area_committed_bytes = 0;
+        shard->committed_bytes = 0;
 
     block->magic = 0;
-    ReleaseSRWLockExclusive(&state->area_lock);
-
+    ReleaseSRWLockExclusive(&shard->lock);
     memfs_vm_release(block);
 }
 
-static void area_destroy_all(MemfsAllocatorState* state) {
-    MemfsAreaBlock* block;
-
-    if (state == NULL)
-        return;
-
-    AcquireSRWLockExclusive(&state->area_lock);
-    block = state->areas;
-    state->areas = NULL;
-    state->area_count = 0;
-    state->area_live_bytes = 0;
-    state->area_reserved_bytes = 0;
-    state->area_committed_bytes = 0;
-    ReleaseSRWLockExclusive(&state->area_lock);
-
+static void area_destroy_list(MemfsAreaBlock* block) {
     while (block) {
         MemfsAreaBlock* next = block->next;
         block->magic = 0;
@@ -646,21 +729,94 @@ static void area_destroy_all(MemfsAllocatorState* state) {
     }
 }
 
+static void area_destroy_all(MemfsAllocatorState* state) {
+    uint32_t i;
+
+    if (state == NULL)
+        return;
+
+    for (i = 0; i < MEMFS_POOL_SHARD_COUNT; i++) {
+        MemfsAreaShard* shard = &state->area_shards[i];
+        MemfsAreaBlock* active;
+        MemfsAreaBlock* cached;
+
+        AcquireSRWLockExclusive(&shard->lock);
+        active = shard->active;
+        cached = shard->cached;
+        shard->active = NULL;
+        shard->cached = NULL;
+        shard->active_count = 0;
+        shard->live_bytes = 0;
+        shard->reserved_bytes = 0;
+        shard->committed_bytes = 0;
+        shard->cached_bytes = 0;
+        shard->cached_count = 0;
+        ReleaseSRWLockExclusive(&shard->lock);
+
+        area_destroy_list(active);
+        area_destroy_list(cached);
+    }
+}
+
 static void area_add_stats(MemfsAllocatorState* state, MemfsAllocatorStats* stats) {
+    uint32_t i;
+
     if (state == NULL || stats == NULL)
         return;
 
-    AcquireSRWLockShared(&state->area_lock);
-    stats->dedicated_count = (uint32_t)state->area_count;
-    stats->dedicated_live_bytes = state->area_live_bytes;
-    stats->dedicated_reserved_bytes = state->area_reserved_bytes;
-    stats->dedicated_committed_bytes = state->area_committed_bytes;
+    for (i = 0; i < MEMFS_POOL_SHARD_COUNT; i++) {
+        MemfsAreaShard* shard = &state->area_shards[i];
 
-    stats->live_objects += state->area_count;
-    stats->live_bytes += state->area_live_bytes;
-    stats->reserved_bytes += state->area_reserved_bytes;
-    stats->committed_bytes += state->area_committed_bytes;
-    ReleaseSRWLockShared(&state->area_lock);
+        AcquireSRWLockShared(&shard->lock);
+        stats->dedicated_count += (uint32_t)shard->active_count;
+        stats->dedicated_live_bytes += shard->live_bytes;
+        stats->dedicated_reserved_bytes += shard->reserved_bytes;
+        stats->dedicated_committed_bytes += shard->committed_bytes;
+        stats->area_cached_count += shard->cached_count;
+        stats->area_cached_bytes += shard->cached_bytes;
+
+        stats->live_objects += shard->active_count;
+        stats->live_bytes += shard->live_bytes;
+        stats->reserved_bytes += shard->reserved_bytes;
+        stats->committed_bytes += shard->committed_bytes;
+        ReleaseSRWLockShared(&shard->lock);
+    }
+}
+
+static uint64_t area_scavenge(MemfsAllocatorState* state) {
+    uint64_t released = 0;
+    uint32_t i;
+
+    if (state == NULL)
+        return 0;
+
+    for (i = 0; i < MEMFS_POOL_SHARD_COUNT; i++) {
+        MemfsAreaShard* shard = &state->area_shards[i];
+        MemfsAreaBlock* cached;
+        uint64_t shard_released;
+
+        AcquireSRWLockExclusive(&shard->lock);
+        cached = shard->cached;
+        shard_released = shard->cached_bytes;
+        shard->cached = NULL;
+        shard->cached_count = 0;
+        shard->cached_bytes = 0;
+
+        if (shard->reserved_bytes >= shard_released)
+            shard->reserved_bytes -= shard_released;
+        else
+            shard->reserved_bytes = 0;
+        if (shard->committed_bytes >= shard_released)
+            shard->committed_bytes -= shard_released;
+        else
+            shard->committed_bytes = 0;
+        ReleaseSRWLockExclusive(&shard->lock);
+
+        area_destroy_list(cached);
+        released += shard_released;
+    }
+
+    return released;
 }
 
 static MemfsAllocatorState* state_create(void) {
@@ -686,7 +842,8 @@ static MemfsAllocatorState* state_create(void) {
     state->class_count = MEMFS_ALLOC_CLASS_COUNT;
     state->allocation_granularity = vm_info.allocation_granularity;
     state->region_bytes = memfs_vm_region_bytes(state);
-    InitializeSRWLock(&state->area_lock);
+    for (shard_index = 0; shard_index < MEMFS_POOL_SHARD_COUNT; ++shard_index)
+        InitializeSRWLock(&state->area_shards[shard_index].lock);
 
     if (state->allocation_granularity < MEMFS_MAX_SLAB_BYTES ||
         (state->allocation_granularity & (state->allocation_granularity - 1U)) != 0) {
@@ -830,7 +987,10 @@ void* memfs_allocator_alloc(MemfsAllocator* allocator, size_t bytes) {
 }
 
 void* memfs_allocator_alloc_zero(MemfsAllocator* allocator, size_t bytes) {
-    return memfs_allocator_alloc(allocator, bytes);
+    void* ptr = memfs_allocator_alloc(allocator, bytes);
+    if (ptr)
+        memset(ptr, 0, bytes);
+    return ptr;
 }
 
 void memfs_allocator_free(MemfsAllocator* allocator, void* ptr, size_t bytes) {
@@ -908,6 +1068,8 @@ uint64_t memfs_allocator_scavenge(MemfsAllocator* allocator) {
 
     for (i = 0; i < MEMFS_ALLOC_CLASS_COUNT; i++)
         released += pool_scavenge(&allocator->state->pools[i]);
+
+    released += area_scavenge(allocator->state);
 
     if (released)
         InterlockedAdd64(&allocator->scavenged_bytes, (LONG64)released);
