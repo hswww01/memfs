@@ -94,6 +94,8 @@ Options:
 --key-env <name>        Read a 64-hex key from an environment variable
 --debug                 Enable WinFsp debug logging
 --service               Run under the Windows Service Control Manager
+--stats                 Print a human-readable runtime snapshot at mount and stop
+--stats-json            Print stable one-line JSON runtime snapshots at mount and stop
 --help
 ```
 
@@ -186,6 +188,17 @@ resident_bytes tracks encoded data blobs/pages and intentionally excludes host a
 The allocator v2 backend is size-class based rather than object-type based. Node, directory, page-group, name and generic allocation APIs all converge on the same rounded-size class, so there is only one physical pool for a given class. Small allocations use adaptive slab backing (4 KiB / 8 KiB / 16 KiB / 32 KiB / 64 KiB according to object size); allocations above the small-object threshold use area allocations. `reserved_bytes` is address-space reservation only; `committed_bytes` is the real OS-backed committed memory, and `physical_bytes` is an alias for `committed_bytes`, not a separate source. `live_bytes` is the caller-visible payload/object bytes currently allocated.
 
 `capacity_auto=true` makes memfs derive its writable allowance from current system memory and allocator backing instead of using a fixed user capacity. `memfs_auto_allowance_bytes()` reports the current allowance, while `used_bytes`, `resident_bytes`, `committed_bytes` and `physical_bytes` remain separate measurements: logical quota, resident payload, and allocator physical backing. The benchmark reports these separately so high-water checks do not confuse allocator backing with logical file usage.
+
+Runtime diagnostics are opt-in and do not start a sampling thread. `memfs_get_runtime_stats()` returns a point-in-time `MemfsRuntimeStats` snapshot containing logical used/free bytes, resident bytes, allocator live/reserved/committed/physical bytes, slab/area/cache counts, scavenger totals, and the current auto-capacity allowance plus its 256 MiB hard and 512 MiB soft pressure margins.
+
+For interactive diagnostics:
+
+```powershell
+.\build\x64-release\memfs.exe --mount R: --size auto --stats
+.\build\x64-release\memfs.exe --mount R: --size auto --stats-json
+```
+
+`--stats` prints a stable `key=value` snapshot after mount and immediately before shutdown. `--stats-json` suppresses the normal mount banner and emits one JSON object per snapshot with `type=memfs_stats` and `phase=mounted|stopping`, making redirected stdout suitable for machine parsing. The API is also available to service/control-plane code without enabling any background sampler.
 
 ### Sparse paged files
 
@@ -284,4 +297,4 @@ scripts/
 - Persistence/snapshot support.
 - Password-based key derivation if persistent encrypted images are introduced.
 - More rename/delete/open race stress tests.
-- Optional dedicated metadata slab allocator if profiling shows CRT heap bookkeeping is still material.
+- Continue profiling unified size-class shard counts, slab sizing and the slab/area threshold under real workloads; do not introduce object-type-specific physical pools.

@@ -291,6 +291,78 @@ static void test_adaptive_memory_pressure_scavenger(void) {
 }
 #endif
 
+
+static void test_runtime_stats_snapshot(void) {
+	const uint64_t capacity = 8ULL * 1024ULL * 1024ULL;
+	Memfs* fs = NULL;
+	MemfsNode* file = NULL;
+	MemfsRuntimeStats baseline;
+	MemfsRuntimeStats active;
+	MemfsRuntimeStats cached;
+	MemfsRuntimeStats scavenged;
+	uint8_t data[1024];
+	uint32_t written = 0;
+	void* area;
+	uint32_t i;
+
+	printf("== runtime stats snapshot ==\n");
+	CHECK(memfs_create(capacity, L"STATS", &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	if (fs == NULL)
+		return;
+
+	memfs_get_runtime_stats(fs, &baseline);
+	CHECK(!baseline.capacity_auto);
+	CHECK(baseline.capacity_bytes == capacity);
+	CHECK(baseline.logical_used_bytes == 0U);
+	CHECK(baseline.free_bytes == capacity);
+	CHECK(baseline.auto_allowance_bytes == 0U);
+	CHECK(baseline.auto_hard_margin_bytes == MEMFS_AUTO_HARD_MARGIN_BYTES);
+	CHECK(baseline.auto_soft_margin_bytes == MEMFS_AUTO_SOFT_MARGIN_BYTES);
+	CHECK(baseline.allocator_physical_bytes == baseline.allocator_committed_bytes);
+
+	CHECK(memfs_node_create(fs, fs->root, L"stats.bin", false,
+		FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(file != NULL);
+	if (file == NULL) {
+		memfs_destroy(fs);
+		return;
+	}
+
+	for (i = 0; i < _countof(data); i++)
+		data[i] = (uint8_t)i;
+	CHECK(memfs_node_write(file, data, 0, sizeof(data), false, false, &written) == MEMFS_OK);
+	CHECK(written == sizeof(data));
+
+	memfs_get_runtime_stats(fs, &active);
+	CHECK(active.logical_used_bytes == sizeof(data));
+	CHECK(active.free_bytes == capacity - sizeof(data));
+	CHECK(active.resident_bytes > 0U);
+	CHECK(active.allocator_live_objects >= baseline.allocator_live_objects);
+	CHECK(active.allocator_physical_bytes == active.allocator_committed_bytes);
+
+	area = memfs_allocator_alloc(&fs->allocator, 16U * 1024U);
+	CHECK(area != NULL);
+	if (area != NULL)
+		memfs_allocator_free(&fs->allocator, area, 16U * 1024U);
+
+	memfs_get_runtime_stats(fs, &cached);
+	CHECK(cached.area_cached_count >= 1U);
+	CHECK(cached.area_cached_bytes > 0U);
+	CHECK(cached.area_count == 0U);
+
+	(void)memfs_allocator_scavenge(&fs->allocator);
+	memfs_get_runtime_stats(fs, &scavenged);
+	CHECK(scavenged.area_cached_count == 0U);
+	CHECK(scavenged.area_cached_bytes == 0U);
+	CHECK(scavenged.allocator_scavenge_count > cached.allocator_scavenge_count);
+	CHECK(scavenged.allocator_scavenged_bytes > cached.allocator_scavenged_bytes);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	memfs_destroy(fs);
+}
+
 static void test_tree_and_lookup(void) {
 	Memfs* fs = NULL;
 	MemfsNode* root;
@@ -3889,6 +3961,7 @@ int main(void) {
 #endif
 
 	test_adaptive_capacity_mode();
+	test_runtime_stats_snapshot();
 #if !defined(NDEBUG)
 	test_adaptive_memory_pressure_scavenger();
 #endif

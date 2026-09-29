@@ -71,6 +71,31 @@ typedef struct MemfsOptions {
 	size_t encryption_key_size;
 } MemfsOptions;
 
+#define MEMFS_AUTO_HARD_MARGIN_BYTES (256ULL * 1024ULL * 1024ULL)
+#define MEMFS_AUTO_SOFT_MARGIN_BYTES (512ULL * 1024ULL * 1024ULL)
+
+typedef struct MemfsRuntimeStats {
+	uint64_t logical_used_bytes;
+	uint64_t resident_bytes;
+	uint64_t capacity_bytes;
+	uint64_t free_bytes;
+	uint64_t auto_allowance_bytes;
+	uint64_t auto_hard_margin_bytes;
+	uint64_t auto_soft_margin_bytes;
+	uint64_t allocator_live_bytes;
+	uint64_t allocator_live_objects;
+	uint64_t allocator_reserved_bytes;
+	uint64_t allocator_committed_bytes;
+	uint64_t allocator_physical_bytes;
+	uint64_t allocator_scavenged_bytes;
+	uint64_t allocator_scavenge_count;
+	uint64_t area_cached_bytes;
+	uint32_t slab_count;
+	uint32_t area_count;
+	uint32_t area_cached_count;
+	bool capacity_auto;
+} MemfsRuntimeStats;
+
 struct MemfsDirHash {
 	MemfsNode** slots;
 	uint32_t capacity;
@@ -217,6 +242,7 @@ uint64_t memfs_node_resident_bytes(const MemfsNode* node);
 // not resident payload; use it for capacity policy that needs real backing.
 uint64_t memfs_committed_bytes(Memfs* fs);
 uint64_t memfs_physical_bytes(Memfs* fs);
+void memfs_get_runtime_stats(Memfs* fs, MemfsRuntimeStats* stats);
 
 #if !defined(NDEBUG)
 void memfs_test_set_system_available_bytes(uint64_t bytes);

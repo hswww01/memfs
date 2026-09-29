@@ -55,8 +55,6 @@ void memfs_node_set_change_time(MemfsNode* node, uint64_t value) {
 		node->change_time = value;
 }
 
-#define MEMFS_AUTO_HARD_MARGIN_BYTES (256ULL * 1024ULL * 1024ULL)
-#define MEMFS_AUTO_SOFT_MARGIN_BYTES (512ULL * 1024ULL * 1024ULL)
 #define MEMFS_AUTO_REFRESH_INTERVAL_MS 250ULL
 
 #if !defined(NDEBUG)
@@ -2298,6 +2296,46 @@ uint64_t memfs_committed_bytes(Memfs* fs) {
 
 uint64_t memfs_physical_bytes(Memfs* fs) {
 	return memfs_committed_bytes(fs);
+}
+
+void memfs_get_runtime_stats(Memfs* fs, MemfsRuntimeStats* stats) {
+	MemfsAllocatorStats allocator_stats;
+	uint64_t used;
+
+	if (stats == NULL)
+		return;
+
+	memset(stats, 0, sizeof(*stats));
+	if (fs == NULL)
+		return;
+
+	memfs_allocator_get_stats(&fs->allocator, &allocator_stats);
+	used = memfs_atomic_load_u64(&fs->used_bytes);
+
+	stats->logical_used_bytes = used;
+	stats->resident_bytes = memfs_atomic_load_u64(&fs->resident_bytes);
+	stats->capacity_bytes = fs->capacity;
+	stats->capacity_auto = fs->capacity_auto;
+	stats->auto_hard_margin_bytes = MEMFS_AUTO_HARD_MARGIN_BYTES;
+	stats->auto_soft_margin_bytes = MEMFS_AUTO_SOFT_MARGIN_BYTES;
+	stats->auto_allowance_bytes = fs->capacity_auto
+		? memfs_auto_allowance_bytes(fs)
+		: 0;
+	stats->free_bytes = fs->capacity_auto
+		? stats->auto_allowance_bytes
+		: (used <= fs->capacity ? fs->capacity - used : 0);
+
+	stats->allocator_live_bytes = allocator_stats.live_bytes;
+	stats->allocator_live_objects = allocator_stats.live_objects;
+	stats->allocator_reserved_bytes = allocator_stats.reserved_bytes;
+	stats->allocator_committed_bytes = allocator_stats.committed_bytes;
+	stats->allocator_physical_bytes = allocator_stats.physical_bytes;
+	stats->allocator_scavenged_bytes = allocator_stats.scavenged_bytes;
+	stats->allocator_scavenge_count = allocator_stats.scavenge_count;
+	stats->slab_count = allocator_stats.slab_count;
+	stats->area_count = allocator_stats.dedicated_count;
+	stats->area_cached_count = allocator_stats.area_cached_count;
+	stats->area_cached_bytes = allocator_stats.area_cached_bytes;
 }
 
 uint64_t memfs_resident_bytes(Memfs* fs) {

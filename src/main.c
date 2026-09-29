@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <string.h>
 #include <wchar.h>
 #include <wctype.h>
 
@@ -22,6 +23,8 @@ typedef struct MemfsRunConfig {
     bool have_fixed_key;
     bool debug;
     bool service_mode;
+    bool stats_enabled;
+    bool stats_json;
     uint8_t encryption_key[MEMFS_ENCRYPTION_KEY_SIZE];
 } MemfsRunConfig;
 
@@ -110,6 +113,8 @@ static void print_usage(const wchar_t* exe) {
              L"  --key-env <name>        Read the 64-hex encryption key from an env variable.\n"
              L"  --debug                 Enable all WinFsp debug logging.\n"
              L"  --service               Run under the Windows Service Control Manager.\n"
+             L"  --stats                 Print human-readable runtime stats at mount/stop.\n"
+             L"  --stats-json            Print machine-readable JSON stats at mount/stop.\n"
              L"  --help                  Show this help.\n"
              L"\n"
              L"Service control example (run from an elevated shell):\n"
@@ -271,6 +276,11 @@ static int parse_config(int argc, wchar_t** argv, MemfsRunConfig* config) {
             config->debug = true;
         } else if (_wcsicmp(argv[i], L"--service") == 0) {
             config->service_mode = true;
+        } else if (_wcsicmp(argv[i], L"--stats") == 0) {
+            config->stats_enabled = true;
+        } else if (_wcsicmp(argv[i], L"--stats-json") == 0) {
+            config->stats_enabled = true;
+            config->stats_json = true;
         } else if (_wcsicmp(argv[i], L"--help") == 0 ||
                    _wcsicmp(argv[i], L"-h") == 0 ||
                    _wcsicmp(argv[i], L"/?") == 0) {
@@ -287,6 +297,97 @@ static int parse_config(int argc, wchar_t** argv, MemfsRunConfig* config) {
     }
 
     return 0;
+}
+
+
+static void print_runtime_stats(Memfs* fs, const char* phase, bool json) {
+    MemfsRuntimeStats stats;
+    HANDLE output;
+    DWORD written = 0;
+    char line[4096];
+    int length;
+
+    if (fs == NULL || phase == NULL)
+        return;
+
+    memfs_get_runtime_stats(fs, &stats);
+
+    if (json) {
+        length = _snprintf_s(
+            line, sizeof(line), _TRUNCATE,
+            "{\"type\":\"memfs_stats\",\"phase\":\"%s\","
+            "\"capacity_auto\":%s,\"capacity_bytes\":%llu,"
+            "\"logical_used_bytes\":%llu,\"free_bytes\":%llu,"
+            "\"resident_bytes\":%llu,\"auto_allowance_bytes\":%llu,"
+            "\"auto_hard_margin_bytes\":%llu,\"auto_soft_margin_bytes\":%llu,"
+            "\"allocator_live_bytes\":%llu,\"allocator_live_objects\":%llu,"
+            "\"allocator_reserved_bytes\":%llu,\"allocator_committed_bytes\":%llu,"
+            "\"allocator_physical_bytes\":%llu,\"slab_count\":%u,"
+            "\"area_count\":%u,\"area_cached_count\":%u,"
+            "\"area_cached_bytes\":%llu,\"allocator_scavenge_count\":%llu,"
+            "\"allocator_scavenged_bytes\":%llu}\r\n",
+            phase,
+            stats.capacity_auto ? "true" : "false",
+            (unsigned long long)stats.capacity_bytes,
+            (unsigned long long)stats.logical_used_bytes,
+            (unsigned long long)stats.free_bytes,
+            (unsigned long long)stats.resident_bytes,
+            (unsigned long long)stats.auto_allowance_bytes,
+            (unsigned long long)stats.auto_hard_margin_bytes,
+            (unsigned long long)stats.auto_soft_margin_bytes,
+            (unsigned long long)stats.allocator_live_bytes,
+            (unsigned long long)stats.allocator_live_objects,
+            (unsigned long long)stats.allocator_reserved_bytes,
+            (unsigned long long)stats.allocator_committed_bytes,
+            (unsigned long long)stats.allocator_physical_bytes,
+            stats.slab_count,
+            stats.area_count,
+            stats.area_cached_count,
+            (unsigned long long)stats.area_cached_bytes,
+            (unsigned long long)stats.allocator_scavenge_count,
+            (unsigned long long)stats.allocator_scavenged_bytes);
+    } else {
+        length = _snprintf_s(
+            line, sizeof(line), _TRUNCATE,
+            "stats phase=%s capacity_auto=%u capacity_bytes=%llu "
+            "logical_used_bytes=%llu free_bytes=%llu resident_bytes=%llu "
+            "auto_allowance_bytes=%llu auto_hard_margin_bytes=%llu "
+            "auto_soft_margin_bytes=%llu allocator_live_bytes=%llu "
+            "allocator_live_objects=%llu allocator_reserved_bytes=%llu "
+            "allocator_committed_bytes=%llu allocator_physical_bytes=%llu "
+            "slab_count=%u area_count=%u area_cached_count=%u "
+            "area_cached_bytes=%llu allocator_scavenge_count=%llu "
+            "allocator_scavenged_bytes=%llu\r\n",
+            phase,
+            stats.capacity_auto ? 1U : 0U,
+            (unsigned long long)stats.capacity_bytes,
+            (unsigned long long)stats.logical_used_bytes,
+            (unsigned long long)stats.free_bytes,
+            (unsigned long long)stats.resident_bytes,
+            (unsigned long long)stats.auto_allowance_bytes,
+            (unsigned long long)stats.auto_hard_margin_bytes,
+            (unsigned long long)stats.auto_soft_margin_bytes,
+            (unsigned long long)stats.allocator_live_bytes,
+            (unsigned long long)stats.allocator_live_objects,
+            (unsigned long long)stats.allocator_reserved_bytes,
+            (unsigned long long)stats.allocator_committed_bytes,
+            (unsigned long long)stats.allocator_physical_bytes,
+            stats.slab_count,
+            stats.area_count,
+            stats.area_cached_count,
+            (unsigned long long)stats.area_cached_bytes,
+            (unsigned long long)stats.allocator_scavenge_count,
+            (unsigned long long)stats.allocator_scavenged_bytes);
+    }
+
+    if (length <= 0)
+        return;
+
+    output = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (output == NULL || output == INVALID_HANDLE_VALUE)
+        return;
+
+    (void)WriteFile(output, line, (DWORD)length, &written, NULL);
 }
 
 static int run_filesystem(const MemfsRunConfig* config, HANDLE stop_event, bool console_mode) {
@@ -334,20 +435,26 @@ static int run_filesystem(const MemfsRunConfig* config, HANDLE stop_event, bool 
     }
 
     if (console_mode) {
-        if (config->capacity_auto)
-            wprintf(L"MEMFS mounted at %s (auto capacity)%s%s. Press Ctrl+C to stop.\n",
-                    config->mount_point,
-                    config->compression_enabled ? L", compressed" : L"",
-                    config->encryption_enabled ? L", encrypted" : L"");
-        else
-            wprintf(L"MEMFS mounted at %s (%llu MiB)%s%s. Press Ctrl+C to stop.\n",
-                    config->mount_point,
-                    (unsigned long long)(config->capacity / (1024ULL * 1024ULL)),
-                    config->compression_enabled ? L", compressed" : L"",
-                    config->encryption_enabled ? L", encrypted" : L"");
+        if (!config->stats_json) {
+            if (config->capacity_auto)
+                wprintf(L"MEMFS mounted at %s (auto capacity)%s%s. Press Ctrl+C to stop.\n",
+                        config->mount_point,
+                        config->compression_enabled ? L", compressed" : L"",
+                        config->encryption_enabled ? L", encrypted" : L"");
+            else
+                wprintf(L"MEMFS mounted at %s (%llu MiB)%s%s. Press Ctrl+C to stop.\n",
+                        config->mount_point,
+                        (unsigned long long)(config->capacity / (1024ULL * 1024ULL)),
+                        config->compression_enabled ? L", compressed" : L"",
+                        config->encryption_enabled ? L", encrypted" : L"");
+        }
+        if (config->stats_enabled)
+            print_runtime_stats(instance->store, "mounted", config->stats_json);
     }
 
     WaitForSingleObject(stop_event, INFINITE);
+    if (console_mode && config->stats_enabled)
+        print_runtime_stats(instance->store, "stopping", config->stats_json);
     exit_code = 0;
     memfs_winfsp_stop(instance);
 
