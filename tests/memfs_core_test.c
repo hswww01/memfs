@@ -1100,6 +1100,101 @@ static void test_truncate_regrow_zero_fill(void) {
 
 	memfs_destroy(fs);
 }
+static void test_allocator_fragmentation_reuse(void) {
+	enum { COUNT = 256 };
+	MemfsAllocator allocator;
+	MemfsAllocatorStats baseline;
+	MemfsAllocatorStats full;
+	MemfsAllocatorStats partial;
+	MemfsAllocatorStats refilled;
+	MemfsAllocatorStats stats;
+	void* blocks[COUNT] = {0};
+	void* refill[COUNT / 2] = {0};
+	void* mixed[10] = {0};
+	const uint32_t sizes[10] = {8, 64, 256, 512, 1024, 4096, 16384, 32768, 65536, 262144};
+	uint32_t i;
+	uint32_t round;
+
+	printf("== allocator fragmentation reuse ==\n");
+
+	memfs_allocator_init(&allocator, 64, 64, 64);
+	memfs_allocator_get_stats(&allocator, &baseline);
+
+	for (i = 0; i < COUNT; i++) {
+		blocks[i] = memfs_allocator_alloc(&allocator, 512);
+		CHECK(blocks[i] != NULL);
+	}
+	memfs_allocator_get_stats(&allocator, &full);
+	CHECK(full.slab_count >= 3);
+
+	for (i = 0; i < COUNT; i += 2U) {
+		memfs_allocator_free(&allocator, blocks[i], 512);
+		blocks[i] = NULL;
+	}
+	memfs_allocator_get_stats(&allocator, &partial);
+	CHECK(partial.live_objects == COUNT / 2U);
+	CHECK(partial.slab_count == full.slab_count);
+
+	for (i = 0; i < COUNT / 2U; i++) {
+		refill[i] = memfs_allocator_alloc(&allocator, 512);
+		CHECK(refill[i] != NULL);
+	}
+	memfs_allocator_get_stats(&allocator, &refilled);
+	CHECK(refilled.slab_count == full.slab_count);
+	CHECK(refilled.reserved_bytes == full.reserved_bytes);
+	CHECK(refilled.committed_bytes == full.committed_bytes);
+
+	for (i = 0; i < COUNT; i++) {
+		if (blocks[i] != NULL) {
+			memfs_allocator_free(&allocator, blocks[i], 512);
+			blocks[i] = NULL;
+		}
+	}
+	for (i = 0; i < COUNT / 2U; i++) {
+		if (refill[i] != NULL) {
+			memfs_allocator_free(&allocator, refill[i], 512);
+			refill[i] = NULL;
+		}
+	}
+	memfs_allocator_get_stats(&allocator, &stats);
+	CHECK(stats.live_objects == baseline.live_objects);
+	CHECK(stats.live_bytes == baseline.live_bytes);
+	CHECK(stats.reserved_bytes == baseline.reserved_bytes);
+	CHECK(stats.committed_bytes == baseline.committed_bytes);
+	CHECK(stats.dedicated_count == baseline.dedicated_count);
+	CHECK(stats.physical_bytes == stats.committed_bytes);
+
+	for (round = 0; round < 8; round++) {
+		for (i = 0; i < 10; i++) {
+			uint8_t* bytes = (uint8_t*)memfs_allocator_alloc(&allocator, sizes[i]);
+
+			CHECK(bytes != NULL);
+			if (bytes != NULL) {
+				uint32_t fill = sizes[i] < 16U ? sizes[i] : 16U;
+				uint32_t j;
+
+				for (j = 0; j < fill; j++)
+					bytes[j] = (uint8_t)(round + j + i);
+			}
+			mixed[i] = bytes;
+		}
+		for (i = 0; i < 10; i++) {
+			if (mixed[i] != NULL) {
+				memfs_allocator_free(&allocator, mixed[i], sizes[i]);
+				mixed[i] = NULL;
+			}
+		}
+		memfs_allocator_get_stats(&allocator, &stats);
+		CHECK(stats.live_objects == baseline.live_objects);
+		CHECK(stats.live_bytes == baseline.live_bytes);
+		CHECK(stats.reserved_bytes == baseline.reserved_bytes);
+		CHECK(stats.committed_bytes == baseline.committed_bytes);
+		CHECK(stats.dedicated_count == baseline.dedicated_count);
+		CHECK(stats.physical_bytes == stats.committed_bytes);
+	}
+
+	memfs_allocator_destroy(&allocator);
+}
 static void test_large_directory(void) {
 	enum { COUNT = 5000 };
 	Memfs* fs = NULL;
@@ -3282,7 +3377,8 @@ int main(void) {
 	setvbuf(stdout, NULL, _IONBF, 0);
 
 	test_tree_and_lookup();
-	test_memory_accounting_layers();
+	test_memory_accounting_layers();	test_allocator_fragmentation_reuse();
+
 	test_adaptive_capacity_mode();
 	test_io_and_resize();
 	test_write_to_end_semantics();
