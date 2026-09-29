@@ -382,6 +382,90 @@ static int bench_large_dir(Memfs* fs, uint32_t count, LARGE_INTEGER frequency, B
 
 	return 0;
 }
+#define BENCH_SWEEP_FILE_COUNT 10000U
+static int bench_small_size_sweep(Memfs* fs, uint32_t count, LARGE_INTEGER frequency) {
+	static const uint32_t sizes[6] = {0U, 1U, 8U, 9U, 64U, 4096U};
+	uint8_t payload[BENCH_4KB_SIZE];
+	uint32_t s;
+	uint32_t i;
+	wchar_t name[32];
+
+	memset(payload, 0x5a, sizeof(payload));
+
+	printf("\n[small size sweep]\n");
+	printf("files:            %u\n", count);
+	printf("%-8s %-8s %12s %18s %16s %24s %18s %20s %14s %16s\n", "size(B)", "files", "create_ops/s",
+		   "private_delta(B)", "private/file(B)", "alloc_reserved_delta(B)", "alloc_live_delta(B)",
+		   "alloc_live_obj_delta", "used/file(B)", "resident/file(B)");
+
+	for (s = 0; s < 6; s++) {
+		uint32_t size = sizes[s];
+		uint64_t private_before;
+		uint64_t private_after;
+		uint64_t used_before;
+		uint64_t used_after;
+		uint64_t resident_before;
+		uint64_t resident_after;
+		MemfsAllocatorStats alloc_before;
+		MemfsAllocatorStats alloc_after;
+		LARGE_INTEGER start;
+		LARGE_INTEGER end;
+		double create_seconds;
+
+		private_before = private_bytes();
+		used_before = fs->used_bytes;
+		resident_before = fs->resident_bytes;
+		memfs_allocator_get_stats(&fs->allocator, &alloc_before);
+
+		QueryPerformanceCounter(&start);
+		for (i = 0; i < count; i++) {
+			MemfsNode* node = NULL;
+			swprintf_s(name, _countof(name), L"ss%07u", i);
+			if (memfs_node_create(fs, fs->root, name, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) != MEMFS_OK) {
+				return fail(fs, "sweep create failed", i);
+			}
+			if (size > 0) {
+				uint32_t written = 0;
+				if (memfs_node_write(node, payload, 0, size, false, false, &written) != MEMFS_OK ||
+					written != size) {
+					memfs_node_close(node);
+					return fail(fs, "sweep write failed", i);
+				}
+			}
+			memfs_node_close(node);
+		}
+		QueryPerformanceCounter(&end);
+		create_seconds = seconds_between(start, end, frequency);
+
+		private_after = private_bytes();
+		used_after = fs->used_bytes;
+		resident_after = fs->resident_bytes;
+		memfs_allocator_get_stats(&fs->allocator, &alloc_after);
+
+		printf("%-8u %-8u %12.0f %18llu %16.2f %24llu %18llu %20llu %14.2f %16.2f\n", size, count,
+			   create_seconds > 0.0 ? (double)count / create_seconds : 0.0,
+			   (unsigned long long)(private_after - private_before),
+			   (double)(private_after - private_before) / (double)count,
+			   (unsigned long long)(alloc_after.reserved_bytes - alloc_before.reserved_bytes),
+			   (unsigned long long)(alloc_after.live_bytes - alloc_before.live_bytes),
+			   (unsigned long long)(alloc_after.live_objects - alloc_before.live_objects),
+			   (double)(used_after - used_before) / (double)count,
+			   (double)(resident_after - resident_before) / (double)count);
+
+		for (i = 0; i < count; i++) {
+			MemfsNode* node;
+			swprintf_s(name, _countof(name), L"ss%07u", i);
+			node = memfs_dir_lookup(fs->root, name);
+			if (node == NULL || memfs_node_unlink(node) != MEMFS_OK) {
+				return fail(fs, "sweep delete failed", i);
+			}
+		}
+		printf("size=%u after-delete used_bytes=%llu resident_bytes=%llu\n", size,
+			   (unsigned long long)fs->used_bytes, (unsigned long long)fs->resident_bytes);
+	}
+
+	return 0;
+}
 static int run_suite(const BenchConfig* config, const char* label, LARGE_INTEGER frequency, BenchResult* results) {
 	Memfs* fs = NULL;
 	uint64_t private_before;
@@ -402,6 +486,11 @@ static int run_suite(const BenchConfig* config, const char* label, LARGE_INTEGER
 	print_fs_state(fs, "initial");
 
 	private_before = private_bytes();
+
+	rc = bench_small_size_sweep(fs, BENCH_SWEEP_FILE_COUNT, frequency);
+	if (rc != 0) {
+		return rc;
+	}
 
 	results[0].label = "small";
 	rc = bench_small_files(fs, BENCH_SMALL_FILE_COUNT, frequency, &results[0]);
