@@ -22,13 +22,13 @@ All file-system contents are volatile. Unmounting or terminating the process los
 ## Prerequisites
 
 - Windows 10/11 x64.
-- WinFsp installed under `C:\Program Files (x86)\WinFsp` or `C:\Program Files\WinFsp`.
+- WinFsp source tree at `D:\\src\\winfsp` for the default static user-mode build.
 - Visual Studio C/C++ build tools.
 - LLVM/clang-cl.
 - CMake + Ninja.
 - vcpkg at `D:\vcpkg` for the supplied presets.
 
-The vcpkg manifest installs `zstd` and `libsodium`. WinFsp itself is consumed from its installed SDK.
+The vcpkg manifest installs `zstd` and `libsodium`. The supplied presets statically link the WinFsp user-mode runtime built from `D:\\src\\winfsp`, so `memfs.exe` does not require `winfsp-x64.dll` at runtime. The WinFsp kernel driver is embedded as an EXE resource from the configured SxS driver path; if no compatible WinFsp driver is already available, memfs can install and start the embedded driver when run elevated.
 
 ## Build
 
@@ -93,10 +93,42 @@ Options:
 --key-hex <64hex>       Use a fixed 256-bit key
 --key-env <name>        Read a 64-hex key from an environment variable
 --debug                 Enable WinFsp debug logging
+--service               Run under the Windows Service Control Manager
 --help
 ```
 
 Stop with Ctrl+C.
+
+## Windows Service
+
+The production path is a normal Windows `SERVICE_WIN32_OWN_PROCESS` service named `MemfsC`. The executable uses the Service Control Manager directly (`StartServiceCtrlDispatcherW`, `RegisterServiceCtrlHandlerExW`) and handles both STOP and SHUTDOWN controls. Service stop first stops the WinFsp dispatcher and then tears down the filesystem/allocator before reporting `SERVICE_STOPPED`.
+
+Run the following from an elevated shell. Keep the service name `MemfsC`, because that is the service name registered by the executable:
+
+```powershell
+$exe = (Resolve-Path .\build\x64-release\memfs.exe).Path
+$bin = '"' + $exe + '" --service --mount R: --size 512M --label MEMFS'
+sc.exe create MemfsC "binPath=" $bin "start=" auto
+sc.exe description MemfsC "MemfsC volatile memory filesystem"
+
+sc.exe start MemfsC
+sc.exe queryex MemfsC
+
+sc.exe stop MemfsC
+sc.exe delete MemfsC
+```
+
+A helper that still uses `sc.exe` for all service control is included:
+
+```powershell
+.\scripts\memfs-service.ps1 install -Exe .\build\x64-release\memfs.exe -Mount R: -Size 512M
+.\scripts\memfs-service.ps1 start
+.\scripts\memfs-service.ps1 query
+.\scripts\memfs-service.ps1 stop
+.\scripts\memfs-service.ps1 delete
+```
+
+The service runs as LocalSystem by default. The first driver installation requires administrator rights. If a compatible official WinFsp SxS driver is already installed, memfs reuses it and does not create a parallel driver service. If the driver is missing or unloadable, memfs extracts the embedded signed WinFsp SYS resource, registers it through SCM, starts it, and retries `FspFileSystemCreate`.
 
 ## Directory design
 
@@ -151,7 +183,7 @@ With encryption enabled a 1-byte file uses 33 bytes of tracked encoded storage: 
 resident_bytes tracks encoded data blobs/pages and intentionally excludes host allocator bookkeeping and namespace metadata.
 ### Allocator v2 and auto capacity
 
-The allocator v2 backend combines fixed-size object pools/slabs for nodes, directories, page groups, names and generic objects with dedicated blocks for larger allocations. `reserved_bytes` is address-space reservation only; `committed_bytes` is the real OS-backed committed memory, and `physical_bytes` is an alias for `committed_bytes`, not a separate source. `live_bytes` is the caller-visible payload/object bytes currently allocated.
+The allocator v2 backend is size-class based rather than object-type based. Node, directory, page-group, name and generic allocation APIs all converge on the same rounded-size class, so there is only one physical pool for a given class. Small allocations use adaptive slab backing (4 KiB / 8 KiB / 16 KiB / 32 KiB / 64 KiB according to object size); allocations above the small-object threshold use area allocations. `reserved_bytes` is address-space reservation only; `committed_bytes` is the real OS-backed committed memory, and `physical_bytes` is an alias for `committed_bytes`, not a separate source. `live_bytes` is the caller-visible payload/object bytes currently allocated.
 
 `capacity_auto=true` makes memfs derive its writable allowance from current system memory and allocator backing instead of using a fixed user capacity. `memfs_auto_allowance_bytes()` reports the current allowance, while `used_bytes`, `resident_bytes`, `committed_bytes` and `physical_bytes` remain separate measurements: logical quota, resident payload, and allocator physical backing. The benchmark reports these separately so high-water checks do not confuse allocator backing with logical file usage.
 
@@ -241,6 +273,8 @@ src/
 tests/
   memfs_core_test.c unit/stress/concurrency/codec tests
   integration.ps1   real mounted-drive integration test
+scripts/
+  memfs-service.ps1 install/start/query/stop/delete wrapper around sc.exe
 ```
 
 ## Planned next steps

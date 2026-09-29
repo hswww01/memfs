@@ -1,0 +1,105 @@
+param(
+    [ValidateSet("install","start","query","stop","delete","restart")]
+    [string]$Action = "query",
+    [string]$Exe = "",
+    [string]$Mount = "R:",
+    [string]$Size = "512M",
+    [string]$Label = "MEMFS",
+    [ValidateSet("auto","demand")]
+    [string]$StartType = "auto"
+)
+
+$ErrorActionPreference = "Stop"
+$ServiceName = "MemfsC"
+
+function Assert-Admin {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "Administrator privileges are required."
+    }
+}
+
+function Invoke-Sc {
+    param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Args)
+    & sc.exe @Args
+    if ($LASTEXITCODE -ne 0) {
+        throw "sc.exe failed with exit code ${LASTEXITCODE}: $($Args -join ' ')"
+    }
+}
+
+function Wait-ServiceState {
+    param([string]$Wanted, [int]$TimeoutSeconds = 20)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $text = (& sc.exe query $ServiceName | Out-String)
+        if ($text -match "STATE\s+:\s+\d+\s+$Wanted") {
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Service $ServiceName did not reach state $Wanted."
+}
+
+switch ($Action) {
+    "install" {
+        Assert-Admin
+        if (-not $Exe) {
+            $Exe = Join-Path (Split-Path $PSScriptRoot -Parent) "build\x64-release\memfs.exe"
+        }
+        $Exe = [IO.Path]::GetFullPath($Exe)
+        if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
+            throw "memfs.exe not found: $Exe"
+        }
+        if ($Mount -notmatch '^[A-Za-z]:$') {
+            throw "For the service helper, -Mount must be a drive letter such as R:."
+        }
+
+        & sc.exe query $ServiceName *> $null
+        if ($LASTEXITCODE -eq 0) {
+            throw "Service $ServiceName already exists. Delete or reconfigure it first."
+        }
+
+        $binPath = '"' + $Exe + '" --service --mount ' + $Mount +
+                   ' --size ' + $Size + ' --label "' + $Label.Replace('"','') + '"'
+        Invoke-Sc create $ServiceName "binPath=" $binPath "start=" $StartType
+        Invoke-Sc description $ServiceName "MemfsC volatile memory filesystem"
+        Invoke-Sc failure $ServiceName "reset=" "86400" "actions=" "restart/5000/restart/15000/""/0"
+        Invoke-Sc failureflag $ServiceName 1
+        Write-Output "Installed $ServiceName"
+        Invoke-Sc qc $ServiceName
+    }
+    "start" {
+        Assert-Admin
+        Invoke-Sc start $ServiceName
+        Wait-ServiceState "RUNNING"
+        Invoke-Sc queryex $ServiceName
+    }
+    "query" {
+        Invoke-Sc queryex $ServiceName
+        Invoke-Sc qc $ServiceName
+    }
+    "stop" {
+        Assert-Admin
+        & sc.exe stop $ServiceName
+        if ($LASTEXITCODE -notin 0, 1062) {
+            throw "sc stop failed with exit code $LASTEXITCODE"
+        }
+        Wait-ServiceState "STOPPED"
+        Invoke-Sc queryex $ServiceName
+    }
+    "delete" {
+        Assert-Admin
+        & sc.exe stop $ServiceName *> $null
+        Invoke-Sc delete $ServiceName
+        Write-Output "Deleted $ServiceName"
+    }
+    "restart" {
+        Assert-Admin
+        & sc.exe stop $ServiceName *> $null
+        Wait-ServiceState "STOPPED"
+        Invoke-Sc start $ServiceName
+        Wait-ServiceState "RUNNING"
+        Invoke-Sc queryex $ServiceName
+    }
+}
