@@ -11,19 +11,21 @@
 #define MEMFS_MIN_SLAB_BYTES (4U * 1024U)
 #define MEMFS_MAX_SLAB_BYTES (64U * 1024U)
 #define MEMFS_ALLOC_ALIGNMENT 16U
+#define MEMFS_POOL_SHARD_COUNT 8U
+
+_Static_assert((MEMFS_POOL_SHARD_COUNT & (MEMFS_POOL_SHARD_COUNT - 1U)) == 0,
+               "pool shard count must be a power of two");
 
 typedef struct MemfsFreeObject {
     struct MemfsFreeObject* next;
 } MemfsFreeObject;
 
 typedef struct MemfsPool MemfsPool;
+typedef struct MemfsPoolShard MemfsPoolShard;
 typedef struct MemfsSlab MemfsSlab;
 typedef struct MemfsAreaBlock MemfsAreaBlock;
 
-struct MemfsPool {
-    MemfsAllocatorState* state;
-    size_t object_size;
-    size_t slab_bytes;
+struct MemfsPoolShard {
     MemfsSlab* slabs;
     MemfsSlab* available;
     SRWLOCK lock;
@@ -34,12 +36,20 @@ struct MemfsPool {
     uint32_t slab_count;
 };
 
+struct MemfsPool {
+    MemfsAllocatorState* state;
+    size_t object_size;
+    size_t slab_bytes;
+    MemfsPoolShard shards[MEMFS_POOL_SHARD_COUNT];
+};
+
 struct MemfsSlab {
     MemfsSlab* next;
     MemfsSlab* prev;
     MemfsSlab* available_next;
     MemfsSlab* available_prev;
     MemfsPool* owner;
+    MemfsPoolShard* shard;
     MemfsFreeObject* free_list;
     size_t region_bytes;
     uint32_t capacity;
@@ -181,19 +191,39 @@ bool memfs_allocator_test_class_layout(size_t bytes,
 }
 #endif
 
-static void available_insert(MemfsPool* pool, MemfsSlab* slab) {
-    slab->available_prev = NULL;
-    slab->available_next = pool->available;
-    if (pool->available)
-        pool->available->available_prev = slab;
-    pool->available = slab;
+static uint32_t pool_shard_index(void) {
+    uint32_t value = (uint32_t)GetCurrentThreadId();
+
+    /*
+     * Windows thread ids have low-bit patterns, so mix before masking. This
+     * preserves one logical size-class pool while spreading hot threads over
+     * independent slab lanes inside that pool.
+     */
+    value ^= value >> 16;
+    value *= 0x7feb352dU;
+    value ^= value >> 15;
+    value *= 0x846ca68bU;
+    value ^= value >> 16;
+    return value & (MEMFS_POOL_SHARD_COUNT - 1U);
 }
 
-static void available_remove(MemfsPool* pool, MemfsSlab* slab) {
+static MemfsPoolShard* pool_current_shard(MemfsPool* pool) {
+    return &pool->shards[pool_shard_index()];
+}
+
+static void available_insert(MemfsPoolShard* shard, MemfsSlab* slab) {
+    slab->available_prev = NULL;
+    slab->available_next = shard->available;
+    if (shard->available)
+        shard->available->available_prev = slab;
+    shard->available = slab;
+}
+
+static void available_remove(MemfsPoolShard* shard, MemfsSlab* slab) {
     if (slab->available_prev)
         slab->available_prev->available_next = slab->available_next;
-    else if (pool->available == slab)
-        pool->available = slab->available_next;
+    else if (shard->available == slab)
+        shard->available = slab->available_next;
 
     if (slab->available_next)
         slab->available_next->available_prev = slab->available_prev;
@@ -202,19 +232,19 @@ static void available_remove(MemfsPool* pool, MemfsSlab* slab) {
     slab->available_next = NULL;
 }
 
-static void all_insert(MemfsPool* pool, MemfsSlab* slab) {
+static void all_insert(MemfsPoolShard* shard, MemfsSlab* slab) {
     slab->prev = NULL;
-    slab->next = pool->slabs;
-    if (pool->slabs)
-        pool->slabs->prev = slab;
-    pool->slabs = slab;
+    slab->next = shard->slabs;
+    if (shard->slabs)
+        shard->slabs->prev = slab;
+    shard->slabs = slab;
 }
 
-static void all_remove(MemfsPool* pool, MemfsSlab* slab) {
+static void all_remove(MemfsPoolShard* shard, MemfsSlab* slab) {
     if (slab->prev)
         slab->prev->next = slab->next;
     else
-        pool->slabs = slab->next;
+        shard->slabs = slab->next;
 
     if (slab->next)
         slab->next->prev = slab->prev;
@@ -223,15 +253,17 @@ static void all_remove(MemfsPool* pool, MemfsSlab* slab) {
     slab->next = NULL;
 }
 
-static MemfsSlab* slab_create(MemfsPool* pool) {
+static MemfsSlab* slab_create(MemfsPool* pool, MemfsPoolShard* shard) {
     const size_t data_offset = align_up(sizeof(MemfsSlab), MEMFS_ALLOC_ALIGNMENT);
     MemfsSlab* slab;
     uint8_t* data;
     uint32_t capacity;
     uint32_t i;
 
-    if (pool == NULL || data_offset == 0 || pool->slab_bytes <= data_offset)
+    if (pool == NULL || shard == NULL ||
+        data_offset == 0 || pool->slab_bytes <= data_offset) {
         return NULL;
+    }
 
     capacity = (uint32_t)((pool->slab_bytes - data_offset) / pool->object_size);
     if (capacity == 0)
@@ -246,6 +278,7 @@ static MemfsSlab* slab_create(MemfsPool* pool) {
 
     memset(slab, 0, data_offset);
     slab->owner = pool;
+    slab->shard = shard;
     slab->capacity = capacity;
     slab->free_count = capacity;
     slab->region_bytes = memfs_vm_region_bytes(slab);
@@ -253,16 +286,17 @@ static MemfsSlab* slab_create(MemfsPool* pool) {
 
     data = (uint8_t*)slab + data_offset;
     for (i = 0; i < capacity; i++) {
-        MemfsFreeObject* object = (MemfsFreeObject*)(data + (size_t)i * pool->object_size);
+        MemfsFreeObject* object =
+            (MemfsFreeObject*)(data + (size_t)i * pool->object_size);
         object->next = slab->free_list;
         slab->free_list = object;
     }
 
-    all_insert(pool, slab);
-    available_insert(pool, slab);
-    pool->slab_count++;
-    pool->reserved_bytes += slab->region_bytes;
-    pool->committed_bytes += slab->region_bytes;
+    all_insert(shard, slab);
+    available_insert(shard, slab);
+    shard->slab_count++;
+    shard->reserved_bytes += slab->region_bytes;
+    shard->committed_bytes += slab->region_bytes;
     return slab;
 }
 
@@ -282,19 +316,21 @@ static MemfsSlab* slab_from_object(MemfsAllocatorState* state, void* ptr) {
 }
 
 static void* pool_alloc(MemfsPool* pool, size_t requested_bytes) {
+    MemfsPoolShard* shard;
     MemfsSlab* slab;
     MemfsFreeObject* object;
 
     if (pool == NULL || requested_bytes == 0 || requested_bytes > pool->object_size)
         return NULL;
 
-    AcquireSRWLockExclusive(&pool->lock);
+    shard = pool_current_shard(pool);
+    AcquireSRWLockExclusive(&shard->lock);
 
-    slab = pool->available;
+    slab = shard->available;
     if (slab == NULL) {
-        slab = slab_create(pool);
+        slab = slab_create(pool, shard);
         if (slab == NULL) {
-            ReleaseSRWLockExclusive(&pool->lock);
+            ReleaseSRWLockExclusive(&shard->lock);
             return NULL;
         }
     }
@@ -302,152 +338,201 @@ static void* pool_alloc(MemfsPool* pool, size_t requested_bytes) {
     object = slab->free_list;
     slab->free_list = object->next;
     slab->free_count--;
-    pool->live_objects++;
-    pool->live_bytes += requested_bytes;
+    shard->live_objects++;
+    shard->live_bytes += requested_bytes;
 
     if (slab->free_count == 0)
-        available_remove(pool, slab);
+        available_remove(shard, slab);
 
-    ReleaseSRWLockExclusive(&pool->lock);
+    ReleaseSRWLockExclusive(&shard->lock);
 
     memset(object, 0, pool->object_size);
     return object;
 }
 
-static void pool_adjust_live_bytes(MemfsPool* pool, size_t old_bytes, size_t new_bytes) {
-    if (pool == NULL || old_bytes == new_bytes)
+static void pool_adjust_live_bytes(
+    MemfsPool* pool,
+    void* ptr,
+    size_t old_bytes,
+    size_t new_bytes) {
+    MemfsSlab* slab;
+    MemfsPoolShard* shard;
+
+    if (pool == NULL || ptr == NULL || old_bytes == new_bytes)
         return;
 
-    AcquireSRWLockExclusive(&pool->lock);
-    if (new_bytes >= old_bytes)
-        pool->live_bytes += new_bytes - old_bytes;
-    else if (pool->live_bytes >= old_bytes - new_bytes)
-        pool->live_bytes -= old_bytes - new_bytes;
-    else
-        pool->live_bytes = 0;
-    ReleaseSRWLockExclusive(&pool->lock);
+    slab = slab_from_object(pool->state, ptr);
+    if (slab == NULL || slab->owner != pool || slab->shard == NULL)
+        return;
+
+    shard = slab->shard;
+    AcquireSRWLockExclusive(&shard->lock);
+
+    if (slab->magic == MEMFS_SLAB_MAGIC &&
+        slab->owner == pool &&
+        slab->shard == shard) {
+        if (new_bytes >= old_bytes)
+            shard->live_bytes += new_bytes - old_bytes;
+        else if (shard->live_bytes >= old_bytes - new_bytes)
+            shard->live_bytes -= old_bytes - new_bytes;
+        else
+            shard->live_bytes = 0;
+    }
+
+    ReleaseSRWLockExclusive(&shard->lock);
 }
 
 static void pool_free(MemfsPool* pool, void* ptr, size_t requested_bytes) {
     MemfsFreeObject* object = (MemfsFreeObject*)ptr;
     MemfsSlab* slab;
+    MemfsPoolShard* shard;
     bool release_slab = false;
 
     if (pool == NULL || ptr == NULL)
         return;
 
     slab = slab_from_object(pool->state, ptr);
-    if (slab == NULL)
+    if (slab == NULL || slab->owner != pool || slab->shard == NULL)
         return;
 
-    AcquireSRWLockExclusive(&pool->lock);
+    shard = slab->shard;
+    AcquireSRWLockExclusive(&shard->lock);
 
-    if (slab->magic != MEMFS_SLAB_MAGIC || slab->owner != pool) {
-        ReleaseSRWLockExclusive(&pool->lock);
+    if (slab->magic != MEMFS_SLAB_MAGIC ||
+        slab->owner != pool ||
+        slab->shard != shard) {
+        ReleaseSRWLockExclusive(&shard->lock);
         return;
     }
 
     if (slab->free_count == 0)
-        available_insert(pool, slab);
+        available_insert(shard, slab);
 
     object->next = slab->free_list;
     slab->free_list = object;
     slab->free_count++;
 
-    if (pool->live_objects)
-        pool->live_objects--;
-    if (pool->live_bytes >= requested_bytes)
-        pool->live_bytes -= requested_bytes;
+    if (shard->live_objects)
+        shard->live_objects--;
+    if (shard->live_bytes >= requested_bytes)
+        shard->live_bytes -= requested_bytes;
     else
-        pool->live_bytes = 0;
+        shard->live_bytes = 0;
 
     /*
-     * Keep at most one empty slab while the class still has live objects.
-     * Once a class becomes completely idle, return its final slab too.
+     * Each shard releases its final slab when it becomes idle. This prevents
+     * the concurrency lanes from turning into permanent per-thread caches.
      */
     if (slab->free_count == slab->capacity &&
-        (pool->slab_count > 1U || pool->live_objects == 0)) {
-        available_remove(pool, slab);
-        all_remove(pool, slab);
-        pool->slab_count--;
-        pool->reserved_bytes -= slab->region_bytes;
-        pool->committed_bytes -= slab->region_bytes;
+        (shard->slab_count > 1U || shard->live_objects == 0)) {
+        available_remove(shard, slab);
+        all_remove(shard, slab);
+        shard->slab_count--;
+        shard->reserved_bytes -= slab->region_bytes;
+        shard->committed_bytes -= slab->region_bytes;
         slab->magic = 0;
         release_slab = true;
     }
 
-    ReleaseSRWLockExclusive(&pool->lock);
+    ReleaseSRWLockExclusive(&shard->lock);
 
     if (release_slab)
         memfs_vm_release(slab);
 }
 
 static uint64_t pool_scavenge(MemfsPool* pool) {
-    MemfsSlab* slab;
     uint64_t released = 0;
+    uint32_t shard_index;
 
     if (pool == NULL)
         return 0;
 
-    AcquireSRWLockExclusive(&pool->lock);
+    for (shard_index = 0;
+         shard_index < MEMFS_POOL_SHARD_COUNT;
+         ++shard_index) {
+        MemfsPoolShard* shard = &pool->shards[shard_index];
+        MemfsSlab* slab;
 
-    slab = pool->slabs;
-    while (slab) {
-        MemfsSlab* next = slab->next;
+        AcquireSRWLockExclusive(&shard->lock);
 
-        if (slab->free_count == slab->capacity) {
-            uint64_t bytes = slab->region_bytes;
-            available_remove(pool, slab);
-            all_remove(pool, slab);
-            pool->slab_count--;
-            pool->reserved_bytes -= bytes;
-            pool->committed_bytes -= bytes;
-            slab->magic = 0;
-            memfs_vm_release(slab);
-            released += bytes;
+        slab = shard->slabs;
+        while (slab) {
+            MemfsSlab* next = slab->next;
+
+            if (slab->free_count == slab->capacity) {
+                uint64_t bytes = slab->region_bytes;
+                available_remove(shard, slab);
+                all_remove(shard, slab);
+                shard->slab_count--;
+                shard->reserved_bytes -= bytes;
+                shard->committed_bytes -= bytes;
+                slab->magic = 0;
+                memfs_vm_release(slab);
+                released += bytes;
+            }
+
+            slab = next;
         }
 
-        slab = next;
+        ReleaseSRWLockExclusive(&shard->lock);
     }
 
-    ReleaseSRWLockExclusive(&pool->lock);
     return released;
 }
 
 static void pool_destroy(MemfsPool* pool) {
-    MemfsSlab* slab;
+    uint32_t shard_index;
 
     if (pool == NULL)
         return;
 
-    slab = pool->slabs;
-    while (slab) {
-        MemfsSlab* next = slab->next;
-        slab->magic = 0;
-        memfs_vm_release(slab);
-        slab = next;
-    }
+    for (shard_index = 0;
+         shard_index < MEMFS_POOL_SHARD_COUNT;
+         ++shard_index) {
+        MemfsPoolShard* shard = &pool->shards[shard_index];
+        MemfsSlab* slab;
 
-    pool->slabs = NULL;
-    pool->available = NULL;
-    pool->live_objects = 0;
-    pool->live_bytes = 0;
-    pool->reserved_bytes = 0;
-    pool->committed_bytes = 0;
-    pool->slab_count = 0;
+        AcquireSRWLockExclusive(&shard->lock);
+
+        slab = shard->slabs;
+        while (slab) {
+            MemfsSlab* next = slab->next;
+            slab->magic = 0;
+            memfs_vm_release(slab);
+            slab = next;
+        }
+
+        shard->slabs = NULL;
+        shard->available = NULL;
+        shard->live_objects = 0;
+        shard->live_bytes = 0;
+        shard->reserved_bytes = 0;
+        shard->committed_bytes = 0;
+        shard->slab_count = 0;
+
+        ReleaseSRWLockExclusive(&shard->lock);
+    }
 }
 
 static void pool_add_stats(MemfsPool* pool, MemfsAllocatorStats* stats) {
+    uint32_t shard_index;
+
     if (pool == NULL || stats == NULL)
         return;
 
-    AcquireSRWLockShared(&pool->lock);
-    stats->reserved_bytes += pool->reserved_bytes;
-    stats->committed_bytes += pool->committed_bytes;
-    stats->live_bytes += pool->live_bytes;
-    stats->live_objects += pool->live_objects;
-    stats->slab_count += pool->slab_count;
-    ReleaseSRWLockShared(&pool->lock);
+    for (shard_index = 0;
+         shard_index < MEMFS_POOL_SHARD_COUNT;
+         ++shard_index) {
+        MemfsPoolShard* shard = &pool->shards[shard_index];
+
+        AcquireSRWLockShared(&shard->lock);
+        stats->reserved_bytes += shard->reserved_bytes;
+        stats->committed_bytes += shard->committed_bytes;
+        stats->live_bytes += shard->live_bytes;
+        stats->live_objects += shard->live_objects;
+        stats->slab_count += shard->slab_count;
+        ReleaseSRWLockShared(&shard->lock);
+    }
 }
 
 static size_t area_header_size(void) {
@@ -581,6 +666,7 @@ static void area_add_stats(MemfsAllocatorState* state, MemfsAllocatorStats* stat
 static MemfsAllocatorState* state_create(void) {
     MemfsAllocatorState* state;
     MemfsVmSystemInfo vm_info;
+    uint32_t shard_index;
     int i;
 
     if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_BOOTSTRAP))
@@ -613,7 +699,11 @@ static MemfsAllocatorState* state_create(void) {
         pool->state = state;
         pool->object_size = g_class_sizes[i];
         pool->slab_bytes = slab_bytes_for_object(pool->object_size);
-        InitializeSRWLock(&pool->lock);
+        for (shard_index = 0;
+             shard_index < MEMFS_POOL_SHARD_COUNT;
+             ++shard_index) {
+            InitializeSRWLock(&pool->shards[shard_index].lock);
+        }
     }
 
     return state;
@@ -771,7 +861,7 @@ void* memfs_allocator_realloc(MemfsAllocator* allocator,
     new_index = class_index(new_bytes);
 
     if (old_index >= 0 && old_index == new_index) {
-        pool_adjust_live_bytes(&allocator->state->pools[old_index], old_bytes, new_bytes);
+        pool_adjust_live_bytes(&allocator->state->pools[old_index], ptr, old_bytes, new_bytes);
         return ptr;
     }
 
