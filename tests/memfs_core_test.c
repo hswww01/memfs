@@ -2103,6 +2103,63 @@ static void test_allocator_reclaim(void) {
 }
 
 
+static void test_allocator_name_pool_boundaries(void) {
+	MemfsAllocator allocator;
+	MemfsAllocatorStats before;
+	MemfsAllocatorStats after;
+	void* max_name;
+	void* exact_512;
+	void* too_large;
+	void* zero;
+	uint32_t i;
+
+	printf("== allocator name pool boundaries ==\n");
+
+	CHECK(memfs_allocator_init(&allocator, 64, 64, 64));
+	memfs_allocator_get_stats(&allocator, &before);
+	CHECK(before.reserved_bytes == 0);
+	CHECK(before.live_objects == 0);
+
+	max_name = memfs_allocator_alloc_name(&allocator, (MEMFS_MAX_NAME + 1U) * sizeof(wchar_t));
+	CHECK(max_name != NULL);
+	if (max_name) {
+		memset(max_name, 0x5a, (MEMFS_MAX_NAME + 1U) * sizeof(wchar_t));
+		memfs_allocator_get_stats(&allocator, &after);
+		CHECK(after.live_objects == before.live_objects + 1);
+		CHECK(after.reserved_bytes > before.reserved_bytes);
+		memfs_allocator_free_name(&allocator, max_name, (MEMFS_MAX_NAME + 1U) * sizeof(wchar_t));
+	}
+
+	exact_512 = memfs_allocator_alloc_name(&allocator, 512);
+	CHECK(exact_512 != NULL);
+	if (exact_512) {
+		memset(exact_512, 0x6b, 512);
+		memfs_allocator_free_name(&allocator, exact_512, 512);
+	}
+
+	too_large = memfs_allocator_alloc_name(&allocator, 513);
+	CHECK(too_large != NULL);
+	if (too_large) {
+		memset(too_large, 0x7c, 513);
+		memfs_allocator_free_name(&allocator, too_large, 513);
+	}
+	zero = memfs_allocator_alloc_name(&allocator, 0);
+	CHECK(zero == NULL);
+	CHECK(memfs_allocator_alloc_name(NULL, 8) == NULL);
+	memfs_allocator_free_name(NULL, exact_512, 8);
+	memfs_allocator_free_name(&allocator, NULL, 8);
+
+	memfs_allocator_get_stats(&allocator, &after);
+	CHECK(after.live_objects == before.live_objects);
+	CHECK(after.reserved_bytes == before.reserved_bytes);
+	memfs_allocator_destroy(&allocator);
+
+	for (i = 0; i < 4; i++) {
+		CHECK(memfs_allocator_init(&allocator, 64, 64, 64));
+		memfs_allocator_destroy(&allocator);
+	}
+}
+
 static void test_allocator_stress(void) {
 	enum { FILES = 4096, ROUNDS = 8 };
 	Memfs* fs = NULL;
@@ -2820,6 +2877,7 @@ int main(void) {
 	test_shared_security_inherit_replace_churn();
 	test_concurrent_files();
 	test_allocator_reclaim();
+	test_allocator_name_pool_boundaries();
 	test_allocator_stress();
 	test_storage_group_churn_stress();
 	test_storage_state_invariants();

@@ -2,11 +2,12 @@
 
 #include <Windows.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 
 #define MEMFS_ALLOC_SLAB_SIZE (64U * 1024U)
 #define MEMFS_SLAB_MAGIC 0x4D46534CU
+#define MEMFS_ALLOC_BOOTSTRAP_MAGIC 0x4D464253U
+#define MEMFS_ALLOC_POOL_COUNT (3U + MEMFS_ALLOC_NAME_POOL_COUNT)
 
 _Static_assert((MEMFS_ALLOC_SLAB_SIZE & (MEMFS_ALLOC_SLAB_SIZE - 1U)) == 0, "slab size must be a power of two");
 
@@ -24,7 +25,18 @@ struct MemfsObjectPool {
 	uint64_t live_objects;
 	uint64_t reserved_bytes;
 	uint32_t slab_count;
+	uint32_t in_use;
+	uint32_t slot_index;
+	uint32_t magic;
 };
+
+typedef struct MemfsBootstrap {
+	uint32_t magic;
+	uint32_t size;
+	uint32_t pool_count;
+	uint32_t reserved;
+	MemfsObjectPool pools[MEMFS_ALLOC_POOL_COUNT];
+} MemfsBootstrap;
 
 struct MemfsSlab {
 	MemfsSlab* next;
@@ -57,19 +69,40 @@ static size_t pool_object_size(size_t size) {
 	return align_up(object_size, alignment);
 }
 
-static MemfsObjectPool* pool_create(size_t size) {
-	MemfsObjectPool* pool = calloc(1, sizeof(*pool));
+static MemfsBootstrap* bootstrap_from_pool(const MemfsObjectPool* pool) {
+	MemfsBootstrap* bootstrap;
+	uintptr_t base;
 
-	if (pool == NULL)
+	if (pool == NULL || pool->magic != MEMFS_SLAB_MAGIC || pool->slot_index >= MEMFS_ALLOC_POOL_COUNT)
 		return NULL;
 
+	base = (uintptr_t)pool - offsetof(MemfsBootstrap, pools) -
+		   (size_t)pool->slot_index * sizeof(MemfsObjectPool);
+	bootstrap = (MemfsBootstrap*)base;
+	if (bootstrap->magic != MEMFS_ALLOC_BOOTSTRAP_MAGIC ||
+		bootstrap->pool_count != MEMFS_ALLOC_POOL_COUNT ||
+		&bootstrap->pools[pool->slot_index] != pool)
+		return NULL;
+
+	return bootstrap;
+}
+
+static MemfsObjectPool* pool_create(MemfsBootstrap* bootstrap, uint32_t slot_index, size_t size) {
+	MemfsObjectPool* pool;
+
+	if (bootstrap == NULL || slot_index >= bootstrap->pool_count || bootstrap->pools[slot_index].in_use)
+		return NULL;
+
+	pool = &bootstrap->pools[slot_index];
+	memset(pool, 0, sizeof(*pool));
 	pool->object_size = pool_object_size(size);
 	if (pool->object_size == 0 ||
-		pool->object_size > MEMFS_ALLOC_SLAB_SIZE - align_up(sizeof(MemfsSlab), sizeof(void*))) {
-		free(pool);
+		pool->object_size > MEMFS_ALLOC_SLAB_SIZE - align_up(sizeof(MemfsSlab), sizeof(void*)))
 		return NULL;
-	}
 
+	pool->slot_index = slot_index;
+	pool->in_use = 1;
+	pool->magic = MEMFS_SLAB_MAGIC;
 	InitializeSRWLock(&pool->lock);
 	return pool;
 }
@@ -242,7 +275,7 @@ static void pool_free(MemfsObjectPool* pool, void* ptr) {
 static void pool_destroy(MemfsObjectPool* pool) {
 	MemfsSlab* slab;
 
-	if (pool == NULL)
+	if (pool == NULL || pool->magic != MEMFS_SLAB_MAGIC)
 		return;
 
 	slab = pool->slabs;
@@ -253,7 +286,7 @@ static void pool_destroy(MemfsObjectPool* pool) {
 		slab = next;
 	}
 
-	free(pool);
+	memset(pool, 0, sizeof(*pool));
 }
 
 static void pool_add_stats(MemfsObjectPool* pool, MemfsAllocatorStats* stats) {
@@ -279,27 +312,59 @@ static int name_pool_index(size_t bytes) {
 	return -1;
 }
 
+static bool bootstrap_init(MemfsBootstrap** out_bootstrap) {
+	MemfsBootstrap* bootstrap;
+
+	if (out_bootstrap == NULL)
+		return false;
+
+	*out_bootstrap = NULL;
+	bootstrap = VirtualAlloc(NULL, sizeof(MemfsBootstrap), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+	if (bootstrap == NULL)
+		return false;
+
+	memset(bootstrap, 0, sizeof(*bootstrap));
+	bootstrap->magic = MEMFS_ALLOC_BOOTSTRAP_MAGIC;
+	bootstrap->size = sizeof(MemfsBootstrap);
+	bootstrap->pool_count = MEMFS_ALLOC_POOL_COUNT;
+	*out_bootstrap = bootstrap;
+	return true;
+}
+
+static void bootstrap_destroy(MemfsBootstrap* bootstrap) {
+	if (bootstrap == NULL || bootstrap->magic != MEMFS_ALLOC_BOOTSTRAP_MAGIC)
+		return;
+
+	memset(bootstrap, 0, sizeof(*bootstrap));
+	VirtualFree(bootstrap, 0, MEM_RELEASE);
+}
+
 bool memfs_allocator_init(MemfsAllocator* allocator, size_t node_size, size_t dir_size, size_t page_group_size) {
+	MemfsBootstrap* bootstrap;
 	int i;
 
 	if (allocator == NULL || node_size == 0 || dir_size == 0 || page_group_size == 0)
 		return false;
 
 	memset(allocator, 0, sizeof(*allocator));
+	if (!bootstrap_init(&bootstrap))
+		return false;
 
-	allocator->node_pool = pool_create(node_size);
-	allocator->dir_pool = pool_create(dir_size);
-	allocator->page_group_pool = pool_create(page_group_size);
+	allocator->node_pool = pool_create(bootstrap, 0U, node_size);
+	allocator->dir_pool = pool_create(bootstrap, 1U, dir_size);
+	allocator->page_group_pool = pool_create(bootstrap, 2U, page_group_size);
 
 	if (allocator->node_pool == NULL || allocator->dir_pool == NULL || allocator->page_group_pool == NULL) {
-		memfs_allocator_destroy(allocator);
+		bootstrap_destroy(bootstrap);
+		memset(allocator, 0, sizeof(*allocator));
 		return false;
 	}
 
 	for (i = 0; i < MEMFS_ALLOC_NAME_POOL_COUNT; i++) {
-		allocator->name_pools[i] = pool_create(g_name_pool_sizes[i]);
+		allocator->name_pools[i] = pool_create(bootstrap, (uint32_t)(3 + i), g_name_pool_sizes[i]);
 		if (allocator->name_pools[i] == NULL) {
-			memfs_allocator_destroy(allocator);
+			bootstrap_destroy(bootstrap);
+			memset(allocator, 0, sizeof(*allocator));
 			return false;
 		}
 	}
@@ -308,10 +373,19 @@ bool memfs_allocator_init(MemfsAllocator* allocator, size_t node_size, size_t di
 }
 
 void memfs_allocator_destroy(MemfsAllocator* allocator) {
+	MemfsBootstrap* bootstrap;
 	int i;
 
 	if (allocator == NULL)
 		return;
+
+	bootstrap = bootstrap_from_pool(allocator->node_pool);
+	if (bootstrap == NULL)
+		bootstrap = bootstrap_from_pool(allocator->dir_pool);
+	if (bootstrap == NULL)
+		bootstrap = bootstrap_from_pool(allocator->page_group_pool);
+	for (i = 0; i < MEMFS_ALLOC_NAME_POOL_COUNT && bootstrap == NULL; i++)
+		bootstrap = bootstrap_from_pool(allocator->name_pools[i]);
 
 	pool_destroy(allocator->node_pool);
 	pool_destroy(allocator->dir_pool);
@@ -321,6 +395,7 @@ void memfs_allocator_destroy(MemfsAllocator* allocator) {
 		pool_destroy(allocator->name_pools[i]);
 
 	memset(allocator, 0, sizeof(*allocator));
+	bootstrap_destroy(bootstrap);
 }
 
 void* memfs_allocator_alloc_node(MemfsAllocator* allocator) {
@@ -358,7 +433,7 @@ void* memfs_allocator_alloc_name(MemfsAllocator* allocator, size_t bytes) {
 
 	index = name_pool_index(bytes);
 	if (index < 0)
-		return calloc(1, bytes);
+		return VirtualAlloc(NULL, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 
 	return pool_alloc(allocator->name_pools[index]);
 }
@@ -371,7 +446,7 @@ void memfs_allocator_free_name(MemfsAllocator* allocator, void* ptr, size_t byte
 
 	index = name_pool_index(bytes);
 	if (index < 0) {
-		free(ptr);
+		VirtualFree(ptr, 0, MEM_RELEASE);
 		return;
 	}
 
