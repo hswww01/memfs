@@ -2119,6 +2119,20 @@ uint64_t memfs_free_bytes(Memfs* fs) {
 	return used <= fs->capacity ? fs->capacity - used : 0;
 }
 
+uint64_t memfs_committed_bytes(Memfs* fs) {
+	MemfsAllocatorStats stats;
+
+	if (fs == NULL)
+		return 0;
+
+	memfs_allocator_get_stats(&fs->allocator, &stats);
+	return stats.committed_bytes;
+}
+
+uint64_t memfs_physical_bytes(Memfs* fs) {
+	return memfs_committed_bytes(fs);
+}
+
 uint64_t memfs_resident_bytes(Memfs* fs) {
 	if (fs == NULL)
 		return 0;

@@ -209,6 +209,11 @@ uint64_t memfs_free_bytes(Memfs* fs);
 uint64_t memfs_resident_bytes(Memfs* fs);
 uint64_t memfs_node_resident_bytes(const MemfsNode* node);
 
+// Allocator committed/physical backing. This is not logical used_bytes and is
+// not resident payload; use it for capacity policy that needs real backing.
+uint64_t memfs_committed_bytes(Memfs* fs);
+uint64_t memfs_physical_bytes(Memfs* fs);
+
 MemfsResult memfs_create(uint64_t capacity, const wchar_t* volume_label, Memfs** out_fs);
 MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs);
 void memfs_destroy(Memfs* fs);

@@ -29,12 +29,19 @@ typedef struct MemfsAllocator {
 } MemfsAllocator;
 
 typedef struct MemfsAllocatorStats {
+	// reserved_bytes: VirtualAlloc MEM_RESERVE address-space backing.
+	// committed_bytes: VirtualAlloc MEM_COMMIT physical backing actually backed by the OS.
+	// physical_bytes: alias for committed_bytes, exposed for capacity policy.
+	// live_bytes: usable payload/object bytes currently allocated to callers.
 	uint64_t reserved_bytes;
+	uint64_t committed_bytes;
+	uint64_t physical_bytes;
 	uint64_t live_bytes;
 	uint64_t live_objects;
 	uint32_t slab_count;
 	uint32_t dedicated_count;
 	uint64_t dedicated_reserved_bytes;
+	uint64_t dedicated_committed_bytes;
 	uint64_t dedicated_live_bytes;
 } MemfsAllocatorStats;
 

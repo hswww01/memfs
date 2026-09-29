@@ -21,6 +21,131 @@ static int g_failures;
 		}                                                                                                              \
 	} while (0)
 
+static void test_memory_accounting_layers(void) {
+	MemfsOptions options = {0};
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	MemfsNode* churn[16];
+	MemfsAllocatorStats stats;
+	uint8_t input[MEMFS_PAGE_SIZE + 123];
+	uint8_t output[MEMFS_PAGE_SIZE + 123];
+	uint32_t transferred;
+	uint32_t i;
+	uint32_t round;
+	uint64_t capacity = 64ULL * 1024ULL * 1024ULL;
+	uint64_t used_before;
+	uint64_t resident_before;
+	uint64_t committed_before;
+	uint64_t live_before;
+
+	printf("== memory accounting layers ==\n");
+
+	options.capacity = capacity;
+	options.volume_label = L"ACCT";
+	CHECK(memfs_create_ex(&options, &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	if (fs == NULL)
+		return;
+
+	memfs_allocator_get_stats(&fs->allocator, &stats);
+	CHECK(stats.committed_bytes > 0);
+	CHECK(stats.physical_bytes == stats.committed_bytes);
+	CHECK(stats.reserved_bytes >= stats.committed_bytes);
+	CHECK(stats.live_bytes > 0);
+	CHECK(stats.live_objects > 0);
+	CHECK(stats.dedicated_committed_bytes <= stats.committed_bytes);
+	CHECK(stats.dedicated_reserved_bytes <= stats.reserved_bytes);
+
+	CHECK(memfs_node_create(fs, fs->root, L"acct.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(file != NULL);
+	if (file == NULL) {
+		memfs_destroy(fs);
+		return;
+	}
+
+	for (i = 0; i < sizeof(input); i++)
+		input[i] = (uint8_t)(0x11 + (i % 251U));
+
+	CHECK(memfs_node_write(file, input, 0, sizeof(input), false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	CHECK(file->file_size == sizeof(input));
+	CHECK(file->allocation_size == sizeof(input));
+	CHECK((uint64_t)fs->used_bytes == sizeof(input));
+	CHECK(memfs_free_bytes(fs) == capacity - sizeof(input));
+	CHECK(memfs_resident_bytes(fs) == memfs_node_resident_bytes(file));
+	CHECK(memfs_node_resident_bytes(file) >= 2ULL * MEMFS_PAGE_SIZE);
+	CHECK(memfs_node_resident_bytes(file) < 3ULL * MEMFS_PAGE_SIZE + 128U);
+	CHECK(memfs_committed_bytes(fs) == memfs_physical_bytes(fs));
+	CHECK(memfs_committed_bytes(fs) > 0);
+	CHECK(memfs_committed_bytes(fs) >= memfs_resident_bytes(fs));
+
+	memset(output, 0xff, sizeof(output));
+	CHECK(memfs_node_read(file, output, 0, sizeof(input), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	CHECK(memcmp(input, output, sizeof(input)) == 0);
+
+	used_before = fs->used_bytes;
+	resident_before = fs->resident_bytes;
+	committed_before = memfs_committed_bytes(fs);
+	memfs_allocator_get_stats(&fs->allocator, &stats);
+	live_before = stats.live_bytes;
+
+	for (round = 0; round < 4; round++) {
+		for (i = 0; i < sizeof(input); i++)
+			input[i] = (uint8_t)(0x20 + round * 13U + (i % 251U));
+		CHECK(memfs_node_write(file, input, 0, sizeof(input), false, false, &transferred) == MEMFS_OK);
+		CHECK(transferred == sizeof(input));
+		CHECK((uint64_t)fs->used_bytes == used_before);
+		CHECK(memfs_resident_bytes(fs) == memfs_node_resident_bytes(file));
+		CHECK(memfs_resident_bytes(fs) < resident_before + 2ULL * MEMFS_PAGE_SIZE);
+	}
+
+	memset(output, 0xff, sizeof(output));
+	CHECK(memfs_node_read(file, output, 0, sizeof(input), &transferred) == MEMFS_OK);
+	CHECK(memcmp(input, output, sizeof(input)) == 0);
+
+	for (i = 0; i < _countof(churn); i++) {
+		wchar_t churn_name[32];
+
+		churn[i] = NULL;
+		swprintf_s(churn_name, _countof(churn_name), L"churn-%u.bin", i);
+		CHECK(memfs_node_create(fs, fs->root, churn_name, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &churn[i]) ==
+			  MEMFS_OK);
+		CHECK(churn[i] != NULL);
+		if (churn[i] == NULL)
+			continue;
+
+		CHECK(memfs_node_write(churn[i], input, 0, 1024, false, false, &transferred) == MEMFS_OK);
+		CHECK(transferred == 1024);
+		CHECK(memfs_node_unlink(churn[i]) == MEMFS_OK);
+		memfs_node_close(churn[i]);
+		churn[i] = NULL;
+
+		CHECK((uint64_t)fs->used_bytes == used_before);
+		CHECK(memfs_resident_bytes(fs) == memfs_node_resident_bytes(file));
+		CHECK(memfs_free_bytes(fs) == capacity - used_before);
+	}
+
+	CHECK(memfs_node_set_file_size(file, MEMFS_PAGE_SIZE) == MEMFS_OK);
+	CHECK(memfs_node_set_allocation_size(file, MEMFS_PAGE_SIZE) == MEMFS_OK);
+	CHECK((uint64_t)fs->used_bytes == MEMFS_PAGE_SIZE);
+	CHECK(memfs_resident_bytes(fs) == memfs_node_resident_bytes(file));
+	CHECK(memfs_resident_bytes(fs) < resident_before);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK(memfs_resident_bytes(fs) == 0);
+	CHECK(memfs_free_bytes(fs) == capacity);
+
+	memfs_allocator_get_stats(&fs->allocator, &stats);
+	CHECK(stats.live_bytes <= live_before + 64ULL * 1024ULL);
+	CHECK(stats.committed_bytes <= committed_before + 64ULL * 1024ULL);
+	CHECK(stats.physical_bytes == stats.committed_bytes);
+
+	memfs_destroy(fs);
+}
+
 static void test_tree_and_lookup(void) {
 	Memfs* fs = NULL;
 	MemfsNode* root;
@@ -3043,6 +3168,7 @@ int main(void) {
 	setvbuf(stdout, NULL, _IONBF, 0);
 
 	test_tree_and_lookup();
+	test_memory_accounting_layers();
 	test_io_and_resize();
 	test_write_to_end_semantics();
 	test_rename_and_delete();

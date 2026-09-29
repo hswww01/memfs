@@ -25,6 +25,7 @@ struct MemfsObjectPool {
 	SRWLOCK lock;
 	uint64_t live_objects;
 	uint64_t reserved_bytes;
+	uint64_t committed_bytes;
 	uint32_t slab_count;
 	uint32_t in_use;
 	uint32_t slot_index;
@@ -43,6 +44,7 @@ struct MemfsDedicatedBlock {
 	uint8_t* backing;
 	uint64_t requested_bytes;
 	uint64_t allocated_bytes;
+	uint64_t committed_bytes;
 	uint32_t magic;
 	uint32_t reserved;
 };
@@ -199,6 +201,7 @@ static MemfsSlab* slab_create(MemfsObjectPool* pool) {
 	available_insert(pool, slab);
 	pool->slab_count++;
 	pool->reserved_bytes += MEMFS_ALLOC_SLAB_SIZE;
+	pool->committed_bytes += MEMFS_ALLOC_SLAB_SIZE;
 	return slab;
 }
 
@@ -275,6 +278,7 @@ static void pool_free(MemfsObjectPool* pool, void* ptr) {
 		all_remove(pool, slab);
 		pool->slab_count--;
 		pool->reserved_bytes -= MEMFS_ALLOC_SLAB_SIZE;
+		pool->committed_bytes -= MEMFS_ALLOC_SLAB_SIZE;
 		slab->magic = 0;
 		release_slab = true;
 	}
@@ -309,6 +313,7 @@ static void pool_add_stats(MemfsObjectPool* pool, MemfsAllocatorStats* stats) {
 
 	AcquireSRWLockShared(&pool->lock);
 	stats->reserved_bytes += pool->reserved_bytes;
+	stats->committed_bytes += pool->committed_bytes;
 	stats->live_bytes += pool->live_objects * pool->object_size;
 	stats->live_objects += pool->live_objects;
 	stats->slab_count += pool->slab_count;
@@ -366,6 +371,7 @@ static void* dedicated_alloc(MemfsAllocator* allocator, size_t bytes) {
 	block->backing = (uint8_t*)block + header_size;
 	block->requested_bytes = bytes;
 	block->allocated_bytes = virtual_region_bytes(block);
+	block->committed_bytes = block->allocated_bytes;
 	block->magic = MEMFS_DEDICATED_MAGIC;
 
 	AcquireSRWLockExclusive(&allocator->dedicated_lock);
@@ -420,8 +426,10 @@ static void dedicated_add_stats(MemfsAllocator* allocator, MemfsAllocatorStats* 
 			continue;
 		stats->dedicated_count++;
 		stats->dedicated_reserved_bytes += block->allocated_bytes;
+		stats->dedicated_committed_bytes += block->committed_bytes;
 		stats->dedicated_live_bytes += block->requested_bytes;
 		stats->reserved_bytes += block->allocated_bytes;
+		stats->committed_bytes += block->committed_bytes;
 		stats->live_bytes += block->requested_bytes;
 		stats->live_objects++;
 	}
@@ -684,8 +692,12 @@ void memfs_allocator_get_stats(MemfsAllocator* allocator, MemfsAllocatorStats* s
 		bootstrap = bootstrap_from_pool(allocator->dir_pool);
 	if (bootstrap == NULL)
 		bootstrap = bootstrap_from_pool(allocator->page_group_pool);
-	if (bootstrap != NULL)
-		stats->reserved_bytes += virtual_region_bytes(bootstrap);
+	if (bootstrap != NULL) {
+		uint64_t bootstrap_bytes = virtual_region_bytes(bootstrap);
+
+		stats->reserved_bytes += bootstrap_bytes;
+		stats->committed_bytes += bootstrap_bytes;
+	}
 
 	pool_add_stats(allocator->node_pool, stats);
 	pool_add_stats(allocator->dir_pool, stats);
@@ -698,4 +710,5 @@ void memfs_allocator_get_stats(MemfsAllocator* allocator, MemfsAllocatorStats* s
 		pool_add_stats(allocator->generic_pools[i], stats);
 
 	dedicated_add_stats(allocator, stats);
+	stats->physical_bytes = stats->committed_bytes;
 }
