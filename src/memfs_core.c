@@ -2159,8 +2159,14 @@ static MemfsResult memfs_account_file_size(MemfsNode* node, uint64_t old_size, u
 
 	if (new_size > old_size) {
 		uint64_t delta = new_size - old_size;
+		uint64_t reserve_limit = fs->capacity_auto ? (uint64_t)INT64_MAX : fs->capacity;
 
-		if (!memfs_capacity_allows(fs, delta) || !memfs_atomic_reserve(&fs->used_bytes, fs->capacity, delta)) {
+		/* Auto capacity is governed by the current system-memory allowance, not
+		 * fs->capacity (which is intentionally zero in auto mode). Keep the
+		 * logical used_bytes update atomic, but only apply the fixed byte quota
+		 * when capacity_auto is disabled. */
+		if (!memfs_capacity_allows(fs, delta) ||
+			!memfs_atomic_reserve(&fs->used_bytes, reserve_limit, delta)) {
 			return MEMFS_ERR_NO_SPACE;
 		}
 	} else {

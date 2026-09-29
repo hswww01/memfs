@@ -149,6 +149,11 @@ Uncompressed/unencrypted local measurements:
 With encryption enabled a 1-byte file uses 33 bytes of tracked encoded storage: 8-byte blob header + 8-byte nonce sequence + 1 byte payload + 16-byte Poly1305 tag.
 
 resident_bytes tracks encoded data blobs/pages and intentionally excludes host allocator bookkeeping and namespace metadata.
+### Allocator v2 and auto capacity
+
+The allocator v2 backend combines fixed-size object pools/slabs for nodes, directories, page groups, names and generic objects with dedicated blocks for larger allocations. `reserved_bytes` is address-space reservation only; `committed_bytes` is the real OS-backed committed memory, and `physical_bytes` is an alias for `committed_bytes`, not a separate source. `live_bytes` is the caller-visible payload/object bytes currently allocated.
+
+`capacity_auto=true` makes memfs derive its writable allowance from current system memory and allocator backing instead of using a fixed user capacity. `memfs_auto_allowance_bytes()` reports the current allowance, while `used_bytes`, `resident_bytes`, `committed_bytes` and `physical_bytes` remain separate measurements: logical quota, resident payload, and allocator physical backing. The benchmark reports these separately so high-water checks do not confuse allocator backing with logical file usage.
 
 ### Sparse paged files
 

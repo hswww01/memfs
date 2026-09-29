@@ -3283,10 +3283,12 @@ int main(void) {
 
 	test_tree_and_lookup();
 	test_memory_accounting_layers();
+	test_adaptive_capacity_mode();
 	test_io_and_resize();
 	test_write_to_end_semantics();
 	test_rename_and_delete();
 	test_capacity();
+	test_explicit_size_hard_limit_with_auto_flag_false();
 	test_no_space_rollback();
 	test_directory_order();
 	test_small_storage();
