@@ -143,4 +143,14 @@ add_test(NAME memfs_core_test COMMAND memfs_core_test)
 add_test(NAME memfs_no_crt_heap_guard COMMAND memfs_no_crt_heap_guard)
 set_tests_properties(memfs_no_crt_heap_guard PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+add_test(NAME memfs_no_crt_heap_guard_good_fixture
+	COMMAND memfs_no_crt_heap_guard ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/memfs_guard_good.c)
+set_tests_properties(memfs_no_crt_heap_guard_good_fixture PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_test(NAME memfs_no_crt_heap_guard_bad_fixture
+	COMMAND memfs_no_crt_heap_guard ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/memfs_guard_bad.c)
+set_tests_properties(memfs_no_crt_heap_guard_bad_fixture PROPERTIES
+	WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+	WILL_FAIL TRUE)
+
 install(TARGETS memfs RUNTIME DESTINATION bin)

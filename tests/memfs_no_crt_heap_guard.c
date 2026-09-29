@@ -13,16 +13,21 @@ static int is_word_boundary(const char* s, size_t i) {
 static int is_crt_heap_call(const char* s, size_t i) {
 	static const char* names[] = {"malloc", "calloc", "realloc", "free"};
 	size_t j;
+	size_t len = strlen(s);
 
 	for (j = 0; j < sizeof(names) / sizeof(names[0]); ++j) {
-		size_t len = strlen(names[j]);
+		size_t name_len = strlen(names[j]);
+		size_t pos;
 
-		if (i + len <= strlen(s) && strncmp(s + i, names[j], len) == 0 && is_word_boundary(s, i) &&
-			!is_ident_char((unsigned char)s[i + len])) {
-			while (i + len < strlen(s) && isspace((unsigned char)s[i + len]))
-				++i;
-			return s[i] == '(';
-		}
+		if (i + name_len > len || strncmp(s + i, names[j], name_len) != 0 || !is_word_boundary(s, i) ||
+			is_ident_char((unsigned char)s[i + name_len]))
+			continue;
+
+		pos = i + name_len;
+		while (pos < len && isspace((unsigned char)s[pos]))
+			++pos;
+		if (s[pos] == '(')
+			return 1;
 	}
 	return 0;
 }
@@ -31,6 +36,7 @@ static int scan_file(const char* path) {
 	char line[4096];
 	int failures = 0;
 	long line_no = 0;
+	int in_block_comment = 0;
 
 	if (fp == NULL) {
 		printf("memfs_no_crt_heap_guard: cannot open %s\n", path);
@@ -41,7 +47,6 @@ static int scan_file(const char* path) {
 		++line_no;
 		size_t i = 0;
 		size_t len = strlen(line);
-		int in_block_comment = 0;
 		int in_string = 0;
 		int in_char = 0;
 		int in_line_comment = 0;
@@ -112,7 +117,7 @@ static int scan_file(const char* path) {
 	fclose(fp);
 	return failures;
 }
-int main(void) {
+int main(int argc, char** argv) {
 	static const char* files[] = {
 		"src/main.c",
 		"src/memfs_core.c",
@@ -125,8 +130,12 @@ int main(void) {
 	size_t i;
 	int failures = 0;
 
-	for (i = 0; i < sizeof(files) / sizeof(files[0]); ++i)
-		failures += scan_file(files[i]);
+	if (argc == 2) {
+		failures = scan_file(argv[1]);
+	} else {
+		for (i = 0; i < sizeof(files) / sizeof(files[0]); ++i)
+			failures += scan_file(files[i]);
+	}
 
 	if (failures) {
 		printf("memfs_no_crt_heap_guard: FAILED with %d violation(s)\n", failures);
