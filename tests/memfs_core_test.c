@@ -3373,11 +3373,244 @@ static void test_constrained_io_eof_bounds(void) {
 	memfs_destroy(fs);
 }
 
+#if !defined(NDEBUG)
+static bool failure_stats_equal(const MemfsAllocatorStats* a, const MemfsAllocatorStats* b) {
+	return a->reserved_bytes == b->reserved_bytes &&
+		   a->committed_bytes == b->committed_bytes &&
+		   a->physical_bytes == b->physical_bytes &&
+		   a->live_bytes == b->live_bytes &&
+		   a->live_objects == b->live_objects &&
+		   a->slab_count == b->slab_count &&
+		   a->dedicated_count == b->dedicated_count &&
+		   a->dedicated_reserved_bytes == b->dedicated_reserved_bytes &&
+		   a->dedicated_committed_bytes == b->dedicated_committed_bytes &&
+		   a->dedicated_live_bytes == b->dedicated_live_bytes;
+}
+
+static void test_allocator_failure_injection_primitives(void) {
+	MemfsAllocator allocator;
+	MemfsAllocatorStats baseline;
+	MemfsAllocatorStats after;
+	void* ptr;
+
+	printf("== allocator deterministic failure injection ==\n");
+
+	memset(&allocator, 0, sizeof(allocator));
+	memfs_allocator_test_fail_after(MEMFS_ALLOC_FAIL_BOOTSTRAP, 0, 1);
+	CHECK(!memfs_allocator_init(&allocator, 128, 128, 1024));
+	memfs_allocator_test_clear_failures();
+	CHECK(memfs_allocator_init(&allocator, 128, 128, 1024));
+	memfs_allocator_get_stats(&allocator, &baseline);
+
+	memfs_allocator_test_fail_after(MEMFS_ALLOC_FAIL_NODE, 0, 1);
+	CHECK(memfs_allocator_alloc_node(&allocator) == NULL);
+	memfs_allocator_get_stats(&allocator, &after);
+	CHECK(failure_stats_equal(&baseline, &after));
+
+	memfs_allocator_test_fail_after(MEMFS_ALLOC_FAIL_DIR, 0, 1);
+	CHECK(memfs_allocator_alloc_dir(&allocator) == NULL);
+	memfs_allocator_get_stats(&allocator, &after);
+	CHECK(failure_stats_equal(&baseline, &after));
+
+	memfs_allocator_test_fail_after(MEMFS_ALLOC_FAIL_GROUP, 0, 1);
+	CHECK(memfs_allocator_alloc_page_group(&allocator) == NULL);
+	memfs_allocator_get_stats(&allocator, &after);
+	CHECK(failure_stats_equal(&baseline, &after));
+
+	memfs_allocator_test_fail_after(MEMFS_ALLOC_FAIL_NAME, 0, 1);
+	CHECK(memfs_allocator_alloc_name(&allocator, 64) == NULL);
+	memfs_allocator_get_stats(&allocator, &after);
+	CHECK(failure_stats_equal(&baseline, &after));
+
+	memfs_allocator_test_fail_after(MEMFS_ALLOC_FAIL_GENERIC, 0, 1);
+	CHECK(memfs_allocator_alloc(&allocator, 1024) == NULL);
+	memfs_allocator_get_stats(&allocator, &after);
+	CHECK(failure_stats_equal(&baseline, &after));
+
+	/* SLAB is below the logical allocation hooks and simulates VirtualAlloc failure. */
+	memfs_allocator_test_fail_after(MEMFS_ALLOC_FAIL_SLAB, 0, 1);
+	CHECK(memfs_allocator_alloc(&allocator, 512) == NULL);
+	memfs_allocator_get_stats(&allocator, &after);
+	CHECK(failure_stats_equal(&baseline, &after));
+
+	memfs_allocator_test_fail_after(MEMFS_ALLOC_FAIL_DEDICATED, 0, 1);
+	CHECK(memfs_allocator_alloc(&allocator, 64U * 1024U) == NULL);
+	memfs_allocator_get_stats(&allocator, &after);
+	CHECK(failure_stats_equal(&baseline, &after));
+
+	/* A one-shot failure must not poison later allocations. */
+	memfs_allocator_test_clear_failures();
+	ptr = memfs_allocator_alloc(&allocator, 512);
+	CHECK(ptr != NULL);
+	memfs_allocator_free(&allocator, ptr, 512);
+	ptr = memfs_allocator_alloc(&allocator, 64U * 1024U);
+	CHECK(ptr != NULL);
+	memfs_allocator_free(&allocator, ptr, 64U * 1024U);
+	memfs_allocator_get_stats(&allocator, &after);
+	CHECK(failure_stats_equal(&baseline, &after));
+
+	memfs_allocator_destroy(&allocator);
+	memfs_allocator_test_clear_failures();
+}
+
+static void test_failure_injection_transaction_rollback(void) {
+	Memfs* fs = NULL;
+	MemfsNode* file = NULL;
+	MemfsNode* failed = (MemfsNode*)(uintptr_t)1;
+	MemfsNode* found = NULL;
+	MemfsSecurity* original_security;
+	MemfsAllocatorStats baseline;
+	MemfsAllocatorStats after;
+	PSECURITY_DESCRIPTOR alternate = NULL;
+	ULONG alternate_size = 0;
+	uint8_t input[MEMFS_PAGE_SIZE];
+	uint8_t output[MEMFS_PAGE_SIZE];
+	uint32_t transferred = 0;
+	uint64_t next_index;
+	uint32_t child_count;
+	uint64_t used;
+	uint64_t resident;
+	uint64_t file_size;
+	uint64_t allocation_size;
+	uint64_t change_time;
+	MemfsAllocFailPoint write_points[] = {
+		MEMFS_ALLOC_FAIL_PAGE,
+		MEMFS_ALLOC_FAIL_GROUP,
+		MEMFS_ALLOC_FAIL_METADATA,
+	};
+
+	printf("== failure injection transaction rollback ==\n");
+	memset(input, 0x5a, sizeof(input));
+
+	CHECK(memfs_create(32ULL * 1024ULL * 1024ULL, L"FAILTX", &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	if (fs == NULL)
+		goto cleanup;
+
+	/* Name failure must not publish a node or consume an index/accounting. */
+	next_index = fs->next_index;
+	child_count = fs->root->dir->child_count;
+	used = (uint64_t)fs->used_bytes;
+	resident = (uint64_t)fs->resident_bytes;
+	memfs_allocator_get_stats(&fs->allocator, &baseline);
+	memfs_allocator_test_fail_after(MEMFS_ALLOC_FAIL_NAME, 0, 1);
+	CHECK(memfs_node_create(fs, fs->root, L"name-fail.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &failed) ==
+		  MEMFS_ERR_NO_MEMORY);
+	CHECK(failed == NULL);
+	CHECK(memfs_dir_lookup(fs->root, L"name-fail.bin") == NULL);
+	CHECK(fs->next_index == next_index);
+	CHECK(fs->root->dir->child_count == child_count);
+	CHECK((uint64_t)fs->used_bytes == used);
+	CHECK((uint64_t)fs->resident_bytes == resident);
+	memfs_allocator_get_stats(&fs->allocator, &after);
+	CHECK(failure_stats_equal(&baseline, &after));
+
+	/* Directory object failure has the same namespace/accounting guarantees. */
+	failed = (MemfsNode*)(uintptr_t)1;
+	memfs_allocator_test_fail_after(MEMFS_ALLOC_FAIL_DIR, 0, 1);
+	CHECK(memfs_node_create(fs, fs->root, L"dir-fail", true, FILE_ATTRIBUTE_DIRECTORY, NULL, 0, &failed) ==
+		  MEMFS_ERR_NO_MEMORY);
+	CHECK(failed == NULL);
+	CHECK(memfs_dir_lookup(fs->root, L"dir-fail") == NULL);
+	CHECK(fs->next_index == next_index);
+	memfs_allocator_get_stats(&fs->allocator, &after);
+	CHECK(failure_stats_equal(&baseline, &after));
+
+	CHECK(ConvertStringSecurityDescriptorToSecurityDescriptorW(
+		  L"O:BAG:BAD:P(A;;GRGW;;;WD)", SDDL_REVISION_1, &alternate, &alternate_size));
+	CHECK(alternate != NULL);
+	if (alternate == NULL)
+		goto cleanup;
+
+	/* Security failure used to consume next_index before all resources committed. */
+	failed = (MemfsNode*)(uintptr_t)1;
+	memfs_allocator_test_fail_after(MEMFS_ALLOC_FAIL_SECURITY, 0, 1);
+	CHECK(memfs_node_create(fs, fs->root, L"security-fail.bin", false, FILE_ATTRIBUTE_NORMAL, alternate, 0, &failed) ==
+		  MEMFS_ERR_NO_MEMORY);
+	CHECK(failed == NULL);
+	CHECK(memfs_dir_lookup(fs->root, L"security-fail.bin") == NULL);
+	CHECK(fs->next_index == next_index);
+	memfs_allocator_get_stats(&fs->allocator, &after);
+	CHECK(failure_stats_equal(&baseline, &after));
+
+	memfs_allocator_test_clear_failures();
+	CHECK(memfs_node_create(fs, fs->root, L"write-fail.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) ==
+		  MEMFS_OK);
+	CHECK(file != NULL);
+	if (file == NULL)
+		goto cleanup;
+
+	for (uint32_t i = 0; i < _countof(write_points); i++) {
+		file_size = file->file_size;
+		allocation_size = file->allocation_size;
+		used = (uint64_t)fs->used_bytes;
+		resident = (uint64_t)fs->resident_bytes;
+		memfs_allocator_get_stats(&fs->allocator, &baseline);
+
+		memfs_allocator_test_fail_after(write_points[i], 0, 1);
+		transferred = 1234;
+		CHECK(memfs_node_write(file, input, 1, sizeof(input), false, false, &transferred) == MEMFS_ERR_NO_MEMORY);
+		CHECK(transferred == 0);
+		CHECK(file->file_size == file_size);
+		CHECK(file->allocation_size == allocation_size);
+		CHECK((uint64_t)fs->used_bytes == used);
+		CHECK((uint64_t)fs->resident_bytes == resident);
+		CHECK(memfs_node_page_group_count(file) == 0);
+		memfs_allocator_get_stats(&fs->allocator, &after);
+		CHECK(failure_stats_equal(&baseline, &after));
+	}
+
+	/* Clearing the same failure path must allow the original operation to succeed. */
+	memfs_allocator_test_clear_failures();
+	CHECK(memfs_node_write(file, input, 0, sizeof(input), false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	memset(output, 0, sizeof(output));
+	CHECK(memfs_node_read(file, output, 0, sizeof(output), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(output));
+	CHECK(memcmp(input, output, sizeof(input)) == 0);
+
+	/* Replacing security must be allocate-then-swap. Failure leaves pointer/time/stats untouched. */
+	original_security = memfs_node_get_security(file);
+	change_time = memfs_node_get_change_time(file);
+	memfs_allocator_get_stats(&fs->allocator, &baseline);
+	memfs_allocator_test_fail_after(MEMFS_ALLOC_FAIL_SECURITY, 0, 1);
+	CHECK(memfs_node_replace_security(file, alternate, alternate_size) == MEMFS_ERR_NO_MEMORY);
+	CHECK(memfs_node_get_security(file) == original_security);
+	CHECK(memfs_node_get_change_time(file) == change_time);
+	memfs_allocator_get_stats(&fs->allocator, &after);
+	CHECK(failure_stats_equal(&baseline, &after));
+
+	memfs_allocator_test_clear_failures();
+	CHECK(memfs_node_replace_security(file, alternate, alternate_size) == MEMFS_OK);
+	CHECK(memfs_node_get_security(file) != original_security);
+
+	/* Existing capacity test covers NO_SPACE -> release capacity -> retry success. */
+	CHECK(memfs_lookup_path(fs, L"\\write-fail.bin", &found) == MEMFS_OK);
+	CHECK(found == file);
+
+cleanup:
+	memfs_allocator_test_clear_failures();
+	if (alternate)
+		LocalFree(alternate);
+	if (file) {
+		(void)memfs_node_unlink(file);
+		memfs_node_close(file);
+	}
+	if (fs)
+		memfs_destroy(fs);
+}
+#endif
+
+
 int main(void) {
 	setvbuf(stdout, NULL, _IONBF, 0);
 
 	test_tree_and_lookup();
 	test_memory_accounting_layers();	test_allocator_fragmentation_reuse();
+#if !defined(NDEBUG)
+	test_allocator_failure_injection_primitives();
+	test_failure_injection_transaction_rollback();
+#endif
 
 	test_adaptive_capacity_mode();
 	test_io_and_resize();

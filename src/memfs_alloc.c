@@ -63,6 +63,55 @@ struct MemfsSlab {
 	uint8_t data[];
 };
 
+#if !defined(NDEBUG)
+static volatile LONG g_memfs_alloc_fail_point = MEMFS_ALLOC_FAIL_NONE;
+static volatile LONG g_memfs_alloc_fail_skip;
+static volatile LONG g_memfs_alloc_fail_remaining;
+
+void memfs_allocator_test_fail_after(MemfsAllocFailPoint point, uint32_t successful_calls_before_failure,
+									 uint32_t failure_count) {
+	/* Publish the point last so readers never observe a half-configured rule. */
+	InterlockedExchange(&g_memfs_alloc_fail_point, MEMFS_ALLOC_FAIL_NONE);
+	InterlockedExchange(&g_memfs_alloc_fail_skip, (LONG)successful_calls_before_failure);
+	InterlockedExchange(&g_memfs_alloc_fail_remaining, (LONG)failure_count);
+	InterlockedExchange(&g_memfs_alloc_fail_point, (LONG)point);
+}
+
+void memfs_allocator_test_clear_failures(void) {
+	InterlockedExchange(&g_memfs_alloc_fail_point, MEMFS_ALLOC_FAIL_NONE);
+	InterlockedExchange(&g_memfs_alloc_fail_skip, 0);
+	InterlockedExchange(&g_memfs_alloc_fail_remaining, 0);
+}
+
+bool memfs_allocator_test_should_fail(MemfsAllocFailPoint point) {
+	LONG current;
+	LONG value;
+
+	if (point == MEMFS_ALLOC_FAIL_NONE)
+		return false;
+
+	current = InterlockedCompareExchange(&g_memfs_alloc_fail_point, 0, 0);
+	if (current != (LONG)point)
+		return false;
+
+	for (;;) {
+		value = InterlockedCompareExchange(&g_memfs_alloc_fail_skip, 0, 0);
+		if (value <= 0)
+			break;
+		if (InterlockedCompareExchange(&g_memfs_alloc_fail_skip, value - 1, value) == value)
+			return false;
+	}
+
+	for (;;) {
+		value = InterlockedCompareExchange(&g_memfs_alloc_fail_remaining, 0, 0);
+		if (value <= 0)
+			return false;
+		if (InterlockedCompareExchange(&g_memfs_alloc_fail_remaining, value - 1, value) == value)
+			return true;
+	}
+}
+#endif
+
 static const size_t g_name_pool_sizes[MEMFS_ALLOC_NAME_POOL_COUNT] = {8U,  16U,	 24U,  32U,	 48U,  64U,
 																	  96U, 128U, 192U, 256U, 384U, 512U};
 static const size_t g_generic_pool_sizes[MEMFS_ALLOC_GENERIC_POOL_COUNT] = {
@@ -177,6 +226,9 @@ static MemfsSlab* slab_create(MemfsObjectPool* pool) {
 
 	capacity = (uint32_t)((MEMFS_ALLOC_SLAB_SIZE - data_offset) / pool->object_size);
 	if (capacity == 0)
+		return NULL;
+
+	if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_SLAB))
 		return NULL;
 
 	slab = VirtualAlloc(NULL, MEMFS_ALLOC_SLAB_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -363,6 +415,9 @@ static void* dedicated_alloc(MemfsAllocator* allocator, size_t bytes) {
 		return NULL;
 	total_size = header_size + bytes;
 
+	if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_DEDICATED))
+		return NULL;
+
 	block = VirtualAlloc(NULL, total_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 	if (block == NULL)
 		return NULL;
@@ -443,6 +498,9 @@ static bool bootstrap_init(MemfsBootstrap** out_bootstrap) {
 		return false;
 
 	*out_bootstrap = NULL;
+	if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_BOOTSTRAP))
+		return false;
+
 	bootstrap = VirtualAlloc(NULL, sizeof(MemfsBootstrap), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 	if (bootstrap == NULL)
 		return false;
@@ -558,7 +616,9 @@ void memfs_allocator_destroy(MemfsAllocator* allocator) {
 }
 
 void* memfs_allocator_alloc_node(MemfsAllocator* allocator) {
-	return allocator ? pool_alloc(allocator->node_pool) : NULL;
+	if (allocator == NULL || memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_NODE))
+		return NULL;
+	return pool_alloc(allocator->node_pool);
 }
 
 void memfs_allocator_free_node(MemfsAllocator* allocator, void* ptr) {
@@ -567,7 +627,9 @@ void memfs_allocator_free_node(MemfsAllocator* allocator, void* ptr) {
 }
 
 void* memfs_allocator_alloc_dir(MemfsAllocator* allocator) {
-	return allocator ? pool_alloc(allocator->dir_pool) : NULL;
+	if (allocator == NULL || memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_DIR))
+		return NULL;
+	return pool_alloc(allocator->dir_pool);
 }
 
 void memfs_allocator_free_dir(MemfsAllocator* allocator, void* ptr) {
@@ -576,7 +638,9 @@ void memfs_allocator_free_dir(MemfsAllocator* allocator, void* ptr) {
 }
 
 void* memfs_allocator_alloc_page_group(MemfsAllocator* allocator) {
-	return allocator ? pool_alloc(allocator->page_group_pool) : NULL;
+	if (allocator == NULL || memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_GROUP))
+		return NULL;
+	return pool_alloc(allocator->page_group_pool);
 }
 
 void memfs_allocator_free_page_group(MemfsAllocator* allocator, void* ptr) {
@@ -588,6 +652,8 @@ void* memfs_allocator_alloc_name(MemfsAllocator* allocator, size_t bytes) {
 	int index;
 
 	if (allocator == NULL || bytes == 0)
+		return NULL;
+	if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_NAME))
 		return NULL;
 
 	index = name_pool_index(bytes);
@@ -615,6 +681,8 @@ void* memfs_allocator_alloc(MemfsAllocator* allocator, size_t bytes) {
 	int index;
 
 	if (allocator == NULL || bytes == 0)
+		return NULL;
+	if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_GENERIC))
 		return NULL;
 
 	index = generic_pool_index(bytes);

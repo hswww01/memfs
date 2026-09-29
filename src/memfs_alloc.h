@@ -18,6 +18,48 @@ enum { MEMFS_ALLOC_GENERIC_POOL_COUNT = 20 };
 
 typedef struct MemfsDedicatedBlock MemfsDedicatedBlock;
 
+typedef enum MemfsAllocFailPoint {
+	MEMFS_ALLOC_FAIL_NONE = 0,
+	MEMFS_ALLOC_FAIL_BOOTSTRAP,
+	MEMFS_ALLOC_FAIL_SLAB,
+	MEMFS_ALLOC_FAIL_DEDICATED,
+	MEMFS_ALLOC_FAIL_NODE,
+	MEMFS_ALLOC_FAIL_DIR,
+	MEMFS_ALLOC_FAIL_GROUP,
+	MEMFS_ALLOC_FAIL_NAME,
+	MEMFS_ALLOC_FAIL_GENERIC,
+	MEMFS_ALLOC_FAIL_METADATA,
+	MEMFS_ALLOC_FAIL_PAGE,
+	MEMFS_ALLOC_FAIL_SECURITY
+} MemfsAllocFailPoint;
+
+/*
+ * Deterministic allocation-failure seam for Debug/test builds.
+ * Release builds compile these hooks to constant no-ops, so MemfsAllocator ABI
+ * and production hot paths remain unchanged.
+ */
+#if !defined(NDEBUG)
+void memfs_allocator_test_fail_after(MemfsAllocFailPoint point, uint32_t successful_calls_before_failure,
+									 uint32_t failure_count);
+void memfs_allocator_test_clear_failures(void);
+bool memfs_allocator_test_should_fail(MemfsAllocFailPoint point);
+#else
+static inline void memfs_allocator_test_fail_after(MemfsAllocFailPoint point,
+											 uint32_t successful_calls_before_failure,
+											 uint32_t failure_count) {
+	(void)point;
+	(void)successful_calls_before_failure;
+	(void)failure_count;
+}
+static inline void memfs_allocator_test_clear_failures(void) {
+}
+static inline bool memfs_allocator_test_should_fail(MemfsAllocFailPoint point) {
+	(void)point;
+	return false;
+}
+#endif
+
+
 typedef struct MemfsAllocator {
 	MemfsObjectPool* node_pool;
 	MemfsObjectPool* dir_pool;

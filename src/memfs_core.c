@@ -352,6 +352,9 @@ static MemfsResult memfs_page_encode(MemfsNode* node, uint64_t storage_index, co
 	if (stored_size > UINT16_MAX)
 		return MEMFS_ERR_NO_MEMORY;
 
+	if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_PAGE))
+		return MEMFS_ERR_NO_MEMORY;
+
 	page = memfs_allocator_alloc(&node->fs->allocator, sizeof(*page) + stored_size);
 	if (page == NULL)
 		return MEMFS_ERR_NO_MEMORY;
@@ -603,6 +606,9 @@ static MemfsStorageMeta* memfs_storage_meta_get_or_create(MemfsNode* node) {
 	meta = memfs_storage_meta(node);
 	if (meta != NULL)
 		return meta;
+
+	if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_METADATA))
+		return NULL;
 
 	meta = memfs_allocator_alloc_zero(&node->fs->allocator, sizeof(*meta));
 	if (meta == NULL)
@@ -1379,6 +1385,9 @@ static MemfsResult memfs_storage_write_raw_pages(MemfsNode* node, const uint8_t*
 		MemfsPage* page = memfs_storage_page(node, page_index);
 
 		if (page == NULL) {
+			if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_PAGE))
+				return MEMFS_ERR_NO_MEMORY;
+
 			page = memfs_allocator_alloc_zero(&node->fs->allocator, sizeof(*page) + MEMFS_PAGE_SIZE);
 			if (page == NULL)
 				return MEMFS_ERR_NO_MEMORY;
@@ -1623,6 +1632,9 @@ static MemfsResult memfs_security_create(MemfsAllocator* allocator, PSECURITY_DE
 	size = GetSecurityDescriptorLength(security);
 	if (size == 0)
 		return MEMFS_ERR_INVALID;
+
+	if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_SECURITY))
+		return MEMFS_ERR_NO_MEMORY;
 
 	shared = memfs_allocator_alloc(allocator, sizeof(*shared) + size);
 	if (shared == NULL)
@@ -2096,7 +2108,6 @@ static MemfsResult memfs_node_alloc(Memfs* fs, MemfsNode* parent, const wchar_t*
 	}
 
 	node->name_hash = memfs_name_hash(node->name);
-	node->index_number = fs->next_index++;
 
 	if (security) {
 		MemfsSecurity* inherited = parent ? memfs_node_get_security(parent) : NULL;
@@ -2123,6 +2134,8 @@ static MemfsResult memfs_node_alloc(Memfs* fs, MemfsNode* parent, const wchar_t*
 		memfs_object_free_node(fs, node);
 		return result;
 	}
+
+	node->index_number = fs->next_index++;
 
 	node->attributes = attributes;
 	node->creation_time = memfs_now();
@@ -2573,6 +2586,9 @@ MemfsResult memfs_node_create(Memfs* fs, MemfsNode* parent, const wchar_t* name,
 							  PSECURITY_DESCRIPTOR security, uint64_t allocation_size, MemfsNode** out_node) {
 	MemfsNode* node;
 	MemfsResult result;
+
+	if (out_node != NULL)
+		*out_node = NULL;
 
 	if (fs == NULL || !MEMFS_NODE_IS_DIRECTORY(parent) || name == NULL || *name == L'\0' || out_node == NULL) {
 		return MEMFS_ERR_INVALID;
