@@ -918,6 +918,226 @@ static int bench_small_size_sweep(Memfs* fs, uint32_t count, LARGE_INTEGER frequ
 
 	return 0;
 }
+#define BENCH_ALLOC_FRAGMENT_ROUNDS 8U
+#define BENCH_ALLOC_FRAGMENT_OBJECTS 256U
+#define BENCH_ALLOC_FRAGMENT_REFILL_OBJECTS (BENCH_ALLOC_FRAGMENT_OBJECTS / 2U)
+#define BENCH_ALLOC_MIXED_COUNT 10U
+
+static const size_t g_bench_alloc_mixed_sizes[BENCH_ALLOC_MIXED_COUNT] = {
+	8U, 64U, 256U, 512U, 1024U, 4096U, 16384U, 32768U, 65536U, 262144U,
+};
+
+static void print_alloc_fragment_stats(const char* phase, uint32_t round, const MemfsAllocatorStats* stats) {
+	printf("round=%u phase=%-12s live=%llu reserved=%llu committed=%llu physical=%llu slab_count=%u dedicated_count=%u\n",
+		   round, phase, (unsigned long long)stats->live_bytes, (unsigned long long)stats->reserved_bytes,
+		   (unsigned long long)stats->committed_bytes, (unsigned long long)stats->physical_bytes,
+		   stats->slab_count, stats->dedicated_count);
+}
+
+static bool alloc_fragment_back_to_baseline(
+	const MemfsAllocatorStats* stats, const MemfsAllocatorStats* baseline) {
+	return stats->live_objects == baseline->live_objects &&
+		   stats->live_bytes == baseline->live_bytes &&
+		   stats->reserved_bytes == baseline->reserved_bytes &&
+		   stats->committed_bytes == baseline->committed_bytes &&
+		   stats->physical_bytes == stats->committed_bytes &&
+		   stats->physical_bytes == baseline->physical_bytes &&
+		   stats->slab_count == baseline->slab_count &&
+		   stats->dedicated_count == baseline->dedicated_count &&
+		   stats->dedicated_reserved_bytes == baseline->dedicated_reserved_bytes &&
+		   stats->dedicated_committed_bytes == baseline->dedicated_committed_bytes &&
+		   stats->dedicated_live_bytes == baseline->dedicated_live_bytes;
+}
+
+static bool alloc_fragment_same_high_water(
+	const MemfsAllocatorStats* stats, const MemfsAllocatorStats* first) {
+	return stats->reserved_bytes == first->reserved_bytes &&
+		   stats->committed_bytes == first->committed_bytes &&
+		   stats->physical_bytes == first->physical_bytes &&
+		   stats->slab_count == first->slab_count &&
+		   stats->dedicated_count == first->dedicated_count;
+}
+
+static int bench_allocator_fragmentation_reuse(void) {
+	MemfsAllocator allocator;
+	MemfsAllocatorStats baseline;
+	MemfsAllocatorStats full;
+	MemfsAllocatorStats partial;
+	MemfsAllocatorStats refilled;
+	MemfsAllocatorStats released;
+	MemfsAllocatorStats mixed_full;
+	MemfsAllocatorStats mixed_released;
+	MemfsAllocatorStats first_full = {0};
+	MemfsAllocatorStats first_mixed_full = {0};
+	void* blocks[BENCH_ALLOC_FRAGMENT_OBJECTS] = {0};
+	void* refill[BENCH_ALLOC_FRAGMENT_REFILL_OBJECTS] = {0};
+	void* mixed[BENCH_ALLOC_MIXED_COUNT] = {0};
+	uint32_t round;
+	uint32_t i;
+	int rc = 0;
+
+	memset(&allocator, 0, sizeof(allocator));
+	if (!memfs_allocator_init(&allocator, 64U, 64U, 64U)) {
+		fprintf(stderr, "allocator fragmentation init failed\n");
+		return 1;
+	}
+
+	memfs_allocator_get_stats(&allocator, &baseline);
+	printf("\n[allocator fragmentation/reuse]\n");
+	printf("rounds:           %u\n", BENCH_ALLOC_FRAGMENT_ROUNDS);
+	printf("512B objects:     %u (free/refill %u)\n", BENCH_ALLOC_FRAGMENT_OBJECTS,
+		   BENCH_ALLOC_FRAGMENT_REFILL_OBJECTS);
+	printf("mixed sizes:      8,64,256,512,1024,4096,16384,32768,65536,262144\n");
+	printf("checks:           exact partial reuse, baseline reclaim, stable per-round high-water\n");
+	print_alloc_fragment_stats("baseline", 0U, &baseline);
+
+	for (round = 0; round < BENCH_ALLOC_FRAGMENT_ROUNDS; round++) {
+		memset(blocks, 0, sizeof(blocks));
+		memset(refill, 0, sizeof(refill));
+		memset(mixed, 0, sizeof(mixed));
+
+		for (i = 0; i < BENCH_ALLOC_FRAGMENT_OBJECTS; i++) {
+			blocks[i] = memfs_allocator_alloc(&allocator, 512U);
+			if (blocks[i] == NULL) {
+				fprintf(stderr, "allocator 512B alloc failed round=%u index=%u\n", round, i);
+				rc = 1;
+				goto cleanup;
+			}
+			((uint8_t*)blocks[i])[0] = (uint8_t)(round + i);
+		}
+
+		memfs_allocator_get_stats(&allocator, &full);
+		print_alloc_fragment_stats("512-full", round, &full);
+		if (full.slab_count < 3U || full.physical_bytes != full.committed_bytes) {
+			fprintf(stderr, "allocator 512B full-state invariant failed round=%u\n", round);
+			rc = 1;
+			goto cleanup;
+		}
+		if (round == 0U) {
+			first_full = full;
+		} else if (!alloc_fragment_same_high_water(&full, &first_full)) {
+			fprintf(stderr, "allocator 512B high-water drift round=%u\n", round);
+			rc = 1;
+			goto cleanup;
+		}
+
+		for (i = 0; i < BENCH_ALLOC_FRAGMENT_OBJECTS; i += 2U) {
+			memfs_allocator_free(&allocator, blocks[i], 512U);
+			blocks[i] = NULL;
+		}
+		memfs_allocator_get_stats(&allocator, &partial);
+		print_alloc_fragment_stats("512-partial", round, &partial);
+
+		for (i = 0; i < BENCH_ALLOC_FRAGMENT_REFILL_OBJECTS; i++) {
+			refill[i] = memfs_allocator_alloc(&allocator, 512U);
+			if (refill[i] == NULL) {
+				fprintf(stderr, "allocator 512B refill failed round=%u index=%u\n", round, i);
+				rc = 1;
+				goto cleanup;
+			}
+			((uint8_t*)refill[i])[0] = (uint8_t)(round + i + 1U);
+		}
+		memfs_allocator_get_stats(&allocator, &refilled);
+		print_alloc_fragment_stats("512-refill", round, &refilled);
+		if (refilled.live_objects != full.live_objects ||
+			refilled.live_bytes != full.live_bytes ||
+			refilled.slab_count != full.slab_count ||
+			refilled.reserved_bytes != full.reserved_bytes ||
+			refilled.committed_bytes != full.committed_bytes ||
+			refilled.physical_bytes != full.physical_bytes ||
+			refilled.dedicated_count != full.dedicated_count) {
+			fprintf(stderr, "allocator 512B partial refill grew/changed high-water round=%u\n", round);
+			rc = 1;
+			goto cleanup;
+		}
+
+		for (i = 0; i < BENCH_ALLOC_FRAGMENT_OBJECTS; i++) {
+			if (blocks[i] != NULL) {
+				memfs_allocator_free(&allocator, blocks[i], 512U);
+				blocks[i] = NULL;
+			}
+		}
+		for (i = 0; i < BENCH_ALLOC_FRAGMENT_REFILL_OBJECTS; i++) {
+			if (refill[i] != NULL) {
+				memfs_allocator_free(&allocator, refill[i], 512U);
+				refill[i] = NULL;
+			}
+		}
+		memfs_allocator_get_stats(&allocator, &released);
+		print_alloc_fragment_stats("512-free", round, &released);
+		if (!alloc_fragment_back_to_baseline(&released, &baseline)) {
+			fprintf(stderr, "allocator 512B free did not return to baseline round=%u\n", round);
+			rc = 1;
+			goto cleanup;
+		}
+
+		for (i = 0; i < BENCH_ALLOC_MIXED_COUNT; i++) {
+			size_t size = g_bench_alloc_mixed_sizes[i];
+			size_t touch = size < 16U ? size : 16U;
+			mixed[i] = memfs_allocator_alloc(&allocator, size);
+			if (mixed[i] == NULL) {
+				fprintf(stderr, "allocator mixed alloc failed round=%u index=%u size=%llu\n",
+						round, i, (unsigned long long)size);
+				rc = 1;
+				goto cleanup;
+			}
+			memset(mixed[i], (int)(0x40U + i), touch);
+		}
+		memfs_allocator_get_stats(&allocator, &mixed_full);
+		print_alloc_fragment_stats("mixed-full", round, &mixed_full);
+		if (mixed_full.physical_bytes != mixed_full.committed_bytes) {
+			fprintf(stderr, "allocator mixed physical/committed mismatch round=%u\n", round);
+			rc = 1;
+			goto cleanup;
+		}
+		if (round == 0U) {
+			first_mixed_full = mixed_full;
+		} else if (!alloc_fragment_same_high_water(&mixed_full, &first_mixed_full)) {
+			fprintf(stderr, "allocator mixed high-water drift round=%u\n", round);
+			rc = 1;
+			goto cleanup;
+		}
+
+		for (i = 0; i < BENCH_ALLOC_MIXED_COUNT; i++) {
+			if (mixed[i] != NULL) {
+				memfs_allocator_free(&allocator, mixed[i], g_bench_alloc_mixed_sizes[i]);
+				mixed[i] = NULL;
+			}
+		}
+		memfs_allocator_get_stats(&allocator, &mixed_released);
+		print_alloc_fragment_stats("mixed-free", round, &mixed_released);
+		if (!alloc_fragment_back_to_baseline(&mixed_released, &baseline)) {
+			fprintf(stderr, "allocator mixed free did not return to baseline round=%u\n", round);
+			rc = 1;
+			goto cleanup;
+		}
+	}
+
+cleanup:
+	for (i = 0; i < BENCH_ALLOC_FRAGMENT_OBJECTS; i++) {
+		if (blocks[i] != NULL) {
+			memfs_allocator_free(&allocator, blocks[i], 512U);
+			blocks[i] = NULL;
+		}
+	}
+	for (i = 0; i < BENCH_ALLOC_FRAGMENT_REFILL_OBJECTS; i++) {
+		if (refill[i] != NULL) {
+			memfs_allocator_free(&allocator, refill[i], 512U);
+			refill[i] = NULL;
+		}
+	}
+	for (i = 0; i < BENCH_ALLOC_MIXED_COUNT; i++) {
+		if (mixed[i] != NULL) {
+			memfs_allocator_free(&allocator, mixed[i], g_bench_alloc_mixed_sizes[i]);
+			mixed[i] = NULL;
+		}
+	}
+
+	memfs_allocator_destroy(&allocator);
+	printf("allocator fragmentation/reuse: %s\n", rc == 0 ? "pass" : "FAIL");
+	return rc;
+}
+
 static int run_suite(const BenchConfig* config, const char* label, LARGE_INTEGER frequency, BenchResult* results) {
 	Memfs* fs = NULL;
 	uint64_t private_before;
@@ -996,6 +1216,11 @@ static int run_suite(const BenchConfig* config, const char* label, LARGE_INTEGER
 	}
 
 	rc = bench_auto_capacity_status(frequency);
+	if (rc != 0) {
+		return rc;
+	}
+
+	rc = bench_allocator_fragmentation_reuse();
 	if (rc != 0) {
 		return rc;
 	}
@@ -1145,6 +1370,7 @@ static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* co
 
 	return 0;
 }
+/* repair: no code change required; verification-only task */
 int main(int argc, char** argv) {
 	LARGE_INTEGER frequency;
 	BenchConfig plain;
