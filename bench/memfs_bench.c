@@ -383,6 +383,160 @@ static int bench_large_dir(Memfs* fs, uint32_t count, LARGE_INTEGER frequency, B
 	return 0;
 }
 #define BENCH_SWEEP_FILE_COUNT 10000U
+#define BENCH_HIGH_OFFSET_1GB (1ULL << 30)
+#define BENCH_HIGH_OFFSET_64GB (64ULL << 30)
+#define BENCH_HIGH_OFFSET_1GB_COUNT 1000U
+#define BENCH_HIGH_OFFSET_64GB_COUNT 100U
+
+static int bench_high_offset_sparse(Memfs* fs, LARGE_INTEGER frequency) {
+	uint8_t page[BENCH_4KB_SIZE];
+	uint64_t offsets[2] = {BENCH_HIGH_OFFSET_1GB, BENCH_HIGH_OFFSET_64GB};
+	uint32_t counts[2] = {BENCH_HIGH_OFFSET_1GB_COUNT, BENCH_HIGH_OFFSET_64GB_COUNT};
+	const char* labels[2] = {"1GiB", "64GiB"};
+	uint32_t o;
+
+	memset(page, 0x5a, sizeof(page));
+
+	printf("\n[high offset sparse single-page write]\n");
+	printf("pattern:          create file, write 4KB at logical offset, close, unlink\n");
+	printf("expectation:      page_group_count=1 per file if high offset does not allocate dense intermediate tables\n");
+
+	for (o = 0; o < 2; o++) {
+		Memfs* target_fs = fs;
+		Memfs* temp_fs = NULL;
+		uint64_t offset = offsets[o];
+		uint32_t count = counts[o];
+		uint64_t private_before;
+		uint64_t private_after;
+		uint64_t used_before;
+		uint64_t used_after;
+		uint64_t resident_before;
+		uint64_t resident_after;
+		MemfsAllocatorStats alloc_before;
+		MemfsAllocatorStats alloc_after;
+		LARGE_INTEGER start;
+		LARGE_INTEGER end;
+		double create_seconds;
+		uint32_t i;
+		wchar_t name[32];
+		uint32_t last_group_count = 0;
+		uint32_t last_group_capacity = 0;
+		uint64_t last_group_index = 0;
+		uint64_t last_node_resident = 0;
+		int rc = 0;
+
+		if (o == 1) {
+			MemfsOptions options;
+			memset(&options, 0, sizeof(options));
+			options.capacity = 128ULL * 1024ULL * 1024ULL * 1024ULL;
+			options.volume_label = L"BENCH_HIGH_OFFSET";
+			rc = memfs_create_ex(&options, &temp_fs);
+			if (rc != MEMFS_OK) {
+				fprintf(stderr, "high offset 64GiB temp fs create failed rc=%d\n", rc);
+				return 1;
+			}
+			target_fs = temp_fs;
+		}
+
+		printf("\n[high offset %s]\n", labels[o]);
+		printf("files:            %u\n", count);
+		printf("logical offset:   %llu B\n", (unsigned long long)offset);
+		printf("write size:       %u B\n", BENCH_4KB_SIZE);
+		printf("capacity:         %llu B\n", (unsigned long long)target_fs->capacity);
+
+		private_before = private_bytes();
+		used_before = target_fs->used_bytes;
+		resident_before = target_fs->resident_bytes;
+		memfs_allocator_get_stats(&target_fs->allocator, &alloc_before);
+
+		QueryPerformanceCounter(&start);
+		for (i = 0; i < count; i++) {
+			MemfsNode* node = NULL;
+			uint32_t written = 0;
+			swprintf_s(name, _countof(name), L"ho%07u", i);
+			if (memfs_node_create(target_fs, target_fs->root, name, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) !=
+				MEMFS_OK) {
+				rc = 1;
+				break;
+			}
+			if (memfs_node_write(node, page, offset, BENCH_4KB_SIZE, false, false, &written) != MEMFS_OK ||
+				written != BENCH_4KB_SIZE) {
+				memfs_node_close(node);
+				rc = 1;
+				break;
+			}
+			last_group_count = memfs_node_page_group_count(node);
+			last_group_capacity = memfs_node_page_group_capacity(node);
+			last_group_index = last_group_count > 0 ? memfs_node_page_group_index(node, 0) : 0;
+			last_node_resident = memfs_node_resident_bytes(node);
+			memfs_node_close(node);
+		}
+		QueryPerformanceCounter(&end);
+		create_seconds = seconds_between(start, end, frequency);
+
+		private_after = private_bytes();
+		used_after = target_fs->used_bytes;
+		resident_after = target_fs->resident_bytes;
+		memfs_allocator_get_stats(&target_fs->allocator, &alloc_after);
+
+		printf("%-12s %10.3f s  %12.0f ops/s\n", "create+4KB", create_seconds,
+			   create_seconds > 0.0 ? (double)count / create_seconds : 0.0);
+		printf("last page_group_count=%u page_group_capacity=%u first_group_index=%llu node_resident=%llu B\n",
+			   last_group_count, last_group_capacity, (unsigned long long)last_group_index,
+			   (unsigned long long)last_node_resident);
+		printf("after-create used_bytes=%llu resident_bytes=%llu\n", (unsigned long long)used_after,
+			   (unsigned long long)resident_after);
+		printf("used delta:         %llu B resident delta: %llu B\n",
+			   (unsigned long long)(used_after - used_before),
+			   (unsigned long long)(resident_after - resident_before));
+		printf("private delta:      %llu B (%.2f MiB)\n", (unsigned long long)(private_after - private_before),
+			   (double)(private_after - private_before) / (1024.0 * 1024.0));
+		printf("alloc reserved delta=%llu B live delta=%llu B live_objects delta=%llu\n",
+			   (unsigned long long)(alloc_after.reserved_bytes - alloc_before.reserved_bytes),
+			   (unsigned long long)(alloc_after.live_bytes - alloc_before.live_bytes),
+			   (unsigned long long)(alloc_after.live_objects - alloc_before.live_objects));
+
+		if (rc == 0) {
+			QueryPerformanceCounter(&start);
+			for (i = 0; i < count; i++) {
+				MemfsNode* node;
+				swprintf_s(name, _countof(name), L"ho%07u", i);
+				node = memfs_dir_lookup(target_fs->root, name);
+				if (node == NULL || memfs_node_unlink(node) != MEMFS_OK) {
+					rc = 1;
+					break;
+				}
+			}
+			QueryPerformanceCounter(&end);
+			print_rate("delete", count, seconds_between(start, end, frequency));
+		}
+
+		private_after = private_bytes();
+		used_after = target_fs->used_bytes;
+		resident_after = target_fs->resident_bytes;
+		memfs_allocator_get_stats(&target_fs->allocator, &alloc_after);
+		printf("after-delete used_bytes=%llu resident_bytes=%llu\n", (unsigned long long)used_after,
+			   (unsigned long long)resident_after);
+		printf("used delta total:   %llu B resident delta total: %llu B\n",
+			   (unsigned long long)(used_after - used_before),
+			   (unsigned long long)(resident_after - resident_before));
+		printf("private delta total=%llu B (%.2f MiB)\n", (unsigned long long)(private_after - private_before),
+			   (double)(private_after - private_before) / (1024.0 * 1024.0));
+		printf("alloc reserved delta=%llu B live delta=%llu B live_objects delta=%llu\n",
+			   (unsigned long long)(alloc_after.reserved_bytes - alloc_before.reserved_bytes),
+			   (unsigned long long)(alloc_after.live_bytes - alloc_before.live_bytes),
+			   (unsigned long long)(alloc_after.live_objects - alloc_before.live_objects));
+
+		if (temp_fs != NULL) {
+			memfs_destroy(temp_fs);
+		}
+		if (rc != 0) {
+			return rc;
+		}
+	}
+
+	return 0;
+}
 static int bench_small_size_sweep(Memfs* fs, uint32_t count, LARGE_INTEGER frequency) {
 	static const uint32_t sizes[6] = {0U, 1U, 8U, 9U, 64U, 4096U};
 	uint8_t payload[BENCH_4KB_SIZE];
@@ -527,6 +681,11 @@ static int run_suite(const BenchConfig* config, const char* label, LARGE_INTEGER
 				return rc;
 			}
 		}
+	}
+
+	rc = bench_high_offset_sparse(fs, frequency);
+	if (rc != 0) {
+		return rc;
 	}
 
 	private_after = private_bytes();
