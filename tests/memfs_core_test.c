@@ -2631,6 +2631,99 @@ static void test_storage_state_invariants(void) {
 	memfs_destroy(fs);
 }
 
+static void test_path_name_boundaries(void) {
+	Memfs* fs = NULL;
+	MemfsNode* dir;
+	MemfsNode* file;
+	MemfsNode* node;
+	MemfsNode* found;
+	MemfsNode* parent;
+	wchar_t name[MEMFS_MAX_NAME + 1];
+	wchar_t max_name[MEMFS_MAX_NAME + 1];
+	wchar_t variant[MEMFS_MAX_NAME + 1];
+	wchar_t too_long[MEMFS_MAX_NAME + 2];
+	wchar_t path[MEMFS_MAX_NAME + 4];
+	uint32_t i;
+
+	printf("== path / name boundaries ==\n");
+
+	CHECK(memfs_create(16 * 1024 * 1024ULL, L"BOUND", &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	CHECK(memfs_node_create(fs, fs->root, L"Dir", true, FILE_ATTRIBUTE_DIRECTORY, NULL, 0, &dir) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, dir, L"file.txt", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(dir != NULL);
+	CHECK(file != NULL);
+	if (fs == NULL || dir == NULL || file == NULL) {
+		if (fs)
+			memfs_destroy(fs);
+		return;
+	}
+
+	for (i = 0; i < MEMFS_MAX_NAME; i++)
+		max_name[i] = L'A';
+	max_name[MEMFS_MAX_NAME] = L'\0';
+	CHECK(memfs_node_create(fs, fs->root, max_name, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) == MEMFS_OK);
+	CHECK(node != NULL);
+	CHECK(memfs_dir_lookup(fs->root, max_name) == node);
+	memcpy(variant, max_name, sizeof(variant));
+	variant[0] = L'a';
+	CHECK(memfs_dir_lookup(fs->root, variant) == node);
+	CHECK(memfs_node_unlink(node) == MEMFS_OK);
+	memfs_node_close(node);
+
+	for (i = 0; i < MEMFS_MAX_NAME + 1U; i++)
+		too_long[i] = L'B';
+	too_long[MEMFS_MAX_NAME + 1U] = L'\0';
+	CHECK(memfs_node_create(fs, fs->root, too_long, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) == MEMFS_OK);
+	CHECK(node != NULL);
+	CHECK(memfs_node_unlink(node) == MEMFS_OK);
+	memfs_node_close(node);
+	path[0] = L'\\';
+	memcpy(path + 1, too_long, (MEMFS_MAX_NAME + 1U) * sizeof(wchar_t));
+	path[MEMFS_MAX_NAME + 2U] = L'\0';
+	CHECK(memfs_lookup_path(fs, path, &found) == MEMFS_ERR_INVALID);
+	CHECK(found == NULL);
+	CHECK(memfs_lookup_parent(fs, path, &parent, name) == MEMFS_ERR_INVALID);
+	CHECK(parent == NULL);
+
+	CHECK(memfs_lookup_path(fs, L"\\", &found) == MEMFS_OK);
+	CHECK(found == fs->root);
+	CHECK(memfs_lookup_path(fs, L"\\\\", &found) == MEMFS_OK);
+	CHECK(found == fs->root);
+
+	CHECK(memfs_lookup_path(fs, L"\\Dir\\", &found) == MEMFS_OK);
+	CHECK(found == dir);
+	CHECK(memfs_lookup_path(fs, L"\\Dir\\file.txt\\", &found) == MEMFS_OK);
+	CHECK(found == file);
+	CHECK(memfs_lookup_parent(fs, L"\\Dir\\new.txt\\", &parent, name) == MEMFS_OK);
+	CHECK(parent == dir);
+	CHECK(wcscmp(name, L"new.txt") == 0);
+
+	CHECK(memfs_lookup_path(fs, L"\\DIR\\FILE.TXT", &found) == MEMFS_OK);
+	CHECK(found == file);
+	CHECK(memfs_lookup_parent(fs, L"\\DIR\\NEW.TXT", &parent, name) == MEMFS_OK);
+	CHECK(parent == dir);
+	CHECK(wcscmp(name, L"NEW.TXT") == 0);
+
+	CHECK(memfs_node_create(fs, file, L"child", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) == MEMFS_ERR_INVALID);
+	CHECK(memfs_lookup_parent(fs, L"\\file.txt\\child", &parent, name) == MEMFS_ERR_PATH_NOT_FOUND);
+	CHECK(memfs_lookup_parent(fs, L"\\Missing\\child", &parent, name) == MEMFS_ERR_PATH_NOT_FOUND);
+	CHECK(memfs_lookup_parent(fs, L"\\Dir\\", &parent, name) == MEMFS_OK);
+	CHECK(parent == fs->root);
+	CHECK(wcscmp(name, L"Dir") == 0);
+	CHECK(memfs_lookup_parent(fs, L"\\Dir\\.", &parent, name) == MEMFS_ERR_INVALID);
+	CHECK(memfs_lookup_parent(fs, L"\\Dir\\..", &parent, name) == MEMFS_ERR_INVALID);
+	CHECK(memfs_lookup_path(fs, L"Dir\\file.txt", &found) == MEMFS_ERR_INVALID);
+	CHECK(memfs_lookup_path(fs, L"\\Dir\\Missing", &found) == MEMFS_ERR_NOT_FOUND);
+	CHECK(memfs_lookup_path(fs, L"\\file.txt\\child", &found) == MEMFS_ERR_NOT_FOUND);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	CHECK(memfs_node_unlink(dir) == MEMFS_OK);
+	memfs_node_close(dir);
+	memfs_destroy(fs);
+}
+
 static void test_constrained_io_eof_bounds(void) {
 	Memfs* fs = NULL;
 	MemfsNode* file;
@@ -2736,7 +2829,9 @@ int main(void) {
 	test_winfsp_open_rename_replace_delete_close_order();
 	test_rename_replace_open_target_lifetime();
 	test_winfsp_directory_open_rename_delete_close_order();
-	test_winfsp_open_delete_recreate_close_order();	test_constrained_io_eof_bounds();
+	test_winfsp_open_delete_recreate_close_order();
+	test_constrained_io_eof_bounds();
+	test_path_name_boundaries();
 
 
 	printf("\nchecks=%d failures=%d => %s\n", g_checks, g_failures, g_failures ? "FAIL" : "PASS");
