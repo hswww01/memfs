@@ -107,6 +107,9 @@ static const size_t g_class_sizes[MEMFS_ALLOC_CLASS_COUNT] = {
     384U, 512U, 768U, 1024U, 1536U, 2048U, 3072U, 4096U, 8192U
 };
 
+static INIT_ONCE g_control_allocator_once = INIT_ONCE_STATIC_INIT;
+static MemfsAllocator g_control_allocator;
+
 #if !defined(NDEBUG)
 static volatile LONG g_memfs_alloc_fail_point = MEMFS_ALLOC_FAIL_NONE;
 static volatile LONG g_memfs_alloc_fail_skip;
@@ -1077,22 +1080,42 @@ uint64_t memfs_allocator_scavenge(MemfsAllocator* allocator) {
     return released;
 }
 
-void* memfs_allocator_alloc_control(size_t bytes) {
+static BOOL CALLBACK control_allocator_init_once(PINIT_ONCE once,
+                                                 PVOID parameter,
+                                                 PVOID* context) {
+    (void)once;
+    (void)parameter;
+    (void)context;
+
     /*
-     * Bootstrap owner allocation.
-     *
-     * Memfs itself must exist before its per-filesystem allocator can be
-     * initialized. Creating a complete 19-class x 8-shard allocator merely to
-     * allocate this single long-lived ~256-byte owner costs more metadata than
-     * the object. Keep the allocation behind the allocator API, but use one
-     * minimal VM region for this bootstrap singleton.
+     * The control allocator is process-wide and exists only to allocate
+     * objects that precede a per-filesystem allocator (currently Memfs).
+     * It uses the exact same size-class/slab/area machinery as every other
+     * allocation; the dummy typed sizes are never used by this path.
      */
-    if (bytes == 0)
+    return memfs_allocator_init(&g_control_allocator, 1U, 1U, 1U)
+        ? TRUE
+        : FALSE;
+}
+
+static bool control_allocator_ready(void) {
+    return !!InitOnceExecuteOnce(&g_control_allocator_once,
+                                 control_allocator_init_once,
+                                 NULL,
+                                 NULL);
+}
+
+
+void* memfs_allocator_alloc_control(size_t bytes) {
+    if (bytes == 0 || !control_allocator_ready())
         return NULL;
-    return memfs_vm_reserve_commit(bytes);
+    return allocator_alloc_internal(&g_control_allocator, bytes);
 }
 
 void memfs_allocator_free_control(void* ptr, size_t bytes) {
-    (void)bytes;
-    memfs_vm_release(ptr);
+    if (ptr == NULL)
+        return;
+    if (!control_allocator_ready())
+        return;
+    allocator_free_internal(&g_control_allocator, ptr, bytes);
 }

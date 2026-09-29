@@ -3930,20 +3930,40 @@ cleanup:
 
 static void test_allocator_bootstrap_control(void) {
 	uint8_t* control;
+	uint8_t* control2;
+	MEMORY_BASIC_INFORMATION info1;
+	MEMORY_BASIC_INFORMATION info2;
 	uint32_t i;
 
 	printf("== allocator bootstrap control ==\n");
 
 	CHECK(memfs_allocator_alloc_control(0) == NULL);
-	control = (uint8_t*)memfs_allocator_alloc_control(sizeof(Memfs));
-	CHECK(control != NULL);
-	if (control == NULL)
-		return;
+	CHECK(sizeof(Memfs) <= MEMFS_ALLOC_AREA_THRESHOLD);
 
-	for (i = 0; i < sizeof(Memfs); ++i)
+	control = (uint8_t*)memfs_allocator_alloc_control(sizeof(Memfs));
+	control2 = (uint8_t*)memfs_allocator_alloc_control(sizeof(Memfs));
+	CHECK(control != NULL);
+	CHECK(control2 != NULL);
+	if (control == NULL || control2 == NULL) {
+		memfs_allocator_free_control(control, sizeof(Memfs));
+		memfs_allocator_free_control(control2, sizeof(Memfs));
+		return;
+	}
+
+	for (i = 0; i < sizeof(Memfs); ++i) {
 		CHECK(control[i] == 0);
+		CHECK(control2[i] == 0);
+	}
+
+	memset(&info1, 0, sizeof(info1));
+	memset(&info2, 0, sizeof(info2));
+	CHECK(VirtualQuery(control, &info1, sizeof(info1)) == sizeof(info1));
+	CHECK(VirtualQuery(control2, &info2, sizeof(info2)) == sizeof(info2));
+	CHECK(info1.AllocationBase == info2.AllocationBase);
 
 	memset(control, 0xA5, sizeof(Memfs));
+	memset(control2, 0x5A, sizeof(Memfs));
+	memfs_allocator_free_control(control2, sizeof(Memfs));
 	memfs_allocator_free_control(control, sizeof(Memfs));
 	memfs_allocator_free_control(NULL, sizeof(Memfs));
 }

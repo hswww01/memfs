@@ -30,6 +30,8 @@ All file-system contents are volatile. Unmounting or terminating the process los
 
 The vcpkg manifest installs `zstd` and `libsodium`. The supplied presets statically link the WinFsp user-mode runtime built from `D:\\src\\winfsp`, so `memfs.exe` does not require `winfsp-x64.dll` at runtime. The WinFsp kernel driver is embedded as an EXE resource from the configured SxS driver path; if no compatible WinFsp driver is already available, memfs can install and start the embedded driver when run elevated.
 
+When `MEMFS_STATIC_WINFSP=ON`, CTest also parses the built PE import and delay-import tables and fails if any `winfsp*.dll` dependency reappears.
+
 ## Build
 
 ```powershell
@@ -185,7 +187,7 @@ With encryption enabled a 1-byte file uses 33 bytes of tracked encoded storage: 
 resident_bytes tracks encoded data blobs/pages and intentionally excludes host allocator bookkeeping and namespace metadata.
 ### Allocator v2 and auto capacity
 
-The allocator v2 backend is size-class based rather than object-type based. Node, directory, page-group, name and generic allocation APIs all converge on the same rounded-size class, so there is only one physical pool for a given class. Small allocations use adaptive slab backing (4 KiB / 8 KiB / 16 KiB / 32 KiB / 64 KiB according to object size); allocations above the small-object threshold use area allocations. `reserved_bytes` is address-space reservation only; `committed_bytes` is the real OS-backed committed memory, and `physical_bytes` is an alias for `committed_bytes`, not a separate source. `live_bytes` is the caller-visible payload/object bytes currently allocated.
+The allocator v2 backend is size-class based rather than object-type based. Node, directory, page-group, name and generic allocation APIs all converge on the same rounded-size class, so there is only one physical pool for a given class. The process-wide control allocation used for `Memfs` itself goes through the same size-class/slab/area machinery; only allocator-state bootstrap reaches the VM backend directly. Small allocations use adaptive slab backing (4 KiB / 8 KiB / 16 KiB / 32 KiB / 64 KiB according to object size); allocations above the small-object threshold use area allocations. `reserved_bytes` is address-space reservation only; `committed_bytes` is the real OS-backed committed memory, and `physical_bytes` is an alias for `committed_bytes`, not a separate source. `live_bytes` is the caller-visible payload/object bytes currently allocated.
 
 `capacity_auto=true` makes memfs derive its writable allowance from current system memory and allocator backing instead of using a fixed user capacity. `memfs_auto_allowance_bytes()` reports the current allowance, while `used_bytes`, `resident_bytes`, `committed_bytes` and `physical_bytes` remain separate measurements: logical quota, resident payload, and allocator physical backing. The benchmark reports these separately so high-water checks do not confuse allocator backing with logical file usage.
 
@@ -261,26 +263,6 @@ The core test suite includes concurrent writes to multiple files with compressio
 ## Handle lifetime and deletion
 
 WinFsp uses the node pointer as `FileContext`. Open/create increments the node's open count. Delete-on-cleanup removes the node from the namespace, but the node remains alive until the final close.
-
-## Long-run memory drift soak
-
-`memfs_soak_bench` runs a mixed core workload with compression and encryption enabled. Each cycle covers tiny-file create/read/rename/unlink, a 256 KiB large-file write with truncate/regrow and zero-fill verification, and a 64 MiB high-offset sparse write/read/truncate/regrow. Every sample reports logical/resident bytes, allocator live/reserved/committed/physical bytes, process private bytes, slab/area/cache counts, and the final summary reports linear private/committed drift slopes.
-
-The default mode is intentionally short for CI:
-
-```powershell
-.\build\x64-release\memfs_soak_bench.exe
-.\build\x64-release\memfs_soak_bench.exe --seconds 10 --sample-ms 1000
-```
-
-Long soak mode is explicit and accepts 10 through 60 minutes:
-
-```powershell
-.\build\x64-release\memfs_soak_bench.exe --soak 10
-.\build\x64-release\memfs_soak_bench.exe --soak 60 --sample-ms 5000
-```
-
-Before measurement the benchmark warms all workload shapes and codec/crypto paths. At exit it scavenges allocator caches and requires logical used, resident, allocator live objects/bytes, reserved, committed, physical, slab and area state to return to the post-warmup baseline. The private-byte slope is reported separately because Windows/runtime libraries may retain process-private bookkeeping that is not memfs allocator backing.
 
 ## Long-run memory drift soak
 

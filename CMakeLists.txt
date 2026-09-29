@@ -252,6 +252,11 @@ add_executable(memfs_driver_test
 	tests/memfs_driver_test.c
 	src/memfs_driver.c)
 
+if(MEMFS_STATIC_WINFSP)
+	add_executable(memfs_static_import_test
+		tests/memfs_static_import_test.c)
+endif()
+
 target_include_directories(memfs_driver_test
 	PRIVATE
 		${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -349,6 +354,11 @@ set_tests_properties(memfs_no_crt_heap_guard_bad_fixture PROPERTIES
 	WILL_FAIL TRUE)
 
 add_test(NAME memfs_driver_test COMMAND memfs_driver_test)
+
+if(MEMFS_STATIC_WINFSP)
+	add_test(NAME memfs_static_winfsp_no_dll_import
+		COMMAND memfs_static_import_test $<TARGET_FILE:memfs>)
+endif()
 
 add_test(NAME memfs_cli_help COMMAND memfs --help)
 
