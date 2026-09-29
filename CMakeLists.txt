@@ -103,6 +103,13 @@ target_link_libraries(memfs_core_test
 	PRIVATE
 		memfs_core)
 
+add_executable(memfs_no_crt_heap_guard
+	tests/memfs_no_crt_heap_guard.c)
+
+target_compile_definitions(memfs_no_crt_heap_guard
+	PRIVATE
+		_CRT_SECURE_NO_WARNINGS)
+
 add_executable(memfs_bench
 	bench/memfs_bench.c)
 
@@ -112,7 +119,7 @@ target_link_libraries(memfs_bench
 		psapi)
 
 if(MSVC)
-	foreach(target memfs_core memfs memfs_core_test memfs_bench)
+	foreach(target memfs_core memfs memfs_core_test memfs_bench memfs_no_crt_heap_guard)
 		target_compile_options(${target}
 			PRIVATE
 				/W4
@@ -132,5 +139,8 @@ if(WINFSP_RUNTIME)
 endif()
 
 add_test(NAME memfs_core_test COMMAND memfs_core_test)
+
+add_test(NAME memfs_no_crt_heap_guard COMMAND memfs_no_crt_heap_guard)
+set_tests_properties(memfs_no_crt_heap_guard PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 install(TARGETS memfs RUNTIME DESTINATION bin)

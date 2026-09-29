@@ -556,6 +556,7 @@ static const FSP_FILE_SYSTEM_INTERFACE g_memfs_interface = {
 NTSTATUS memfs_winfsp_create(const MemfsOptions* options, MemfsWinFsp** out_instance) {
 	FSP_FSCTL_VOLUME_PARAMS volume_params;
 	MemfsWinFsp* instance;
+	Memfs* instance_store;
 	MemfsResult result;
 	NTSTATUS status;
 
@@ -564,15 +565,16 @@ NTSTATUS memfs_winfsp_create(const MemfsOptions* options, MemfsWinFsp** out_inst
 
 	*out_instance = NULL;
 
-	instance = calloc(1, sizeof(*instance));
-	if (instance == NULL)
-		return STATUS_INSUFFICIENT_RESOURCES;
-
-	result = memfs_create_ex(options, &instance->store);
-	if (result != MEMFS_OK) {
-		free(instance);
+	result = memfs_create_ex(options, &instance_store);
+	if (result != MEMFS_OK)
 		return memfs_status(result);
+
+	instance = memfs_allocator_alloc_zero(&instance_store->allocator, sizeof(*instance));
+	if (instance == NULL) {
+		memfs_destroy(instance_store);
+		return STATUS_INSUFFICIENT_RESOURCES;
 	}
+	instance->store = instance_store;
 
 	memset(&volume_params, 0, sizeof(volume_params));
 	volume_params.Version = sizeof(volume_params);
@@ -597,8 +599,8 @@ NTSTATUS memfs_winfsp_create(const MemfsOptions* options, MemfsWinFsp** out_inst
 	status =
 		FspFileSystemCreate(L"" FSP_FSCTL_DISK_DEVICE_NAME, &volume_params, &g_memfs_interface, &instance->file_system);
 	if (!NT_SUCCESS(status)) {
+		memfs_allocator_free(&instance->store->allocator, instance, sizeof(*instance));
 		memfs_destroy(instance->store);
-		free(instance);
 		return status;
 	}
 
@@ -635,6 +637,6 @@ void memfs_winfsp_destroy(MemfsWinFsp* instance) {
 	if (instance->file_system)
 		FspFileSystemDelete(instance->file_system);
 
+	memfs_allocator_free(&instance->store->allocator, instance, sizeof(*instance));
 	memfs_destroy(instance->store);
-	free(instance);
 }
