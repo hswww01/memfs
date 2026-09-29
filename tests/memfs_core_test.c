@@ -2117,7 +2117,7 @@ static void test_allocator_name_pool_boundaries(void) {
 
 	CHECK(memfs_allocator_init(&allocator, 64, 64, 64));
 	memfs_allocator_get_stats(&allocator, &before);
-	CHECK(before.reserved_bytes == 0);
+	CHECK(before.reserved_bytes > 0);
 	CHECK(before.live_objects == 0);
 
 	max_name = memfs_allocator_alloc_name(&allocator, (MEMFS_MAX_NAME + 1U) * sizeof(wchar_t));
@@ -2158,6 +2158,192 @@ static void test_allocator_name_pool_boundaries(void) {
 		CHECK(memfs_allocator_init(&allocator, 64, 64, 64));
 		memfs_allocator_destroy(&allocator);
 	}
+}
+
+
+static void test_allocator_generic_size_classes(void) {
+	MemfsAllocator allocator;
+	MemfsAllocatorStats before;
+	MemfsAllocatorStats during;
+	MemfsAllocatorStats after;
+	uint8_t* same;
+	uint8_t* grown;
+	uint8_t* dedicated;
+	uint8_t* zeroed;
+	uint8_t* failed;
+	size_t i;
+	static const size_t sizes[] = {
+		1U, 8U, 9U, 32U, 33U, 512U, 513U, 4096U, 32768U
+	};
+	void* blocks[_countof(sizes)] = {0};
+
+	printf("== allocator generic size classes ==\n");
+
+	CHECK(memfs_allocator_init(&allocator, 64, 64, 64));
+	memfs_allocator_get_stats(&allocator, &before);
+
+	for (i = 0; i < _countof(sizes); i++) {
+		blocks[i] = memfs_allocator_alloc(&allocator, sizes[i]);
+		CHECK(blocks[i] != NULL);
+		if (blocks[i])
+			memset(blocks[i], (int)(0x20U + i), sizes[i]);
+	}
+
+	zeroed = memfs_allocator_alloc_zero(&allocator, 257U);
+	CHECK(zeroed != NULL);
+	if (zeroed) {
+		for (i = 0; i < 257U; i++)
+			CHECK(zeroed[i] == 0);
+		memfs_allocator_free(&allocator, zeroed, 257U);
+	}
+
+	same = memfs_allocator_alloc(&allocator, 100U);
+	CHECK(same != NULL);
+	if (same) {
+		memset(same, 0x5a, 100U);
+		grown = memfs_allocator_realloc(&allocator, same, 100U, 120U);
+		CHECK(grown == same);
+		if (grown) {
+			for (i = 0; i < 100U; i++)
+				CHECK(grown[i] == 0x5a);
+			same = grown;
+		}
+
+		grown = memfs_allocator_realloc(&allocator, same, 120U, 300U);
+		CHECK(grown != NULL);
+		if (grown) {
+			for (i = 0; i < 100U; i++)
+				CHECK(grown[i] == 0x5a);
+			same = grown;
+		}
+
+		dedicated = memfs_allocator_realloc(&allocator, same, 300U, 65536U);
+		CHECK(dedicated != NULL);
+		if (dedicated) {
+			for (i = 0; i < 100U; i++)
+				CHECK(dedicated[i] == 0x5a);
+			same = dedicated;
+		}
+
+		grown = memfs_allocator_realloc(&allocator, same, 65536U, 64U);
+		CHECK(grown != NULL);
+		if (grown) {
+			for (i = 0; i < 64U; i++)
+				CHECK(grown[i] == 0x5a);
+			same = grown;
+		}
+
+		failed = memfs_allocator_realloc(&allocator, same, 64U, SIZE_MAX);
+		CHECK(failed == NULL);
+		for (i = 0; i < 64U; i++)
+			CHECK(same[i] == 0x5a);
+		memfs_allocator_free(&allocator, same, 64U);
+	}
+
+	dedicated = memfs_allocator_alloc(&allocator, 65536U);
+	CHECK(dedicated != NULL);
+	memfs_allocator_get_stats(&allocator, &during);
+	CHECK(during.dedicated_count >= 1U);
+	CHECK(during.dedicated_live_bytes >= 65536U);
+	CHECK(during.dedicated_reserved_bytes >= during.dedicated_live_bytes);
+	CHECK(during.reserved_bytes >= during.dedicated_reserved_bytes);
+	if (dedicated)
+		memfs_allocator_free(&allocator, dedicated, 65536U);
+
+	for (i = 0; i < _countof(sizes); i++) {
+		if (blocks[i])
+			memfs_allocator_free(&allocator, blocks[i], sizes[i]);
+	}
+
+	memfs_allocator_get_stats(&allocator, &after);
+	CHECK(after.live_objects == before.live_objects);
+	CHECK(after.dedicated_count == 0U);
+	CHECK(after.dedicated_live_bytes == 0U);
+	CHECK(after.dedicated_reserved_bytes == 0U);
+	CHECK(after.reserved_bytes == before.reserved_bytes);
+
+	memfs_allocator_destroy(&allocator);
+}
+
+
+typedef struct AllocatorThreadArg {
+	MemfsAllocator* allocator;
+	uint32_t thread_id;
+	uint32_t failures;
+} AllocatorThreadArg;
+
+static DWORD WINAPI allocator_generic_thread(void* parameter) {
+	AllocatorThreadArg* arg = parameter;
+	static const size_t sizes[] = {8U, 33U, 513U, 4096U, 20000U, 40000U};
+	uint32_t round;
+
+	for (round = 0; round < 1500U; round++) {
+		size_t size = sizes[(round + arg->thread_id) % _countof(sizes)];
+		size_t next_size = size > 32768U ? 128U : size * 2U + 1U;
+		size_t verify = size < next_size ? size : next_size;
+		uint8_t value = (uint8_t)(0x31U + arg->thread_id);
+		uint8_t* ptr = memfs_allocator_alloc(arg->allocator, size);
+		uint8_t* next;
+		size_t i;
+
+		if (ptr == NULL) {
+			arg->failures++;
+			continue;
+		}
+
+		verify = verify < 64U ? verify : 64U;
+		memset(ptr, value, verify);
+		next = memfs_allocator_realloc(arg->allocator, ptr, size, next_size);
+		if (next == NULL) {
+			arg->failures++;
+			memfs_allocator_free(arg->allocator, ptr, size);
+			continue;
+		}
+
+		for (i = 0; i < verify; i++) {
+			if (next[i] != value) {
+				arg->failures++;
+				break;
+			}
+		}
+		memfs_allocator_free(arg->allocator, next, next_size);
+	}
+
+	return 0;
+}
+
+static void test_allocator_generic_concurrency(void) {
+	enum { THREADS = 4 };
+	MemfsAllocator allocator;
+	MemfsAllocatorStats before;
+	MemfsAllocatorStats after;
+	AllocatorThreadArg args[THREADS] = {0};
+	HANDLE threads[THREADS] = {0};
+	uint32_t i;
+
+	printf("== allocator generic concurrency ==\n");
+	CHECK(memfs_allocator_init(&allocator, 64, 64, 64));
+	memfs_allocator_get_stats(&allocator, &before);
+
+	for (i = 0; i < THREADS; i++) {
+		args[i].allocator = &allocator;
+		args[i].thread_id = i;
+		threads[i] = CreateThread(NULL, 0, allocator_generic_thread, &args[i], 0, NULL);
+		CHECK(threads[i] != NULL);
+	}
+
+	WaitForMultipleObjects(THREADS, threads, TRUE, INFINITE);
+	for (i = 0; i < THREADS; i++) {
+		if (threads[i])
+			CloseHandle(threads[i]);
+		CHECK(args[i].failures == 0);
+	}
+
+	memfs_allocator_get_stats(&allocator, &after);
+	CHECK(after.live_objects == before.live_objects);
+	CHECK(after.dedicated_count == 0U);
+	CHECK(after.reserved_bytes == before.reserved_bytes);
+	memfs_allocator_destroy(&allocator);
 }
 
 static void test_allocator_stress(void) {
@@ -2878,6 +3064,8 @@ int main(void) {
 	test_concurrent_files();
 	test_allocator_reclaim();
 	test_allocator_name_pool_boundaries();
+	test_allocator_generic_size_classes();
+	test_allocator_generic_concurrency();
 	test_allocator_stress();
 	test_storage_group_churn_stress();
 	test_storage_state_invariants();

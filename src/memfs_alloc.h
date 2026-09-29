@@ -4,15 +4,28 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef _WIN32
+#include <Windows.h>
+#else
+typedef void SRWLOCK;
+#endif
+
 typedef struct MemfsObjectPool MemfsObjectPool;
 
 enum { MEMFS_ALLOC_NAME_POOL_COUNT = 12 };
+
+enum { MEMFS_ALLOC_GENERIC_POOL_COUNT = 20 };
+
+typedef struct MemfsDedicatedBlock MemfsDedicatedBlock;
 
 typedef struct MemfsAllocator {
 	MemfsObjectPool* node_pool;
 	MemfsObjectPool* dir_pool;
 	MemfsObjectPool* page_group_pool;
 	MemfsObjectPool* name_pools[MEMFS_ALLOC_NAME_POOL_COUNT];
+	MemfsObjectPool* generic_pools[MEMFS_ALLOC_GENERIC_POOL_COUNT];
+	MemfsDedicatedBlock* dedicated;
+	SRWLOCK dedicated_lock;
 } MemfsAllocator;
 
 typedef struct MemfsAllocatorStats {
@@ -20,6 +33,9 @@ typedef struct MemfsAllocatorStats {
 	uint64_t live_bytes;
 	uint64_t live_objects;
 	uint32_t slab_count;
+	uint32_t dedicated_count;
+	uint64_t dedicated_reserved_bytes;
+	uint64_t dedicated_live_bytes;
 } MemfsAllocatorStats;
 
 bool memfs_allocator_init(MemfsAllocator* allocator, size_t node_size, size_t dir_size, size_t page_group_size);
@@ -36,5 +52,9 @@ void memfs_allocator_free_page_group(MemfsAllocator* allocator, void* ptr);
 
 void* memfs_allocator_alloc_name(MemfsAllocator* allocator, size_t bytes);
 void memfs_allocator_free_name(MemfsAllocator* allocator, void* ptr, size_t bytes);
+void* memfs_allocator_alloc(MemfsAllocator* allocator, size_t bytes);
+void* memfs_allocator_alloc_zero(MemfsAllocator* allocator, size_t bytes);
+void* memfs_allocator_realloc(MemfsAllocator* allocator, void* ptr, size_t old_bytes, size_t new_bytes);
+void memfs_allocator_free(MemfsAllocator* allocator, void* ptr, size_t bytes);
 
 void memfs_allocator_get_stats(MemfsAllocator* allocator, MemfsAllocatorStats* stats);
