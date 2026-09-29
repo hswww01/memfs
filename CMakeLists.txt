@@ -283,9 +283,17 @@ add_executable(memfs_bench
 add_executable(memfs_alloc_mt_bench
 	bench/memfs_alloc_mt_bench.c)
 
+add_executable(memfs_soak_bench
+	bench/memfs_soak_bench.c)
+
 target_link_libraries(memfs_alloc_mt_bench
 	PRIVATE
 		memfs_core)
+
+target_link_libraries(memfs_soak_bench
+	PRIVATE
+		memfs_core
+		psapi)
 
 target_link_libraries(memfs_bench
 	PRIVATE
@@ -311,7 +319,7 @@ endif()
 add_test(NAME memfs_mt_stress_test COMMAND memfs_mt_stress_test)
 
 if(MSVC)
-	foreach(target memfs_core memfs memfs_core_test memfs_bench memfs_alloc_mt_bench memfs_no_crt_heap_guard memfs_resource_test memfs_driver_test)
+	foreach(target memfs_core memfs memfs_core_test memfs_bench memfs_alloc_mt_bench memfs_soak_bench memfs_no_crt_heap_guard memfs_resource_test memfs_driver_test)
 		target_compile_options(${target}
 			PRIVATE
 				/W4
@@ -324,6 +332,8 @@ if(MSVC)
 endif()
 
 add_test(NAME memfs_core_test COMMAND memfs_core_test)
+add_test(NAME memfs_soak_smoke COMMAND memfs_soak_bench --seconds 2 --sample-ms 500)
+set_tests_properties(memfs_soak_smoke PROPERTIES TIMEOUT 15)
 
 add_test(NAME memfs_no_crt_heap_guard COMMAND memfs_no_crt_heap_guard)
 set_tests_properties(memfs_no_crt_heap_guard PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})

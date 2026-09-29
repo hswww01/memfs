@@ -262,6 +262,46 @@ The core test suite includes concurrent writes to multiple files with compressio
 
 WinFsp uses the node pointer as `FileContext`. Open/create increments the node's open count. Delete-on-cleanup removes the node from the namespace, but the node remains alive until the final close.
 
+## Long-run memory drift soak
+
+`memfs_soak_bench` runs a mixed core workload with compression and encryption enabled. Each cycle covers tiny-file create/read/rename/unlink, a 256 KiB large-file write with truncate/regrow and zero-fill verification, and a 64 MiB high-offset sparse write/read/truncate/regrow. Every sample reports logical/resident bytes, allocator live/reserved/committed/physical bytes, process private bytes, slab/area/cache counts, and the final summary reports linear private/committed drift slopes.
+
+The default mode is intentionally short for CI:
+
+```powershell
+.\build\x64-release\memfs_soak_bench.exe
+.\build\x64-release\memfs_soak_bench.exe --seconds 10 --sample-ms 1000
+```
+
+Long soak mode is explicit and accepts 10 through 60 minutes:
+
+```powershell
+.\build\x64-release\memfs_soak_bench.exe --soak 10
+.\build\x64-release\memfs_soak_bench.exe --soak 60 --sample-ms 5000
+```
+
+Before measurement the benchmark warms all workload shapes and codec/crypto paths. At exit it scavenges allocator caches and requires logical used, resident, allocator live objects/bytes, reserved, committed, physical, slab and area state to return to the post-warmup baseline. The private-byte slope is reported separately because Windows/runtime libraries may retain process-private bookkeeping that is not memfs allocator backing.
+
+## Long-run memory drift soak
+
+`memfs_soak_bench` runs a mixed core workload with compression and encryption enabled. Each cycle covers tiny-file create/read/rename/unlink, a 256 KiB large-file write with truncate/regrow and zero-fill verification, and a 64 MiB high-offset sparse write/read/truncate/regrow. Every sample reports logical/resident bytes, allocator live/reserved/committed/physical bytes, process private bytes, slab/area/cache counts, and the final summary reports linear private/committed drift slopes.
+
+The default mode is intentionally short for CI:
+
+```powershell
+.\build\x64-release\memfs_soak_bench.exe
+.\build\x64-release\memfs_soak_bench.exe --seconds 10 --sample-ms 1000
+```
+
+Long soak mode is explicit and accepts 10 through 60 minutes:
+
+```powershell
+.\build\x64-release\memfs_soak_bench.exe --soak 10
+.\build\x64-release\memfs_soak_bench.exe --soak 60 --sample-ms 5000
+```
+
+Before measurement the benchmark warms all workload shapes and codec/crypto paths. At exit it scavenges allocator caches and requires logical used, resident, allocator live objects/bytes, reserved, committed, physical, slab and area state to return to the post-warmup baseline. The private-byte slope is reported separately because Windows/runtime libraries may retain process-private bookkeeping that is not memfs allocator backing.
+
 ## Integration test
 
 The integration test mounts a real WinFsp drive and exercises normal Windows file APIs, sparse writes, rename/move/enumeration/delete:
