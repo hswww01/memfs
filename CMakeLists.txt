@@ -139,6 +139,7 @@ configure_file(
 add_library(memfs_core STATIC
 	src/memfs_core.c
 	src/memfs_alloc.c
+	src/memfs_vm.c
 	src/memfs_object.c)
 
 target_include_directories(memfs_core

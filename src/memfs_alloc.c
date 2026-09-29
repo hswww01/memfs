@@ -1,4 +1,5 @@
 #include "memfs_alloc.h"
+#include "memfs_vm.h"
 
 #include <Windows.h>
 #include <stdint.h>
@@ -134,14 +135,6 @@ static size_t align_up(size_t value, size_t alignment) {
     return (value + alignment - 1U) & ~(alignment - 1U);
 }
 
-static uint64_t virtual_region_bytes(const void* ptr) {
-    MEMORY_BASIC_INFORMATION info;
-
-    if (ptr == NULL || VirtualQuery(ptr, &info, sizeof(info)) != sizeof(info))
-        return 0;
-    return (uint64_t)info.RegionSize;
-}
-
 static int class_index(size_t bytes) {
     int i;
 
@@ -247,7 +240,7 @@ static MemfsSlab* slab_create(MemfsPool* pool) {
     if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_SLAB))
         return NULL;
 
-    slab = VirtualAlloc(NULL, pool->slab_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    slab = memfs_vm_reserve_commit(pool->slab_bytes);
     if (slab == NULL)
         return NULL;
 
@@ -255,7 +248,7 @@ static MemfsSlab* slab_create(MemfsPool* pool) {
     slab->owner = pool;
     slab->capacity = capacity;
     slab->free_count = capacity;
-    slab->region_bytes = virtual_region_bytes(slab);
+    slab->region_bytes = memfs_vm_region_bytes(slab);
     slab->magic = MEMFS_SLAB_MAGIC;
 
     data = (uint8_t*)slab + data_offset;
@@ -386,7 +379,7 @@ static void pool_free(MemfsPool* pool, void* ptr, size_t requested_bytes) {
     ReleaseSRWLockExclusive(&pool->lock);
 
     if (release_slab)
-        VirtualFree(slab, 0, MEM_RELEASE);
+        memfs_vm_release(slab);
 }
 
 static uint64_t pool_scavenge(MemfsPool* pool) {
@@ -410,7 +403,7 @@ static uint64_t pool_scavenge(MemfsPool* pool) {
             pool->reserved_bytes -= bytes;
             pool->committed_bytes -= bytes;
             slab->magic = 0;
-            VirtualFree(slab, 0, MEM_RELEASE);
+            memfs_vm_release(slab);
             released += bytes;
         }
 
@@ -431,7 +424,7 @@ static void pool_destroy(MemfsPool* pool) {
     while (slab) {
         MemfsSlab* next = slab->next;
         slab->magic = 0;
-        VirtualFree(slab, 0, MEM_RELEASE);
+        memfs_vm_release(slab);
         slab = next;
     }
 
@@ -477,14 +470,14 @@ static void* area_alloc(MemfsAllocatorState* state, size_t bytes) {
     if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_DEDICATED))
         return NULL;
 
-    block = VirtualAlloc(NULL, total_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    block = memfs_vm_reserve_commit(total_size);
     if (block == NULL)
         return NULL;
 
     memset(block, 0, header_size);
     block->owner = state;
     block->requested_bytes = bytes;
-    block->region_bytes = virtual_region_bytes(block);
+    block->region_bytes = memfs_vm_region_bytes(block);
     block->magic = MEMFS_AREA_MAGIC;
 
     AcquireSRWLockExclusive(&state->area_lock);
@@ -542,7 +535,7 @@ static void area_free(MemfsAllocatorState* state, void* ptr) {
     block->magic = 0;
     ReleaseSRWLockExclusive(&state->area_lock);
 
-    VirtualFree(block, 0, MEM_RELEASE);
+    memfs_vm_release(block);
 }
 
 static void area_destroy_all(MemfsAllocatorState* state) {
@@ -563,7 +556,7 @@ static void area_destroy_all(MemfsAllocatorState* state) {
     while (block) {
         MemfsAreaBlock* next = block->next;
         block->magic = 0;
-        VirtualFree(block, 0, MEM_RELEASE);
+        memfs_vm_release(block);
         block = next;
     }
 }
@@ -587,28 +580,31 @@ static void area_add_stats(MemfsAllocatorState* state, MemfsAllocatorStats* stat
 
 static MemfsAllocatorState* state_create(void) {
     MemfsAllocatorState* state;
-    SYSTEM_INFO system_info;
+    MemfsVmSystemInfo vm_info;
     int i;
 
     if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_BOOTSTRAP))
         return NULL;
 
-    state = VirtualAlloc(NULL, sizeof(*state), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    state = memfs_vm_reserve_commit(sizeof(*state));
     if (state == NULL)
         return NULL;
 
     memset(state, 0, sizeof(*state));
-    GetSystemInfo(&system_info);
+    if (!memfs_vm_get_system_info(&vm_info)) {
+        memfs_vm_release(state);
+        return NULL;
+    }
 
     state->magic = MEMFS_ALLOC_STATE_MAGIC;
     state->class_count = MEMFS_ALLOC_CLASS_COUNT;
-    state->allocation_granularity = system_info.dwAllocationGranularity;
-    state->region_bytes = virtual_region_bytes(state);
+    state->allocation_granularity = vm_info.allocation_granularity;
+    state->region_bytes = memfs_vm_region_bytes(state);
     InitializeSRWLock(&state->area_lock);
 
     if (state->allocation_granularity < MEMFS_MAX_SLAB_BYTES ||
         (state->allocation_granularity & (state->allocation_granularity - 1U)) != 0) {
-        VirtualFree(state, 0, MEM_RELEASE);
+        memfs_vm_release(state);
         return NULL;
     }
 
@@ -634,7 +630,7 @@ static void state_destroy(MemfsAllocatorState* state) {
 
     area_destroy_all(state);
     state->magic = 0;
-    VirtualFree(state, 0, MEM_RELEASE);
+    memfs_vm_release(state);
 }
 
 static void* allocator_alloc_internal(MemfsAllocator* allocator, size_t bytes) {

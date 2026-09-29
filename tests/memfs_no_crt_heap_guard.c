@@ -10,8 +10,12 @@ static int is_word_boundary(const char* s, size_t i) {
 	return i == 0 || !is_ident_char((unsigned char)s[i - 1]);
 }
 
-static int is_crt_heap_call(const char* s, size_t i) {
-	static const char* names[] = {"malloc", "calloc", "realloc", "free"};
+static int is_forbidden_alloc_call(const char* s, size_t i) {
+	static const char* names[] = {
+		"malloc", "calloc", "realloc", "free",
+		"VirtualAlloc", "VirtualFree", "VirtualQuery", "GetSystemInfo",
+		"HeapAlloc", "HeapFree"
+	};
 	size_t j;
 	size_t len = strlen(s);
 
@@ -106,8 +110,8 @@ static int scan_file(const char* path) {
 				continue;
 			}
 
-			if (is_crt_heap_call(line, i)) {
-				printf("memfs_no_crt_heap_guard: %s:%ld uses CRT heap call\n", path, line_no);
+			if (is_forbidden_alloc_call(line, i)) {
+				printf("memfs_no_crt_heap_guard: %s:%ld uses forbidden allocation/backend call\n", path, line_no);
 				++failures;
 			}
 			++i;
@@ -120,10 +124,14 @@ static int scan_file(const char* path) {
 int main(int argc, char** argv) {
 	static const char* files[] = {
 		"src/main.c",
+		"src/memfs_alloc.c",
+		"src/memfs_alloc.h",
 		"src/memfs_core.c",
 		"src/memfs_core.h",
 		"src/memfs_object.c",
 		"src/memfs_object.h",
+		"src/memfs_driver.c",
+		"src/memfs_driver.h",
 		"src/memfs_winfsp.c",
 		"src/memfs_winfsp.h",
 	};
