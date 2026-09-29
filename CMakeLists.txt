@@ -117,6 +117,24 @@ target_link_libraries(memfs_bench
 	PRIVATE
 		memfs_core
 		psapi)
+add_executable(memfs_mt_stress_test
+	tests/memfs_mt_stress_test.c)
+
+target_link_libraries(memfs_mt_stress_test
+	PRIVATE
+		memfs_core)
+
+if(MSVC)
+	target_compile_options(memfs_mt_stress_test
+		PRIVATE
+			/W4
+			/utf-8)
+	target_compile_definitions(memfs_mt_stress_test
+		PRIVATE
+			_CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_test(NAME memfs_mt_stress_test COMMAND memfs_mt_stress_test)
 
 if(MSVC)
 	foreach(target memfs_core memfs memfs_core_test memfs_bench memfs_no_crt_heap_guard)
