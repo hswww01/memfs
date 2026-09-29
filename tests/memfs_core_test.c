@@ -2442,6 +2442,102 @@ static void test_allocator_reclaim(void) {
 }
 
 
+static void test_allocator_unified_pool_layout(void) {
+	MemfsAllocator allocator;
+	MemfsAllocatorStats baseline;
+	MemfsAllocatorStats after_node;
+	MemfsAllocatorStats after_name;
+	MemfsAllocatorStats after_generic;
+	MemfsAllocatorStats after_area;
+	MemfsAllocatorStats after;
+	void* node;
+	void* name;
+	void* generic;
+	void* area;
+
+	printf("== allocator unified pool layout ==\n");
+
+	CHECK(memfs_allocator_init(&allocator, 96U, 96U, 96U));
+	memfs_allocator_get_stats(&allocator, &baseline);
+	CHECK(baseline.slab_count == 0U);
+
+	node = memfs_allocator_alloc_node(&allocator);
+	CHECK(node != NULL);
+	memfs_allocator_get_stats(&allocator, &after_node);
+	CHECK(after_node.slab_count == 1U);
+
+	name = memfs_allocator_alloc_name(&allocator, 96U);
+	CHECK(name != NULL);
+	memfs_allocator_get_stats(&allocator, &after_name);
+	CHECK(after_name.slab_count == after_node.slab_count);
+
+	generic = memfs_allocator_alloc(&allocator, 96U);
+	CHECK(generic != NULL);
+	memfs_allocator_get_stats(&allocator, &after_generic);
+	CHECK(after_generic.slab_count == after_node.slab_count);
+	CHECK(after_generic.dedicated_count == 0U);
+
+	area = memfs_allocator_alloc(&allocator, MEMFS_ALLOC_AREA_THRESHOLD + 1U);
+	CHECK(area != NULL);
+	memfs_allocator_get_stats(&allocator, &after_area);
+	CHECK(after_area.slab_count == after_node.slab_count);
+	CHECK(after_area.dedicated_count == 1U);
+	CHECK(after_area.dedicated_live_bytes >= MEMFS_ALLOC_AREA_THRESHOLD + 1U);
+
+	memfs_allocator_free(&allocator, area, MEMFS_ALLOC_AREA_THRESHOLD + 1U);
+	memfs_allocator_free(&allocator, generic, 96U);
+	memfs_allocator_free_name(&allocator, name, 96U);
+	memfs_allocator_free_node(&allocator, node);
+
+	memfs_allocator_get_stats(&allocator, &after);
+	CHECK(after.live_objects == baseline.live_objects);
+	CHECK(after.slab_count == 0U);
+	CHECK(after.dedicated_count == 0U);
+	CHECK(after.reserved_bytes == baseline.reserved_bytes);
+
+#if !defined(NDEBUG)
+	{
+		static const struct {
+			size_t request;
+			size_t expected_class;
+			size_t expected_slab;
+		} cases[] = {
+			{1U, 8U, 4U * 1024U},
+			{96U, 96U, 4U * 1024U},
+			{129U, 192U, 8U * 1024U},
+			{256U, 256U, 8U * 1024U},
+			{257U, 384U, 16U * 1024U},
+			{512U, 512U, 16U * 1024U},
+			{513U, 768U, 32U * 1024U},
+			{1024U, 1024U, 32U * 1024U},
+			{1025U, 1536U, 64U * 1024U},
+			{8192U, 8192U, 64U * 1024U},
+		};
+		size_t i;
+
+		for (i = 0; i < _countof(cases); i++) {
+			size_t class_bytes = 0;
+			size_t slab_bytes = 0;
+			CHECK(memfs_allocator_test_class_layout(cases[i].request, &class_bytes, &slab_bytes));
+			CHECK(class_bytes == cases[i].expected_class);
+			CHECK(slab_bytes == cases[i].expected_slab);
+		}
+
+		{
+			size_t class_bytes = 123U;
+			size_t slab_bytes = 456U;
+			CHECK(!memfs_allocator_test_class_layout(MEMFS_ALLOC_AREA_THRESHOLD + 1U,
+												 &class_bytes, &slab_bytes));
+			CHECK(class_bytes == 0U);
+			CHECK(slab_bytes == 0U);
+		}
+	}
+#endif
+
+	memfs_allocator_destroy(&allocator);
+}
+
+
 static void test_allocator_name_pool_boundaries(void) {
 	MemfsAllocator allocator;
 	MemfsAllocatorStats before;
@@ -3639,6 +3735,7 @@ int main(void) {
 	test_shared_security_inherit_replace_churn();
 	test_concurrent_files();
 	test_allocator_reclaim();
+	test_allocator_unified_pool_layout();
 	test_allocator_name_pool_boundaries();
 	test_allocator_generic_size_classes();
 	test_allocator_generic_concurrency();

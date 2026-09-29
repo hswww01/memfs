@@ -2284,12 +2284,12 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 	if (sodium_init() < 0)
 		return MEMFS_ERR_ACCESS;
 
-	fs = VirtualAlloc(NULL, sizeof(*fs), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+	fs = memfs_allocator_alloc_control(sizeof(*fs));
 	if (fs == NULL)
 		return MEMFS_ERR_NO_MEMORY;
 
 	if (!memfs_allocator_init(&fs->allocator, sizeof(MemfsNode), sizeof(MemfsDir), sizeof(MemfsPageGroup))) {
-		VirtualFree(fs, 0, MEM_RELEASE);
+		memfs_allocator_free_control(fs, sizeof(*fs));
 		return MEMFS_ERR_NO_MEMORY;
 	}
 
@@ -2345,7 +2345,7 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 			(void)sodium_munlock(fs->encryption_key, MEMFS_ENCRYPTION_KEY_SIZE);
 		}
 		memfs_allocator_destroy(&fs->allocator);
-		VirtualFree(fs, 0, MEM_RELEASE);
+		memfs_allocator_free_control(fs, sizeof(*fs));
 		return result;
 	}
 
@@ -2385,7 +2385,7 @@ void memfs_destroy(Memfs* fs) {
 	}
 
 	memfs_allocator_destroy(&fs->allocator);
-	VirtualFree(fs, 0, MEM_RELEASE);
+	memfs_allocator_free_control(fs, sizeof(*fs));
 }
 
 MemfsNode* memfs_dir_lookup(MemfsNode* dir_node, const wchar_t* name) {
@@ -2477,6 +2477,9 @@ MemfsResult memfs_lookup_path(Memfs* fs, const wchar_t* path, MemfsNode** out_no
 	MemfsNode* node;
 	wchar_t component[MEMFS_MAX_NAME + 1];
 
+	if (out_node != NULL)
+		*out_node = NULL;
+
 	if (fs == NULL || path == NULL || out_node == NULL || path[0] != L'\\')
 		return MEMFS_ERR_INVALID;
 
@@ -2533,6 +2536,11 @@ MemfsResult memfs_lookup_parent(Memfs* fs, const wchar_t* path, MemfsNode** out_
 	wchar_t* parent_path = NULL;
 	MemfsNode* parent;
 	MemfsResult result;
+
+	if (out_parent != NULL)
+		*out_parent = NULL;
+	if (name != NULL)
+		name[0] = L'\0';
 
 	if (fs == NULL || path == NULL || out_parent == NULL || name == NULL || path[0] != L'\\')
 		return MEMFS_ERR_INVALID;

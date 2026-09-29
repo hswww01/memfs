@@ -1,4 +1,5 @@
 #include "memfs_winfsp.h"
+#include "memfs_driver.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -553,17 +554,35 @@ static const FSP_FILE_SYSTEM_INTERFACE g_memfs_interface = {
 	.GetDirInfoByName = fs_GetDirInfoByName,
 };
 
+static NTSTATUS memfs_win32_status(DWORD error) {
+	if (error == ERROR_SUCCESS)
+		return STATUS_SUCCESS;
+	if (error == ERROR_ACCESS_DENIED || error == ERROR_PRIVILEGE_NOT_HELD)
+		return STATUS_ACCESS_DENIED;
+	if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ||
+		error == ERROR_MOD_NOT_FOUND || error == ERROR_DLL_NOT_FOUND)
+		return STATUS_OBJECT_NAME_NOT_FOUND;
+	if (error == ERROR_NOT_ENOUGH_MEMORY || error == ERROR_OUTOFMEMORY)
+		return STATUS_INSUFFICIENT_RESOURCES;
+	return STATUS_UNSUCCESSFUL;
+}
+
 NTSTATUS memfs_winfsp_create(const MemfsOptions* options, MemfsWinFsp** out_instance) {
 	FSP_FSCTL_VOLUME_PARAMS volume_params;
 	MemfsWinFsp* instance;
 	Memfs* instance_store;
 	MemfsResult result;
 	NTSTATUS status;
+	DWORD runtime_error;
 
 	if (options == NULL || out_instance == NULL)
 		return STATUS_INVALID_PARAMETER;
 
 	*out_instance = NULL;
+
+	runtime_error = memfs_winfsp_prepare_runtime();
+	if (runtime_error != ERROR_SUCCESS)
+		return memfs_win32_status(runtime_error);
 
 	result = memfs_create_ex(options, &instance_store);
 	if (result != MEMFS_OK)
@@ -599,9 +618,17 @@ NTSTATUS memfs_winfsp_create(const MemfsOptions* options, MemfsWinFsp** out_inst
 	status =
 		FspFileSystemCreate(L"" FSP_FSCTL_DISK_DEVICE_NAME, &volume_params, &g_memfs_interface, &instance->file_system);
 	if (!NT_SUCCESS(status)) {
-		memfs_allocator_free(&instance->store->allocator, instance, sizeof(*instance));
-		memfs_destroy(instance->store);
-		return status;
+		runtime_error = memfs_winfsp_install_embedded_driver();
+		if (runtime_error == ERROR_SUCCESS) {
+			status = FspFileSystemCreate(L"" FSP_FSCTL_DISK_DEVICE_NAME, &volume_params,
+									 &g_memfs_interface, &instance->file_system);
+		}
+	}
+	if (!NT_SUCCESS(status)) {
+		Memfs* store = instance->store;
+		memfs_allocator_free(&store->allocator, instance, sizeof(*instance));
+		memfs_destroy(store);
+		return runtime_error != ERROR_SUCCESS ? memfs_win32_status(runtime_error) : status;
 	}
 
 	instance->file_system->UserContext = instance;
@@ -634,9 +661,13 @@ void memfs_winfsp_destroy(MemfsWinFsp* instance) {
 	if (instance == NULL)
 		return;
 
-	if (instance->file_system)
-		FspFileSystemDelete(instance->file_system);
+	{
+		Memfs* store = instance->store;
 
-	memfs_allocator_free(&instance->store->allocator, instance, sizeof(*instance));
-	memfs_destroy(instance->store);
+		if (instance->file_system)
+			FspFileSystemDelete(instance->file_system);
+
+		memfs_allocator_free(&store->allocator, instance, sizeof(*instance));
+		memfs_destroy(store);
+	}
 }

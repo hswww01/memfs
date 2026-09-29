@@ -1,0 +1,4 @@
+#include "memfs_resource.h"
+
+@WINFSP_RUNTIME_RESOURCE@
+IDR_MEMFS_WINFSP_SYS RCDATA "@WINFSP_DRIVER_RC@"

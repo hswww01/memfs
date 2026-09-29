@@ -3,287 +3,439 @@
 
 #include <errno.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <wchar.h>
 #include <wctype.h>
 
 #include "memfs_winfsp.h"
 
+#define MEMFS_SERVICE_NAME L"MemfsC"
+
+typedef struct MemfsRunConfig {
+    const wchar_t* mount_point;
+    const wchar_t* volume_label;
+    uint64_t capacity;
+    bool capacity_auto;
+    uint32_t thread_count;
+    uint32_t compression_level;
+    bool compression_enabled;
+    bool encryption_enabled;
+    bool have_fixed_key;
+    bool debug;
+    bool service_mode;
+    uint8_t encryption_key[MEMFS_ENCRYPTION_KEY_SIZE];
+} MemfsRunConfig;
+
 static HANDLE g_stop_event;
+static SERVICE_STATUS_HANDLE g_service_status_handle;
+static SERVICE_STATUS g_service_status;
+static MemfsRunConfig g_config;
+
+static void service_report(DWORD state, DWORD win32_exit, DWORD wait_hint) {
+    static DWORD checkpoint = 1;
+
+    if (g_service_status_handle == NULL)
+        return;
+
+    memset(&g_service_status, 0, sizeof(g_service_status));
+    g_service_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    g_service_status.dwCurrentState = state;
+    g_service_status.dwWin32ExitCode = win32_exit;
+    g_service_status.dwWaitHint = wait_hint;
+
+    if (state == SERVICE_START_PENDING)
+        g_service_status.dwControlsAccepted = 0;
+    else if (state == SERVICE_RUNNING)
+        g_service_status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+    else if (state == SERVICE_STOP_PENDING)
+        g_service_status.dwControlsAccepted = 0;
+
+    if (state == SERVICE_RUNNING || state == SERVICE_STOPPED)
+        g_service_status.dwCheckPoint = 0;
+    else
+        g_service_status.dwCheckPoint = checkpoint++;
+
+    SetServiceStatus(g_service_status_handle, &g_service_status);
+}
+
+static DWORD WINAPI service_handler(DWORD control,
+                                    DWORD event_type,
+                                    void* event_data,
+                                    void* context) {
+    (void)event_type;
+    (void)event_data;
+    (void)context;
+
+    switch (control) {
+    case SERVICE_CONTROL_STOP:
+    case SERVICE_CONTROL_SHUTDOWN:
+        service_report(SERVICE_STOP_PENDING, NO_ERROR, 15000);
+        if (g_stop_event)
+            SetEvent(g_stop_event);
+        return NO_ERROR;
+    case SERVICE_CONTROL_INTERROGATE:
+        return NO_ERROR;
+    default:
+        return ERROR_CALL_NOT_IMPLEMENTED;
+    }
+}
 
 static BOOL WINAPI console_handler(DWORD control_type) {
-	switch (control_type) {
-	case CTRL_C_EVENT:
-	case CTRL_BREAK_EVENT:
-	case CTRL_CLOSE_EVENT:
-	case CTRL_SHUTDOWN_EVENT:
-		if (g_stop_event)
-			SetEvent(g_stop_event);
-		return TRUE;
-	default:
-		return FALSE;
-	}
+    switch (control_type) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        if (g_stop_event)
+            SetEvent(g_stop_event);
+        return TRUE;
+    default:
+        return FALSE;
+    }
 }
 
 static void print_usage(const wchar_t* exe) {
-	fwprintf(stderr,
-			 L"Usage: %s --mount M: [options]\n"
-			 L"\n"
-			 L"Options:\n"
-			 L"  --mount <path>          Drive letter or directory mount point.\n"
-			 L"  --size <bytes|auto>     Capacity; supports K/M/G suffix. Default: auto.\n"
-			 L"  --label <name>          Volume label. Default: MEMFS.\n"
-			 L"  --threads <n>           WinFsp dispatcher threads. 0 = automatic.\n"
-			 L"  --compress              Enable per-page Zstd compression (level 1).\n"
-			 L"  --compression-level <n> Enable compression with level 1..22.\n"
-			 L"  --encrypt               Enable XChaCha20-Poly1305 with random session key.\n"
-			 L"  --key-hex <64hex>       Enable encryption with a fixed 256-bit key.\n"
-			 L"  --key-env <name>        Read the 64-hex encryption key from an env variable.\n"
-			 L"  --debug                 Enable all WinFsp debug logging.\n"
-			 L"  --help                  Show this help.\n",
-			 exe);
+    fwprintf(stderr,
+             L"Usage: %s --mount M: [options]\n"
+             L"       %s --service --mount M: [options]\n"
+             L"\n"
+             L"Options:\n"
+             L"  --mount <path>          Drive letter or directory mount point.\n"
+             L"  --size <bytes|auto>     Capacity; supports K/M/G suffix. Default: auto.\n"
+             L"  --label <name>          Volume label. Default: MEMFS.\n"
+             L"  --threads <n>           WinFsp dispatcher threads. 0 = automatic.\n"
+             L"  --compress              Enable per-page Zstd compression (level 1).\n"
+             L"  --compression-level <n> Enable compression with level 1..22.\n"
+             L"  --encrypt               Enable XChaCha20-Poly1305 with random session key.\n"
+             L"  --key-hex <64hex>       Enable encryption with a fixed 256-bit key.\n"
+             L"  --key-env <name>        Read the 64-hex encryption key from an env variable.\n"
+             L"  --debug                 Enable all WinFsp debug logging.\n"
+             L"  --service               Run under the Windows Service Control Manager.\n"
+             L"  --help                  Show this help.\n"
+             L"\n"
+             L"Service control example (run from an elevated shell):\n"
+             L"  sc create MemfsC binPath= \"\\\"C:\\path\\memfs.exe\\\" --service --mount M: --size auto\" start= auto\n"
+             L"  sc start MemfsC\n"
+             L"  sc stop MemfsC\n"
+             L"  sc delete MemfsC\n",
+             exe, exe);
 }
 
 static bool parse_size(const wchar_t* text, uint64_t* out, bool* auto_size) {
-	wchar_t* end;
-	unsigned long long value;
-	uint64_t multiplier = 1;
+    wchar_t* end;
+    unsigned long long value;
+    uint64_t multiplier = 1;
 
-	if (text == NULL || *text == L'\0' || out == NULL)
-		return false;
+    if (text == NULL || *text == L'\0' || out == NULL)
+        return false;
 
-	if (auto_size)
-		*auto_size = false;
+    if (auto_size)
+        *auto_size = false;
 
-	if (_wcsicmp(text, L"auto") == 0) {
-		if (auto_size)
-			*auto_size = true;
-		if (out)
-			*out = 0;
-		return true;
-	}
+    if (_wcsicmp(text, L"auto") == 0) {
+        if (auto_size)
+            *auto_size = true;
+        *out = 0;
+        return true;
+    }
 
-	errno = 0;
-	value = wcstoull(text, &end, 0);
-	if (errno || end == text)
-		return false;
+    errno = 0;
+    value = wcstoull(text, &end, 0);
+    if (errno || end == text)
+        return false;
 
-	if (*end) {
-		if (end[1] != L'\0')
-			return false;
+    if (*end) {
+        if (end[1] != L'\0')
+            return false;
 
-		switch (towupper(*end)) {
-		case L'K':
-			multiplier = 1024ULL;
-			break;
-		case L'M':
-			multiplier = 1024ULL * 1024ULL;
-			break;
-		case L'G':
-			multiplier = 1024ULL * 1024ULL * 1024ULL;
-			break;
-		default:
-			return false;
-		}
-	}
+        switch (towupper(*end)) {
+        case L'K':
+            multiplier = 1024ULL;
+            break;
+        case L'M':
+            multiplier = 1024ULL * 1024ULL;
+            break;
+        case L'G':
+            multiplier = 1024ULL * 1024ULL * 1024ULL;
+            break;
+        default:
+            return false;
+        }
+    }
 
-	if (value > UINT64_MAX / multiplier)
-		return false;
+    if (value > UINT64_MAX / multiplier)
+        return false;
 
-	*out = (uint64_t)value * multiplier;
-	return *out != 0;
+    *out = (uint64_t)value * multiplier;
+    return *out != 0;
 }
 
 static bool parse_u32(const wchar_t* text, uint32_t* out) {
-	wchar_t* end;
-	unsigned long value;
+    wchar_t* end;
+    unsigned long value;
 
-	if (text == NULL || *text == L'\0' || out == NULL)
-		return false;
+    if (text == NULL || *text == L'\0' || out == NULL)
+        return false;
 
-	errno = 0;
-	value = wcstoul(text, &end, 0);
-	if (errno || end == text || *end || value > UINT32_MAX)
-		return false;
+    errno = 0;
+    value = wcstoul(text, &end, 0);
+    if (errno || end == text || *end || value > UINT32_MAX)
+        return false;
 
-	*out = (uint32_t)value;
-	return true;
+    *out = (uint32_t)value;
+    return true;
 }
 
 static int hex_value(wchar_t c) {
-	if (c >= L'0' && c <= L'9')
-		return (int)(c - L'0');
-	if (c >= L'a' && c <= L'f')
-		return (int)(c - L'a') + 10;
-	if (c >= L'A' && c <= L'F')
-		return (int)(c - L'A') + 10;
-	return -1;
+    if (c >= L'0' && c <= L'9')
+        return (int)(c - L'0');
+    if (c >= L'a' && c <= L'f')
+        return (int)(c - L'a') + 10;
+    if (c >= L'A' && c <= L'F')
+        return (int)(c - L'A') + 10;
+    return -1;
 }
 
 static bool parse_key_hex(const wchar_t* text, uint8_t key[MEMFS_ENCRYPTION_KEY_SIZE]) {
-	uint32_t i;
+    uint32_t i;
 
-	if (text == NULL || wcslen(text) != MEMFS_ENCRYPTION_KEY_SIZE * 2U) {
-		return false;
-	}
+    if (text == NULL || wcslen(text) != MEMFS_ENCRYPTION_KEY_SIZE * 2U)
+        return false;
 
-	for (i = 0; i < MEMFS_ENCRYPTION_KEY_SIZE; i++) {
-		int hi = hex_value(text[i * 2U]);
-		int lo = hex_value(text[i * 2U + 1U]);
+    for (i = 0; i < MEMFS_ENCRYPTION_KEY_SIZE; i++) {
+        int hi = hex_value(text[i * 2U]);
+        int lo = hex_value(text[i * 2U + 1U]);
 
-		if (hi < 0 || lo < 0)
-			return false;
+        if (hi < 0 || lo < 0)
+            return false;
 
-		key[i] = (uint8_t)((hi << 4) | lo);
-	}
+        key[i] = (uint8_t)((hi << 4) | lo);
+    }
 
-	return true;
+    return true;
+}
+
+static int parse_config(int argc, wchar_t** argv, MemfsRunConfig* config) {
+    int i;
+
+    memset(config, 0, sizeof(*config));
+    config->volume_label = L"MEMFS";
+    config->capacity_auto = true;
+    config->compression_level = 1;
+
+    for (i = 1; i < argc; i++) {
+        if (_wcsicmp(argv[i], L"--mount") == 0 && i + 1 < argc) {
+            config->mount_point = argv[++i];
+        } else if (_wcsicmp(argv[i], L"--size") == 0 && i + 1 < argc) {
+            if (!parse_size(argv[++i], &config->capacity, &config->capacity_auto)) {
+                fwprintf(stderr, L"Invalid --size value.\n");
+                return 2;
+            }
+        } else if (_wcsicmp(argv[i], L"--auto-size") == 0) {
+            config->capacity = 0;
+            config->capacity_auto = true;
+        } else if (_wcsicmp(argv[i], L"--label") == 0 && i + 1 < argc) {
+            config->volume_label = argv[++i];
+        } else if (_wcsicmp(argv[i], L"--threads") == 0 && i + 1 < argc) {
+            if (!parse_u32(argv[++i], &config->thread_count)) {
+                fwprintf(stderr, L"Invalid --threads value.\n");
+                return 2;
+            }
+        } else if (_wcsicmp(argv[i], L"--compress") == 0) {
+            config->compression_enabled = true;
+        } else if (_wcsicmp(argv[i], L"--compression-level") == 0 && i + 1 < argc) {
+            if (!parse_u32(argv[++i], &config->compression_level) ||
+                config->compression_level < 1 || config->compression_level > 22) {
+                fwprintf(stderr, L"Invalid compression level; use 1..22.\n");
+                return 2;
+            }
+            config->compression_enabled = true;
+        } else if (_wcsicmp(argv[i], L"--encrypt") == 0) {
+            config->encryption_enabled = true;
+        } else if (_wcsicmp(argv[i], L"--key-hex") == 0 && i + 1 < argc) {
+            if (!parse_key_hex(argv[++i], config->encryption_key)) {
+                fwprintf(stderr, L"Invalid --key-hex; expected exactly 64 hex characters.\n");
+                return 2;
+            }
+            config->encryption_enabled = true;
+            config->have_fixed_key = true;
+        } else if (_wcsicmp(argv[i], L"--key-env") == 0 && i + 1 < argc) {
+            const wchar_t* value = _wgetenv(argv[++i]);
+
+            if (!parse_key_hex(value, config->encryption_key)) {
+                fwprintf(stderr, L"Invalid or missing encryption-key environment variable.\n");
+                return 2;
+            }
+            config->encryption_enabled = true;
+            config->have_fixed_key = true;
+        } else if (_wcsicmp(argv[i], L"--debug") == 0) {
+            config->debug = true;
+        } else if (_wcsicmp(argv[i], L"--service") == 0) {
+            config->service_mode = true;
+        } else if (_wcsicmp(argv[i], L"--help") == 0 ||
+                   _wcsicmp(argv[i], L"-h") == 0 ||
+                   _wcsicmp(argv[i], L"/?") == 0) {
+            return 1;
+        } else {
+            fwprintf(stderr, L"Unknown argument: %s\n", argv[i]);
+            return 2;
+        }
+    }
+
+    if (config->mount_point == NULL) {
+        fwprintf(stderr, L"--mount is required.\n");
+        return 2;
+    }
+
+    return 0;
+}
+
+static int run_filesystem(const MemfsRunConfig* config, HANDLE stop_event, bool console_mode) {
+    MemfsOptions options;
+    MemfsWinFsp* instance = NULL;
+    NTSTATUS status;
+    int exit_code = 1;
+
+    memset(&options, 0, sizeof(options));
+    options.capacity = config->capacity;
+    options.capacity_auto = config->capacity_auto;
+    options.volume_label = config->volume_label;
+    options.compression_enabled = config->compression_enabled;
+    options.compression_level = (int)config->compression_level;
+    options.encryption_enabled = config->encryption_enabled;
+
+    if (config->have_fixed_key) {
+        options.encryption_key = config->encryption_key;
+        options.encryption_key_size = sizeof(config->encryption_key);
+    }
+
+    status = memfs_winfsp_create(&options, &instance);
+    if (!NT_SUCCESS(status)) {
+        if (console_mode)
+            fwprintf(stderr, L"memfs_winfsp_create failed: 0x%08X\n", (unsigned)status);
+        return 3;
+    }
+
+    if (config->debug)
+        FspFileSystemSetDebugLog(instance->file_system, (ULONG)-1);
+
+    status = memfs_winfsp_mount(instance, config->mount_point);
+    if (!NT_SUCCESS(status)) {
+        if (console_mode)
+            fwprintf(stderr, L"Cannot mount %s: 0x%08X\n",
+                     config->mount_point, (unsigned)status);
+        goto exit;
+    }
+
+    status = memfs_winfsp_start(instance, config->thread_count);
+    if (!NT_SUCCESS(status)) {
+        if (console_mode)
+            fwprintf(stderr, L"Cannot start WinFsp dispatcher: 0x%08X\n", (unsigned)status);
+        goto exit;
+    }
+
+    if (console_mode) {
+        if (config->capacity_auto)
+            wprintf(L"MEMFS mounted at %s (auto capacity)%s%s. Press Ctrl+C to stop.\n",
+                    config->mount_point,
+                    config->compression_enabled ? L", compressed" : L"",
+                    config->encryption_enabled ? L", encrypted" : L"");
+        else
+            wprintf(L"MEMFS mounted at %s (%llu MiB)%s%s. Press Ctrl+C to stop.\n",
+                    config->mount_point,
+                    (unsigned long long)(config->capacity / (1024ULL * 1024ULL)),
+                    config->compression_enabled ? L", compressed" : L"",
+                    config->encryption_enabled ? L", encrypted" : L"");
+    }
+
+    WaitForSingleObject(stop_event, INFINITE);
+    exit_code = 0;
+    memfs_winfsp_stop(instance);
+
+exit:
+    memfs_winfsp_destroy(instance);
+    return exit_code;
+}
+
+static VOID WINAPI service_main(DWORD argc, LPWSTR* argv) {
+    int result;
+
+    (void)argc;
+    (void)argv;
+
+    g_service_status_handle =
+        RegisterServiceCtrlHandlerExW(MEMFS_SERVICE_NAME, service_handler, NULL);
+    if (g_service_status_handle == NULL)
+        return;
+
+    service_report(SERVICE_START_PENDING, NO_ERROR, 15000);
+
+    g_stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (g_stop_event == NULL) {
+        service_report(SERVICE_STOPPED, GetLastError(), 0);
+        return;
+    }
+
+    service_report(SERVICE_RUNNING, NO_ERROR, 0);
+    result = run_filesystem(&g_config, g_stop_event, false);
+
+    CloseHandle(g_stop_event);
+    g_stop_event = NULL;
+
+    if (result == 0)
+        service_report(SERVICE_STOPPED, NO_ERROR, 0);
+    else
+        service_report(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, 0);
 }
 
 int wmain(int argc, wchar_t** argv) {
-	const wchar_t* mount_point = NULL;
-	const wchar_t* volume_label = L"MEMFS";
-	uint64_t capacity = 0;
-	bool capacity_auto = true;
-	uint32_t thread_count = 0;
-	uint32_t compression_level = 1;
-	bool compression_enabled = false;
-	bool encryption_enabled = false;
-	bool have_fixed_key = false;
-	bool debug = false;
-	uint8_t encryption_key[MEMFS_ENCRYPTION_KEY_SIZE] = {0};
-	MemfsOptions options;
-	MemfsWinFsp* instance = NULL;
-	NTSTATUS status;
-	int i;
-	int exit_code = 1;
+    int parse_result;
 
-	for (i = 1; i < argc; i++) {
-		if (_wcsicmp(argv[i], L"--mount") == 0 && i + 1 < argc) {
-			mount_point = argv[++i];
-		} else if (_wcsicmp(argv[i], L"--size") == 0 && i + 1 < argc) {
-			if (!parse_size(argv[++i], &capacity, &capacity_auto)) {
-				fwprintf(stderr, L"Invalid --size value.\n");
-				return 2;
-			}
-		} else if (_wcsicmp(argv[i], L"--auto-size") == 0) {
-			capacity = 0;
-			capacity_auto = true;
-		} else if (_wcsicmp(argv[i], L"--label") == 0 && i + 1 < argc) {
-			volume_label = argv[++i];
-		} else if (_wcsicmp(argv[i], L"--threads") == 0 && i + 1 < argc) {
-			if (!parse_u32(argv[++i], &thread_count)) {
-				fwprintf(stderr, L"Invalid --threads value.\n");
-				return 2;
-			}
-		} else if (_wcsicmp(argv[i], L"--compress") == 0) {
-			compression_enabled = true;
-		} else if (_wcsicmp(argv[i], L"--compression-level") == 0 && i + 1 < argc) {
-			if (!parse_u32(argv[++i], &compression_level) || compression_level < 1 || compression_level > 22) {
-				fwprintf(stderr, L"Invalid compression level; use 1..22.\n");
-				return 2;
-			}
-			compression_enabled = true;
-		} else if (_wcsicmp(argv[i], L"--encrypt") == 0) {
-			encryption_enabled = true;
-		} else if (_wcsicmp(argv[i], L"--key-hex") == 0 && i + 1 < argc) {
-			if (!parse_key_hex(argv[++i], encryption_key)) {
-				fwprintf(stderr, L"Invalid --key-hex; expected exactly 64 hex characters.\n");
-				return 2;
-			}
-			encryption_enabled = true;
-			have_fixed_key = true;
-		} else if (_wcsicmp(argv[i], L"--key-env") == 0 && i + 1 < argc) {
-			const wchar_t* value = _wgetenv(argv[++i]);
+    parse_result = parse_config(argc, argv, &g_config);
+    if (parse_result == 1) {
+        print_usage(argv[0]);
+        return 0;
+    }
+    if (parse_result != 0) {
+        print_usage(argv[0]);
+        SecureZeroMemory(g_config.encryption_key, sizeof(g_config.encryption_key));
+        return parse_result;
+    }
 
-			if (!parse_key_hex(value, encryption_key)) {
-				fwprintf(stderr, L"Invalid or missing encryption-key environment variable.\n");
-				return 2;
-			}
-			encryption_enabled = true;
-			have_fixed_key = true;
-		} else if (_wcsicmp(argv[i], L"--debug") == 0) {
-			debug = true;
-		} else if (_wcsicmp(argv[i], L"--help") == 0 || _wcsicmp(argv[i], L"-h") == 0 ||
-				   _wcsicmp(argv[i], L"/?") == 0) {
-			print_usage(argv[0]);
-			return 0;
-		} else {
-			fwprintf(stderr, L"Unknown argument: %s\n", argv[i]);
-			print_usage(argv[0]);
-			return 2;
-		}
-	}
+    if (g_config.service_mode) {
+        SERVICE_TABLE_ENTRYW service_table[] = {
+            {(LPWSTR)MEMFS_SERVICE_NAME, service_main},
+            {NULL, NULL},
+        };
 
-	if (mount_point == NULL) {
-		print_usage(argv[0]);
-		return 2;
-	}
+        if (!StartServiceCtrlDispatcherW(service_table)) {
+            DWORD error = GetLastError();
+            if (error == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
+                fwprintf(stderr,
+                         L"--service must be launched by SCM. Use 'sc create/start MemfsC'.\n");
+            } else {
+                fwprintf(stderr, L"StartServiceCtrlDispatcher failed: %lu\n", error);
+            }
+            SecureZeroMemory(g_config.encryption_key, sizeof(g_config.encryption_key));
+            return 4;
+        }
 
-	memset(&options, 0, sizeof(options));
-	options.capacity = capacity;
-	options.capacity_auto = capacity_auto;
-	options.volume_label = volume_label;
-	options.compression_enabled = compression_enabled;
-	options.compression_level = (int)compression_level;
-	options.encryption_enabled = encryption_enabled;
+        SecureZeroMemory(g_config.encryption_key, sizeof(g_config.encryption_key));
+        return 0;
+    }
 
-	if (have_fixed_key) {
-		options.encryption_key = encryption_key;
-		options.encryption_key_size = sizeof(encryption_key);
-	}
+    g_stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (g_stop_event == NULL) {
+        fwprintf(stderr, L"CreateEvent failed: %lu\n", GetLastError());
+        SecureZeroMemory(g_config.encryption_key, sizeof(g_config.encryption_key));
+        return 1;
+    }
 
-	status = memfs_winfsp_create(&options, &instance);
-	SecureZeroMemory(encryption_key, sizeof(encryption_key));
+    SetConsoleCtrlHandler(console_handler, TRUE);
+    parse_result = run_filesystem(&g_config, g_stop_event, true);
+    SetConsoleCtrlHandler(console_handler, FALSE);
 
-	if (!NT_SUCCESS(status)) {
-		fwprintf(stderr, L"memfs_winfsp_create failed: 0x%08X\n", (unsigned)status);
-		goto exit;
-	}
-
-	if (debug)
-		FspFileSystemSetDebugLog(instance->file_system, (ULONG)-1);
-
-	status = memfs_winfsp_mount(instance, mount_point);
-	if (!NT_SUCCESS(status)) {
-		fwprintf(stderr, L"Cannot mount %s: 0x%08X\n", mount_point, (unsigned)status);
-		goto exit;
-	}
-
-	status = memfs_winfsp_start(instance, thread_count);
-	if (!NT_SUCCESS(status)) {
-		fwprintf(stderr, L"Cannot start WinFsp dispatcher: 0x%08X\n", (unsigned)status);
-		goto exit;
-	}
-
-	g_stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
-	if (g_stop_event == NULL) {
-		fwprintf(stderr, L"CreateEvent failed: %lu\n", GetLastError());
-		goto stop;
-	}
-
-	SetConsoleCtrlHandler(console_handler, TRUE);
-
-	if (capacity_auto)
-		wprintf(L"MEMFS mounted at %s (auto capacity)%s%s. Press Ctrl+C to stop.\n", mount_point,
-				compression_enabled ? L", compressed" : L"", encryption_enabled ? L", encrypted" : L"");
-	else
-		wprintf(L"MEMFS mounted at %s (%llu MiB)%s%s. Press Ctrl+C to stop.\n", mount_point,
-				(unsigned long long)(capacity / (1024ULL * 1024ULL)), compression_enabled ? L", compressed" : L"",
-				encryption_enabled ? L", encrypted" : L"");
-
-	WaitForSingleObject(g_stop_event, INFINITE);
-	exit_code = 0;
-
-	SetConsoleCtrlHandler(console_handler, FALSE);
-	CloseHandle(g_stop_event);
-	g_stop_event = NULL;
-
-stop:
-	memfs_winfsp_stop(instance);
-
-exit:
-	memfs_winfsp_destroy(instance);
-	SecureZeroMemory(encryption_key, sizeof(encryption_key));
-	return exit_code;
+    CloseHandle(g_stop_event);
+    g_stop_event = NULL;
+    SecureZeroMemory(g_config.encryption_key, sizeof(g_config.encryption_key));
+    return parse_result;
 }

@@ -15,7 +15,10 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_C_COMPILER": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/Llvm/x64/bin/clang-cl.exe",
         "CMAKE_TOOLCHAIN_FILE": "D:/vcpkg/scripts/buildsystems/vcpkg.cmake",
-        "VCPKG_TARGET_TRIPLET": "x64-windows"
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static",
+        "WINFSP_SOURCE_ROOT": "D:/src/winfsp",
+        "MEMFS_STATIC_WINFSP": "ON",
+        "WINFSP_DRIVER_SOURCE": "C:/Program Files (x86)/WinFsp/SxS/sxs.20251221T124141Z/bin/winfsp-x64.sys"
       }
     },
     {

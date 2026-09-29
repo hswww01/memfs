@@ -4,63 +4,77 @@
 #include <stdint.h>
 #include <string.h>
 
-#define MEMFS_ALLOC_SLAB_SIZE (64U * 1024U)
 #define MEMFS_SLAB_MAGIC 0x4D46534CU
-#define MEMFS_ALLOC_BOOTSTRAP_MAGIC 0x4D464253U
-#define MEMFS_ALLOC_POOL_COUNT (3U + MEMFS_ALLOC_NAME_POOL_COUNT + MEMFS_ALLOC_GENERIC_POOL_COUNT)
-#define MEMFS_DEDICATED_MAGIC 0x4D46444BU
-
-_Static_assert((MEMFS_ALLOC_SLAB_SIZE & (MEMFS_ALLOC_SLAB_SIZE - 1U)) == 0, "slab size must be a power of two");
+#define MEMFS_ALLOC_STATE_MAGIC 0x4D464153U
+#define MEMFS_AREA_MAGIC 0x4D464152U
+#define MEMFS_MIN_SLAB_BYTES (4U * 1024U)
+#define MEMFS_MAX_SLAB_BYTES (64U * 1024U)
+#define MEMFS_ALLOC_ALIGNMENT 16U
 
 typedef struct MemfsFreeObject {
-	struct MemfsFreeObject* next;
+    struct MemfsFreeObject* next;
 } MemfsFreeObject;
 
+typedef struct MemfsPool MemfsPool;
 typedef struct MemfsSlab MemfsSlab;
+typedef struct MemfsAreaBlock MemfsAreaBlock;
 
-struct MemfsObjectPool {
-	size_t object_size;
-	MemfsSlab* slabs;
-	MemfsSlab* available;
-	SRWLOCK lock;
-	uint64_t live_objects;
-	uint64_t reserved_bytes;
-	uint64_t committed_bytes;
-	uint32_t slab_count;
-	uint32_t in_use;
-	uint32_t slot_index;
-	uint32_t magic;
-};
-
-typedef struct MemfsBootstrap {
-	uint32_t magic;
-	uint32_t size;
-	uint32_t pool_count;
-	uint32_t reserved;
-	MemfsObjectPool pools[MEMFS_ALLOC_POOL_COUNT];
-} MemfsBootstrap;
-struct MemfsDedicatedBlock {
-	MemfsDedicatedBlock* next;
-	uint8_t* backing;
-	uint64_t requested_bytes;
-	uint64_t allocated_bytes;
-	uint64_t committed_bytes;
-	uint32_t magic;
-	uint32_t reserved;
+struct MemfsPool {
+    MemfsAllocatorState* state;
+    size_t object_size;
+    size_t slab_bytes;
+    MemfsSlab* slabs;
+    MemfsSlab* available;
+    SRWLOCK lock;
+    uint64_t live_objects;
+    uint64_t live_bytes;
+    uint64_t reserved_bytes;
+    uint64_t committed_bytes;
+    uint32_t slab_count;
 };
 
 struct MemfsSlab {
-	MemfsSlab* next;
-	MemfsSlab* prev;
-	MemfsSlab* available_next;
-	MemfsSlab* available_prev;
-	MemfsObjectPool* owner;
-	MemfsFreeObject* free_list;
-	uint32_t capacity;
-	uint32_t free_count;
-	uint32_t magic;
-	uint32_t reserved;
-	uint8_t data[];
+    MemfsSlab* next;
+    MemfsSlab* prev;
+    MemfsSlab* available_next;
+    MemfsSlab* available_prev;
+    MemfsPool* owner;
+    MemfsFreeObject* free_list;
+    size_t region_bytes;
+    uint32_t capacity;
+    uint32_t free_count;
+    uint32_t magic;
+    uint32_t reserved;
+};
+
+struct MemfsAreaBlock {
+    MemfsAreaBlock* next;
+    MemfsAreaBlock* prev;
+    MemfsAllocatorState* owner;
+    uint64_t requested_bytes;
+    uint64_t region_bytes;
+    uint32_t magic;
+    uint32_t reserved;
+};
+
+struct MemfsAllocatorState {
+    uint32_t magic;
+    uint32_t class_count;
+    size_t allocation_granularity;
+    uint64_t region_bytes;
+    MemfsPool pools[MEMFS_ALLOC_CLASS_COUNT];
+
+    SRWLOCK area_lock;
+    MemfsAreaBlock* areas;
+    uint64_t area_count;
+    uint64_t area_live_bytes;
+    uint64_t area_reserved_bytes;
+    uint64_t area_committed_bytes;
+};
+
+static const size_t g_class_sizes[MEMFS_ALLOC_CLASS_COUNT] = {
+    8U, 16U, 24U, 32U, 48U, 64U, 96U, 128U, 192U, 256U,
+    384U, 512U, 768U, 1024U, 1536U, 2048U, 3072U, 4096U, 8192U
 };
 
 #if !defined(NDEBUG)
@@ -68,715 +82,777 @@ static volatile LONG g_memfs_alloc_fail_point = MEMFS_ALLOC_FAIL_NONE;
 static volatile LONG g_memfs_alloc_fail_skip;
 static volatile LONG g_memfs_alloc_fail_remaining;
 
-void memfs_allocator_test_fail_after(MemfsAllocFailPoint point, uint32_t successful_calls_before_failure,
-									 uint32_t failure_count) {
-	/* Publish the point last so readers never observe a half-configured rule. */
-	InterlockedExchange(&g_memfs_alloc_fail_point, MEMFS_ALLOC_FAIL_NONE);
-	InterlockedExchange(&g_memfs_alloc_fail_skip, (LONG)successful_calls_before_failure);
-	InterlockedExchange(&g_memfs_alloc_fail_remaining, (LONG)failure_count);
-	InterlockedExchange(&g_memfs_alloc_fail_point, (LONG)point);
+void memfs_allocator_test_fail_after(MemfsAllocFailPoint point,
+                                     uint32_t successful_calls_before_failure,
+                                     uint32_t failure_count) {
+    InterlockedExchange(&g_memfs_alloc_fail_point, MEMFS_ALLOC_FAIL_NONE);
+    InterlockedExchange(&g_memfs_alloc_fail_skip, (LONG)successful_calls_before_failure);
+    InterlockedExchange(&g_memfs_alloc_fail_remaining, (LONG)failure_count);
+    InterlockedExchange(&g_memfs_alloc_fail_point, (LONG)point);
 }
 
 void memfs_allocator_test_clear_failures(void) {
-	InterlockedExchange(&g_memfs_alloc_fail_point, MEMFS_ALLOC_FAIL_NONE);
-	InterlockedExchange(&g_memfs_alloc_fail_skip, 0);
-	InterlockedExchange(&g_memfs_alloc_fail_remaining, 0);
+    InterlockedExchange(&g_memfs_alloc_fail_point, MEMFS_ALLOC_FAIL_NONE);
+    InterlockedExchange(&g_memfs_alloc_fail_skip, 0);
+    InterlockedExchange(&g_memfs_alloc_fail_remaining, 0);
 }
 
 bool memfs_allocator_test_should_fail(MemfsAllocFailPoint point) {
-	LONG current;
-	LONG value;
+    LONG current;
+    LONG value;
 
-	if (point == MEMFS_ALLOC_FAIL_NONE)
-		return false;
+    if (point == MEMFS_ALLOC_FAIL_NONE)
+        return false;
 
-	current = InterlockedCompareExchange(&g_memfs_alloc_fail_point, 0, 0);
-	if (current != (LONG)point)
-		return false;
+    current = InterlockedCompareExchange(&g_memfs_alloc_fail_point, 0, 0);
+    if (current != (LONG)point)
+        return false;
 
-	for (;;) {
-		value = InterlockedCompareExchange(&g_memfs_alloc_fail_skip, 0, 0);
-		if (value <= 0)
-			break;
-		if (InterlockedCompareExchange(&g_memfs_alloc_fail_skip, value - 1, value) == value)
-			return false;
-	}
+    for (;;) {
+        value = InterlockedCompareExchange(&g_memfs_alloc_fail_skip, 0, 0);
+        if (value <= 0)
+            break;
+        if (InterlockedCompareExchange(&g_memfs_alloc_fail_skip, value - 1, value) == value)
+            return false;
+    }
 
-	for (;;) {
-		value = InterlockedCompareExchange(&g_memfs_alloc_fail_remaining, 0, 0);
-		if (value <= 0)
-			return false;
-		if (InterlockedCompareExchange(&g_memfs_alloc_fail_remaining, value - 1, value) == value)
-			return true;
-	}
+    for (;;) {
+        value = InterlockedCompareExchange(&g_memfs_alloc_fail_remaining, 0, 0);
+        if (value <= 0)
+            return false;
+        if (InterlockedCompareExchange(&g_memfs_alloc_fail_remaining, value - 1, value) == value)
+            return true;
+    }
 }
 #endif
 
-static const size_t g_name_pool_sizes[MEMFS_ALLOC_NAME_POOL_COUNT] = {8U,  16U,	 24U,  32U,	 48U,  64U,
-																	  96U, 128U, 192U, 256U, 384U, 512U};
-static const size_t g_generic_pool_sizes[MEMFS_ALLOC_GENERIC_POOL_COUNT] = {
-	8U,		16U,	24U,	32U,	48U,	64U,	96U,	128U,	192U,	256U,	384U,
-	512U,	768U,	1024U, 1536U, 2048U, 4096U, 8192U, 16384U, 32768U
-};
-
 static size_t align_up(size_t value, size_t alignment) {
-	if (value > SIZE_MAX - (alignment - 1U))
-		return 0;
-
-	return (value + alignment - 1U) & ~(alignment - 1U);
-}
-
-static size_t pool_object_size(size_t size) {
-	const size_t alignment = sizeof(void*);
-	size_t object_size = size < sizeof(MemfsFreeObject) ? sizeof(MemfsFreeObject) : size;
-
-	return align_up(object_size, alignment);
-}
-
-static MemfsBootstrap* bootstrap_from_pool(const MemfsObjectPool* pool) {
-	MemfsBootstrap* bootstrap;
-	uintptr_t base;
-
-	if (pool == NULL || pool->magic != MEMFS_SLAB_MAGIC || pool->slot_index >= MEMFS_ALLOC_POOL_COUNT)
-		return NULL;
-
-	base = (uintptr_t)pool - offsetof(MemfsBootstrap, pools) -
-		   (size_t)pool->slot_index * sizeof(MemfsObjectPool);
-	bootstrap = (MemfsBootstrap*)base;
-	if (bootstrap->magic != MEMFS_ALLOC_BOOTSTRAP_MAGIC ||
-		bootstrap->pool_count != MEMFS_ALLOC_POOL_COUNT ||
-		&bootstrap->pools[pool->slot_index] != pool)
-		return NULL;
-
-	return bootstrap;
-}
-
-static MemfsObjectPool* pool_create(MemfsBootstrap* bootstrap, uint32_t slot_index, size_t size) {
-	MemfsObjectPool* pool;
-
-	if (bootstrap == NULL || slot_index >= bootstrap->pool_count || bootstrap->pools[slot_index].in_use)
-		return NULL;
-
-	pool = &bootstrap->pools[slot_index];
-	memset(pool, 0, sizeof(*pool));
-	pool->object_size = pool_object_size(size);
-	if (pool->object_size == 0 ||
-		pool->object_size > MEMFS_ALLOC_SLAB_SIZE - align_up(sizeof(MemfsSlab), sizeof(void*)))
-		return NULL;
-
-	pool->slot_index = slot_index;
-	pool->in_use = 1;
-	pool->magic = MEMFS_SLAB_MAGIC;
-	InitializeSRWLock(&pool->lock);
-	return pool;
-}
-
-static void available_insert(MemfsObjectPool* pool, MemfsSlab* slab) {
-	slab->available_prev = NULL;
-	slab->available_next = pool->available;
-
-	if (pool->available != NULL)
-		pool->available->available_prev = slab;
-
-	pool->available = slab;
-}
-
-static void available_remove(MemfsObjectPool* pool, MemfsSlab* slab) {
-	if (slab->available_prev != NULL)
-		slab->available_prev->available_next = slab->available_next;
-	else if (pool->available == slab)
-		pool->available = slab->available_next;
-
-	if (slab->available_next != NULL)
-		slab->available_next->available_prev = slab->available_prev;
-
-	slab->available_prev = NULL;
-	slab->available_next = NULL;
-}
-
-static void all_insert(MemfsObjectPool* pool, MemfsSlab* slab) {
-	slab->prev = NULL;
-	slab->next = pool->slabs;
-
-	if (pool->slabs != NULL)
-		pool->slabs->prev = slab;
-
-	pool->slabs = slab;
-}
-
-static void all_remove(MemfsObjectPool* pool, MemfsSlab* slab) {
-	if (slab->prev != NULL)
-		slab->prev->next = slab->next;
-	else
-		pool->slabs = slab->next;
-
-	if (slab->next != NULL)
-		slab->next->prev = slab->prev;
-
-	slab->prev = NULL;
-	slab->next = NULL;
-}
-
-static MemfsSlab* slab_create(MemfsObjectPool* pool) {
-	const size_t data_offset = align_up(sizeof(MemfsSlab), sizeof(void*));
-	uint8_t* data;
-	MemfsSlab* slab;
-	uint32_t capacity;
-	uint32_t i;
-
-	capacity = (uint32_t)((MEMFS_ALLOC_SLAB_SIZE - data_offset) / pool->object_size);
-	if (capacity == 0)
-		return NULL;
-
-	if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_SLAB))
-		return NULL;
-
-	slab = VirtualAlloc(NULL, MEMFS_ALLOC_SLAB_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-	if (slab == NULL)
-		return NULL;
-
-	memset(slab, 0, data_offset);
-	slab->owner = pool;
-	slab->capacity = capacity;
-	slab->free_count = capacity;
-	slab->magic = MEMFS_SLAB_MAGIC;
-
-	data = (uint8_t*)slab + data_offset;
-	for (i = 0; i < capacity; i++) {
-		MemfsFreeObject* object = (MemfsFreeObject*)(data + (size_t)i * pool->object_size);
-
-		object->next = slab->free_list;
-		slab->free_list = object;
-	}
-
-	all_insert(pool, slab);
-	available_insert(pool, slab);
-	pool->slab_count++;
-	pool->reserved_bytes += MEMFS_ALLOC_SLAB_SIZE;
-	pool->committed_bytes += MEMFS_ALLOC_SLAB_SIZE;
-	return slab;
-}
-
-static MemfsSlab* slab_from_object(void* ptr) {
-	uintptr_t address = (uintptr_t)ptr;
-	uintptr_t base = address & ~((uintptr_t)MEMFS_ALLOC_SLAB_SIZE - 1U);
-
-	return (MemfsSlab*)base;
-}
-
-static void* pool_alloc(MemfsObjectPool* pool) {
-	MemfsFreeObject* object;
-	MemfsSlab* slab;
-
-	if (pool == NULL)
-		return NULL;
-
-	AcquireSRWLockExclusive(&pool->lock);
-
-	slab = pool->available;
-	if (slab == NULL) {
-		slab = slab_create(pool);
-		if (slab == NULL) {
-			ReleaseSRWLockExclusive(&pool->lock);
-			return NULL;
-		}
-	}
-
-	object = slab->free_list;
-	slab->free_list = object->next;
-	slab->free_count--;
-	pool->live_objects++;
-
-	if (slab->free_count == 0)
-		available_remove(pool, slab);
-
-	ReleaseSRWLockExclusive(&pool->lock);
-
-	memset(object, 0, pool->object_size);
-	return object;
-}
-
-static void pool_free(MemfsObjectPool* pool, void* ptr) {
-	MemfsFreeObject* object = ptr;
-	MemfsSlab* slab;
-	bool release_slab = false;
-
-	if (pool == NULL || object == NULL)
-		return;
-
-	slab = slab_from_object(ptr);
-	if (slab->magic != MEMFS_SLAB_MAGIC || slab->owner != pool)
-		return;
-
-	AcquireSRWLockExclusive(&pool->lock);
-
-	if (slab->free_count == 0)
-		available_insert(pool, slab);
-
-	object->next = slab->free_list;
-	slab->free_list = object;
-	slab->free_count++;
-
-	if (pool->live_objects != 0)
-		pool->live_objects--;
-
-	/*
-	 * Keep one completely empty slab per size class as a hot cache.  Any
-	 * additional empty slab is returned to Windows immediately, which keeps
-	 * long-lived create/delete workloads from pinning their high-water RSS.
-	 */
-	if (slab->free_count == slab->capacity && (pool->slab_count > 1U || pool->live_objects == 0)) {
-		available_remove(pool, slab);
-		all_remove(pool, slab);
-		pool->slab_count--;
-		pool->reserved_bytes -= MEMFS_ALLOC_SLAB_SIZE;
-		pool->committed_bytes -= MEMFS_ALLOC_SLAB_SIZE;
-		slab->magic = 0;
-		release_slab = true;
-	}
-
-	ReleaseSRWLockExclusive(&pool->lock);
-
-	if (release_slab)
-		VirtualFree(slab, 0, MEM_RELEASE);
-}
-
-static void pool_destroy(MemfsObjectPool* pool) {
-	MemfsSlab* slab;
-
-	if (pool == NULL || pool->magic != MEMFS_SLAB_MAGIC)
-		return;
-
-	slab = pool->slabs;
-	while (slab != NULL) {
-		MemfsSlab* next = slab->next;
-		slab->magic = 0;
-		VirtualFree(slab, 0, MEM_RELEASE);
-		slab = next;
-	}
-
-	memset(pool, 0, sizeof(*pool));
-}
-
-
-static void pool_add_stats(MemfsObjectPool* pool, MemfsAllocatorStats* stats) {
-	if (pool == NULL)
-		return;
-
-	AcquireSRWLockShared(&pool->lock);
-	stats->reserved_bytes += pool->reserved_bytes;
-	stats->committed_bytes += pool->committed_bytes;
-	stats->live_bytes += pool->live_objects * pool->object_size;
-	stats->live_objects += pool->live_objects;
-	stats->slab_count += pool->slab_count;
-	ReleaseSRWLockShared(&pool->lock);
-}
-
-static int name_pool_index(size_t bytes) {
-	int i;
-
-	for (i = 0; i < MEMFS_ALLOC_NAME_POOL_COUNT; i++) {
-		if (bytes <= g_name_pool_sizes[i])
-			return i;
-	}
-
-	return -1;
-}
-static int generic_pool_index(size_t bytes) {
-	int i;
-
-	for (i = 0; i < MEMFS_ALLOC_GENERIC_POOL_COUNT; i++) {
-		if (bytes <= g_generic_pool_sizes[i])
-			return i;
-	}
-
-	return -1;
+    if (alignment == 0 || (alignment & (alignment - 1U)) != 0)
+        return 0;
+    if (value > SIZE_MAX - (alignment - 1U))
+        return 0;
+    return (value + alignment - 1U) & ~(alignment - 1U);
 }
 
 static uint64_t virtual_region_bytes(const void* ptr) {
-	MEMORY_BASIC_INFORMATION info;
+    MEMORY_BASIC_INFORMATION info;
 
-	if (ptr == NULL || VirtualQuery(ptr, &info, sizeof(info)) != sizeof(info))
-		return 0;
-
-	return (uint64_t)info.RegionSize;
+    if (ptr == NULL || VirtualQuery(ptr, &info, sizeof(info)) != sizeof(info))
+        return 0;
+    return (uint64_t)info.RegionSize;
 }
 
-static void* dedicated_alloc(MemfsAllocator* allocator, size_t bytes) {
-	MemfsDedicatedBlock* block;
-	size_t header_size;
-	size_t total_size;
+static int class_index(size_t bytes) {
+    int i;
 
-	if (allocator == NULL || bytes == 0)
-		return NULL;
+    if (bytes == 0 || bytes > MEMFS_ALLOC_AREA_THRESHOLD)
+        return -1;
 
-	header_size = align_up(sizeof(*block), sizeof(void*));
-	if (header_size == 0 || bytes > SIZE_MAX - header_size)
-		return NULL;
-	total_size = header_size + bytes;
-
-	if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_DEDICATED))
-		return NULL;
-
-	block = VirtualAlloc(NULL, total_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-	if (block == NULL)
-		return NULL;
-
-	memset(block, 0, header_size);
-	block->backing = (uint8_t*)block + header_size;
-	block->requested_bytes = bytes;
-	block->allocated_bytes = virtual_region_bytes(block);
-	block->committed_bytes = block->allocated_bytes;
-	block->magic = MEMFS_DEDICATED_MAGIC;
-
-	AcquireSRWLockExclusive(&allocator->dedicated_lock);
-	block->next = allocator->dedicated;
-	allocator->dedicated = block;
-	ReleaseSRWLockExclusive(&allocator->dedicated_lock);
-
-	return block->backing;
+    for (i = 0; i < MEMFS_ALLOC_CLASS_COUNT; i++) {
+        if (bytes <= g_class_sizes[i])
+            return i;
+    }
+    return -1;
 }
 
-static void dedicated_free(MemfsAllocator* allocator, void* ptr) {
-	MemfsDedicatedBlock* block;
-	MemfsDedicatedBlock* prev;
-	bool found = false;
-
-	if (allocator == NULL || ptr == NULL)
-		return;
-
-	AcquireSRWLockExclusive(&allocator->dedicated_lock);
-	prev = NULL;
-	for (block = allocator->dedicated; block != NULL; block = block->next) {
-		if (block->magic == MEMFS_DEDICATED_MAGIC && block->backing == ptr) {
-			found = true;
-			if (prev == NULL)
-				allocator->dedicated = block->next;
-			else
-				prev->next = block->next;
-			break;
-		}
-		prev = block;
-	}
-	if (!found) {
-		ReleaseSRWLockExclusive(&allocator->dedicated_lock);
-		return;
-	}
-
-	block->magic = 0;
-	ReleaseSRWLockExclusive(&allocator->dedicated_lock);
-
-	VirtualFree(block, 0, MEM_RELEASE);
+static size_t slab_bytes_for_object(size_t object_size) {
+    if (object_size <= 128U)
+        return 4U * 1024U;
+    if (object_size <= 256U)
+        return 8U * 1024U;
+    if (object_size <= 512U)
+        return 16U * 1024U;
+    if (object_size <= 1024U)
+        return 32U * 1024U;
+    return 64U * 1024U;
 }
 
-static void dedicated_add_stats(MemfsAllocator* allocator, MemfsAllocatorStats* stats) {
-	MemfsDedicatedBlock* block;
+#if !defined(NDEBUG)
+bool memfs_allocator_test_class_layout(size_t bytes,
+                                       size_t* class_bytes,
+                                       size_t* slab_bytes) {
+    int index = class_index(bytes);
 
-	if (allocator == NULL || stats == NULL)
-		return;
+    if (class_bytes)
+        *class_bytes = 0;
+    if (slab_bytes)
+        *slab_bytes = 0;
+    if (index < 0)
+        return false;
 
-	AcquireSRWLockShared(&allocator->dedicated_lock);
-	for (block = allocator->dedicated; block != NULL; block = block->next) {
-		if (block->magic != MEMFS_DEDICATED_MAGIC)
-			continue;
-		stats->dedicated_count++;
-		stats->dedicated_reserved_bytes += block->allocated_bytes;
-		stats->dedicated_committed_bytes += block->committed_bytes;
-		stats->dedicated_live_bytes += block->requested_bytes;
-		stats->reserved_bytes += block->allocated_bytes;
-		stats->committed_bytes += block->committed_bytes;
-		stats->live_bytes += block->requested_bytes;
-		stats->live_objects++;
-	}
-	ReleaseSRWLockShared(&allocator->dedicated_lock);
+    if (class_bytes)
+        *class_bytes = g_class_sizes[index];
+    if (slab_bytes)
+        *slab_bytes = slab_bytes_for_object(g_class_sizes[index]);
+    return true;
+}
+#endif
+
+static void available_insert(MemfsPool* pool, MemfsSlab* slab) {
+    slab->available_prev = NULL;
+    slab->available_next = pool->available;
+    if (pool->available)
+        pool->available->available_prev = slab;
+    pool->available = slab;
 }
 
-static bool bootstrap_init(MemfsBootstrap** out_bootstrap) {
-	MemfsBootstrap* bootstrap;
+static void available_remove(MemfsPool* pool, MemfsSlab* slab) {
+    if (slab->available_prev)
+        slab->available_prev->available_next = slab->available_next;
+    else if (pool->available == slab)
+        pool->available = slab->available_next;
 
-	if (out_bootstrap == NULL)
-		return false;
+    if (slab->available_next)
+        slab->available_next->available_prev = slab->available_prev;
 
-	*out_bootstrap = NULL;
-	if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_BOOTSTRAP))
-		return false;
-
-	bootstrap = VirtualAlloc(NULL, sizeof(MemfsBootstrap), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-	if (bootstrap == NULL)
-		return false;
-
-	memset(bootstrap, 0, sizeof(*bootstrap));
-	bootstrap->magic = MEMFS_ALLOC_BOOTSTRAP_MAGIC;
-	bootstrap->size = sizeof(MemfsBootstrap);
-	bootstrap->pool_count = MEMFS_ALLOC_POOL_COUNT;
-	*out_bootstrap = bootstrap;
-	return true;
+    slab->available_prev = NULL;
+    slab->available_next = NULL;
 }
 
-static void bootstrap_destroy(MemfsBootstrap* bootstrap) {
-	if (bootstrap == NULL || bootstrap->magic != MEMFS_ALLOC_BOOTSTRAP_MAGIC)
-		return;
-
-	memset(bootstrap, 0, sizeof(*bootstrap));
-	VirtualFree(bootstrap, 0, MEM_RELEASE);
+static void all_insert(MemfsPool* pool, MemfsSlab* slab) {
+    slab->prev = NULL;
+    slab->next = pool->slabs;
+    if (pool->slabs)
+        pool->slabs->prev = slab;
+    pool->slabs = slab;
 }
 
-static void allocator_fail_destroy(MemfsAllocator* allocator, MemfsBootstrap* bootstrap) {
-	int i;
+static void all_remove(MemfsPool* pool, MemfsSlab* slab) {
+    if (slab->prev)
+        slab->prev->next = slab->next;
+    else
+        pool->slabs = slab->next;
 
-	if (allocator != NULL) {
-		pool_destroy(allocator->node_pool);
-		pool_destroy(allocator->dir_pool);
-		pool_destroy(allocator->page_group_pool);
-		for (i = 0; i < MEMFS_ALLOC_NAME_POOL_COUNT; i++)
-			pool_destroy(allocator->name_pools[i]);
-		for (i = 0; i < MEMFS_ALLOC_GENERIC_POOL_COUNT; i++)
-			pool_destroy(allocator->generic_pools[i]);
-		memset(allocator, 0, sizeof(*allocator));
-	}
-	bootstrap_destroy(bootstrap);
+    if (slab->next)
+        slab->next->prev = slab->prev;
+
+    slab->prev = NULL;
+    slab->next = NULL;
 }
 
-bool memfs_allocator_init(MemfsAllocator* allocator, size_t node_size, size_t dir_size, size_t page_group_size) {
-	MemfsBootstrap* bootstrap;
-	int i;
+static MemfsSlab* slab_create(MemfsPool* pool) {
+    const size_t data_offset = align_up(sizeof(MemfsSlab), MEMFS_ALLOC_ALIGNMENT);
+    MemfsSlab* slab;
+    uint8_t* data;
+    uint32_t capacity;
+    uint32_t i;
 
-	if (allocator == NULL || node_size == 0 || dir_size == 0 || page_group_size == 0)
-		return false;
+    if (pool == NULL || data_offset == 0 || pool->slab_bytes <= data_offset)
+        return NULL;
 
-	memset(allocator, 0, sizeof(*allocator));
-	if (!bootstrap_init(&bootstrap))
-		return false;
+    capacity = (uint32_t)((pool->slab_bytes - data_offset) / pool->object_size);
+    if (capacity == 0)
+        return NULL;
 
-	allocator->node_pool = pool_create(bootstrap, 0U, node_size);
-	allocator->dir_pool = pool_create(bootstrap, 1U, dir_size);
-	allocator->page_group_pool = pool_create(bootstrap, 2U, page_group_size);
+    if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_SLAB))
+        return NULL;
 
-	if (allocator->node_pool == NULL || allocator->dir_pool == NULL || allocator->page_group_pool == NULL) {
-		allocator_fail_destroy(allocator, bootstrap);
-		return false;
-	}
+    slab = VirtualAlloc(NULL, pool->slab_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (slab == NULL)
+        return NULL;
 
-	for (i = 0; i < MEMFS_ALLOC_NAME_POOL_COUNT; i++) {
-		allocator->name_pools[i] = pool_create(bootstrap, (uint32_t)(3 + i), g_name_pool_sizes[i]);
-		if (allocator->name_pools[i] == NULL) {
-			allocator_fail_destroy(allocator, bootstrap);
-			return false;
-		}
-	}
+    memset(slab, 0, data_offset);
+    slab->owner = pool;
+    slab->capacity = capacity;
+    slab->free_count = capacity;
+    slab->region_bytes = virtual_region_bytes(slab);
+    slab->magic = MEMFS_SLAB_MAGIC;
 
-	for (i = 0; i < MEMFS_ALLOC_GENERIC_POOL_COUNT; i++) {
-		allocator->generic_pools[i] = pool_create(bootstrap, (uint32_t)(3 + MEMFS_ALLOC_NAME_POOL_COUNT + i),
-												  g_generic_pool_sizes[i]);
-		if (allocator->generic_pools[i] == NULL) {
-			allocator_fail_destroy(allocator, bootstrap);
-			return false;
-		}
-	}
+    data = (uint8_t*)slab + data_offset;
+    for (i = 0; i < capacity; i++) {
+        MemfsFreeObject* object = (MemfsFreeObject*)(data + (size_t)i * pool->object_size);
+        object->next = slab->free_list;
+        slab->free_list = object;
+    }
 
-	allocator->dedicated = NULL;
-	InitializeSRWLock(&allocator->dedicated_lock);
-	return true;
+    all_insert(pool, slab);
+    available_insert(pool, slab);
+    pool->slab_count++;
+    pool->reserved_bytes += slab->region_bytes;
+    pool->committed_bytes += slab->region_bytes;
+    return slab;
 }
 
+static MemfsSlab* slab_from_object(MemfsAllocatorState* state, void* ptr) {
+    uintptr_t address;
+    uintptr_t granularity;
+
+    if (state == NULL || ptr == NULL)
+        return NULL;
+
+    granularity = (uintptr_t)state->allocation_granularity;
+    if (granularity == 0 || (granularity & (granularity - 1U)) != 0)
+        return NULL;
+
+    address = (uintptr_t)ptr;
+    return (MemfsSlab*)(address & ~(granularity - 1U));
+}
+
+static void* pool_alloc(MemfsPool* pool, size_t requested_bytes) {
+    MemfsSlab* slab;
+    MemfsFreeObject* object;
+
+    if (pool == NULL || requested_bytes == 0 || requested_bytes > pool->object_size)
+        return NULL;
+
+    AcquireSRWLockExclusive(&pool->lock);
+
+    slab = pool->available;
+    if (slab == NULL) {
+        slab = slab_create(pool);
+        if (slab == NULL) {
+            ReleaseSRWLockExclusive(&pool->lock);
+            return NULL;
+        }
+    }
+
+    object = slab->free_list;
+    slab->free_list = object->next;
+    slab->free_count--;
+    pool->live_objects++;
+    pool->live_bytes += requested_bytes;
+
+    if (slab->free_count == 0)
+        available_remove(pool, slab);
+
+    ReleaseSRWLockExclusive(&pool->lock);
+
+    memset(object, 0, pool->object_size);
+    return object;
+}
+
+static void pool_adjust_live_bytes(MemfsPool* pool, size_t old_bytes, size_t new_bytes) {
+    if (pool == NULL || old_bytes == new_bytes)
+        return;
+
+    AcquireSRWLockExclusive(&pool->lock);
+    if (new_bytes >= old_bytes)
+        pool->live_bytes += new_bytes - old_bytes;
+    else if (pool->live_bytes >= old_bytes - new_bytes)
+        pool->live_bytes -= old_bytes - new_bytes;
+    else
+        pool->live_bytes = 0;
+    ReleaseSRWLockExclusive(&pool->lock);
+}
+
+static void pool_free(MemfsPool* pool, void* ptr, size_t requested_bytes) {
+    MemfsFreeObject* object = (MemfsFreeObject*)ptr;
+    MemfsSlab* slab;
+    bool release_slab = false;
+
+    if (pool == NULL || ptr == NULL)
+        return;
+
+    slab = slab_from_object(pool->state, ptr);
+    if (slab == NULL)
+        return;
+
+    AcquireSRWLockExclusive(&pool->lock);
+
+    if (slab->magic != MEMFS_SLAB_MAGIC || slab->owner != pool) {
+        ReleaseSRWLockExclusive(&pool->lock);
+        return;
+    }
+
+    if (slab->free_count == 0)
+        available_insert(pool, slab);
+
+    object->next = slab->free_list;
+    slab->free_list = object;
+    slab->free_count++;
+
+    if (pool->live_objects)
+        pool->live_objects--;
+    if (pool->live_bytes >= requested_bytes)
+        pool->live_bytes -= requested_bytes;
+    else
+        pool->live_bytes = 0;
+
+    /*
+     * Keep at most one empty slab while the class still has live objects.
+     * Once a class becomes completely idle, return its final slab too.
+     */
+    if (slab->free_count == slab->capacity &&
+        (pool->slab_count > 1U || pool->live_objects == 0)) {
+        available_remove(pool, slab);
+        all_remove(pool, slab);
+        pool->slab_count--;
+        pool->reserved_bytes -= slab->region_bytes;
+        pool->committed_bytes -= slab->region_bytes;
+        slab->magic = 0;
+        release_slab = true;
+    }
+
+    ReleaseSRWLockExclusive(&pool->lock);
+
+    if (release_slab)
+        VirtualFree(slab, 0, MEM_RELEASE);
+}
+
+static uint64_t pool_scavenge(MemfsPool* pool) {
+    MemfsSlab* slab;
+    uint64_t released = 0;
+
+    if (pool == NULL)
+        return 0;
+
+    AcquireSRWLockExclusive(&pool->lock);
+
+    slab = pool->slabs;
+    while (slab) {
+        MemfsSlab* next = slab->next;
+
+        if (slab->free_count == slab->capacity) {
+            uint64_t bytes = slab->region_bytes;
+            available_remove(pool, slab);
+            all_remove(pool, slab);
+            pool->slab_count--;
+            pool->reserved_bytes -= bytes;
+            pool->committed_bytes -= bytes;
+            slab->magic = 0;
+            VirtualFree(slab, 0, MEM_RELEASE);
+            released += bytes;
+        }
+
+        slab = next;
+    }
+
+    ReleaseSRWLockExclusive(&pool->lock);
+    return released;
+}
+
+static void pool_destroy(MemfsPool* pool) {
+    MemfsSlab* slab;
+
+    if (pool == NULL)
+        return;
+
+    slab = pool->slabs;
+    while (slab) {
+        MemfsSlab* next = slab->next;
+        slab->magic = 0;
+        VirtualFree(slab, 0, MEM_RELEASE);
+        slab = next;
+    }
+
+    pool->slabs = NULL;
+    pool->available = NULL;
+    pool->live_objects = 0;
+    pool->live_bytes = 0;
+    pool->reserved_bytes = 0;
+    pool->committed_bytes = 0;
+    pool->slab_count = 0;
+}
+
+static void pool_add_stats(MemfsPool* pool, MemfsAllocatorStats* stats) {
+    if (pool == NULL || stats == NULL)
+        return;
+
+    AcquireSRWLockShared(&pool->lock);
+    stats->reserved_bytes += pool->reserved_bytes;
+    stats->committed_bytes += pool->committed_bytes;
+    stats->live_bytes += pool->live_bytes;
+    stats->live_objects += pool->live_objects;
+    stats->slab_count += pool->slab_count;
+    ReleaseSRWLockShared(&pool->lock);
+}
+
+static size_t area_header_size(void) {
+    return align_up(sizeof(MemfsAreaBlock), MEMFS_ALLOC_ALIGNMENT);
+}
+
+static void* area_alloc(MemfsAllocatorState* state, size_t bytes) {
+    MemfsAreaBlock* block;
+    size_t header_size;
+    size_t total_size;
+
+    if (state == NULL || bytes == 0)
+        return NULL;
+
+    header_size = area_header_size();
+    if (header_size == 0 || bytes > SIZE_MAX - header_size)
+        return NULL;
+    total_size = header_size + bytes;
+
+    if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_DEDICATED))
+        return NULL;
+
+    block = VirtualAlloc(NULL, total_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (block == NULL)
+        return NULL;
+
+    memset(block, 0, header_size);
+    block->owner = state;
+    block->requested_bytes = bytes;
+    block->region_bytes = virtual_region_bytes(block);
+    block->magic = MEMFS_AREA_MAGIC;
+
+    AcquireSRWLockExclusive(&state->area_lock);
+    block->prev = NULL;
+    block->next = state->areas;
+    if (state->areas)
+        state->areas->prev = block;
+    state->areas = block;
+    state->area_count++;
+    state->area_live_bytes += bytes;
+    state->area_reserved_bytes += block->region_bytes;
+    state->area_committed_bytes += block->region_bytes;
+    ReleaseSRWLockExclusive(&state->area_lock);
+
+    return (uint8_t*)block + header_size;
+}
+
+static void area_free(MemfsAllocatorState* state, void* ptr) {
+    MemfsAreaBlock* block;
+    size_t header_size;
+
+    if (state == NULL || ptr == NULL)
+        return;
+
+    header_size = area_header_size();
+    block = (MemfsAreaBlock*)((uint8_t*)ptr - header_size);
+
+    if (block->magic != MEMFS_AREA_MAGIC || block->owner != state)
+        return;
+
+    AcquireSRWLockExclusive(&state->area_lock);
+
+    if (block->prev)
+        block->prev->next = block->next;
+    else
+        state->areas = block->next;
+    if (block->next)
+        block->next->prev = block->prev;
+
+    if (state->area_count)
+        state->area_count--;
+    if (state->area_live_bytes >= block->requested_bytes)
+        state->area_live_bytes -= block->requested_bytes;
+    else
+        state->area_live_bytes = 0;
+    if (state->area_reserved_bytes >= block->region_bytes)
+        state->area_reserved_bytes -= block->region_bytes;
+    else
+        state->area_reserved_bytes = 0;
+    if (state->area_committed_bytes >= block->region_bytes)
+        state->area_committed_bytes -= block->region_bytes;
+    else
+        state->area_committed_bytes = 0;
+
+    block->magic = 0;
+    ReleaseSRWLockExclusive(&state->area_lock);
+
+    VirtualFree(block, 0, MEM_RELEASE);
+}
+
+static void area_destroy_all(MemfsAllocatorState* state) {
+    MemfsAreaBlock* block;
+
+    if (state == NULL)
+        return;
+
+    AcquireSRWLockExclusive(&state->area_lock);
+    block = state->areas;
+    state->areas = NULL;
+    state->area_count = 0;
+    state->area_live_bytes = 0;
+    state->area_reserved_bytes = 0;
+    state->area_committed_bytes = 0;
+    ReleaseSRWLockExclusive(&state->area_lock);
+
+    while (block) {
+        MemfsAreaBlock* next = block->next;
+        block->magic = 0;
+        VirtualFree(block, 0, MEM_RELEASE);
+        block = next;
+    }
+}
+
+static void area_add_stats(MemfsAllocatorState* state, MemfsAllocatorStats* stats) {
+    if (state == NULL || stats == NULL)
+        return;
+
+    AcquireSRWLockShared(&state->area_lock);
+    stats->dedicated_count = (uint32_t)state->area_count;
+    stats->dedicated_live_bytes = state->area_live_bytes;
+    stats->dedicated_reserved_bytes = state->area_reserved_bytes;
+    stats->dedicated_committed_bytes = state->area_committed_bytes;
+
+    stats->live_objects += state->area_count;
+    stats->live_bytes += state->area_live_bytes;
+    stats->reserved_bytes += state->area_reserved_bytes;
+    stats->committed_bytes += state->area_committed_bytes;
+    ReleaseSRWLockShared(&state->area_lock);
+}
+
+static MemfsAllocatorState* state_create(void) {
+    MemfsAllocatorState* state;
+    SYSTEM_INFO system_info;
+    int i;
+
+    if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_BOOTSTRAP))
+        return NULL;
+
+    state = VirtualAlloc(NULL, sizeof(*state), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (state == NULL)
+        return NULL;
+
+    memset(state, 0, sizeof(*state));
+    GetSystemInfo(&system_info);
+
+    state->magic = MEMFS_ALLOC_STATE_MAGIC;
+    state->class_count = MEMFS_ALLOC_CLASS_COUNT;
+    state->allocation_granularity = system_info.dwAllocationGranularity;
+    state->region_bytes = virtual_region_bytes(state);
+    InitializeSRWLock(&state->area_lock);
+
+    if (state->allocation_granularity < MEMFS_MAX_SLAB_BYTES ||
+        (state->allocation_granularity & (state->allocation_granularity - 1U)) != 0) {
+        VirtualFree(state, 0, MEM_RELEASE);
+        return NULL;
+    }
+
+    for (i = 0; i < MEMFS_ALLOC_CLASS_COUNT; i++) {
+        MemfsPool* pool = &state->pools[i];
+        pool->state = state;
+        pool->object_size = g_class_sizes[i];
+        pool->slab_bytes = slab_bytes_for_object(pool->object_size);
+        InitializeSRWLock(&pool->lock);
+    }
+
+    return state;
+}
+
+static void state_destroy(MemfsAllocatorState* state) {
+    int i;
+
+    if (state == NULL || state->magic != MEMFS_ALLOC_STATE_MAGIC)
+        return;
+
+    for (i = 0; i < MEMFS_ALLOC_CLASS_COUNT; i++)
+        pool_destroy(&state->pools[i]);
+
+    area_destroy_all(state);
+    state->magic = 0;
+    VirtualFree(state, 0, MEM_RELEASE);
+}
+
+static void* allocator_alloc_internal(MemfsAllocator* allocator, size_t bytes) {
+    int index;
+
+    if (allocator == NULL || allocator->state == NULL || bytes == 0)
+        return NULL;
+
+    index = class_index(bytes);
+    if (index >= 0)
+        return pool_alloc(&allocator->state->pools[index], bytes);
+
+    return area_alloc(allocator->state, bytes);
+}
+
+static void allocator_free_internal(MemfsAllocator* allocator, void* ptr, size_t bytes) {
+    int index;
+
+    if (allocator == NULL || allocator->state == NULL || ptr == NULL)
+        return;
+
+    index = class_index(bytes);
+    if (index >= 0)
+        pool_free(&allocator->state->pools[index], ptr, bytes);
+    else
+        area_free(allocator->state, ptr);
+}
+
+bool memfs_allocator_init(MemfsAllocator* allocator,
+                          size_t node_size,
+                          size_t dir_size,
+                          size_t page_group_size) {
+    MemfsAllocatorState* state;
+
+    if (allocator == NULL || node_size == 0 || dir_size == 0 || page_group_size == 0)
+        return false;
+
+    memset(allocator, 0, sizeof(*allocator));
+    state = state_create();
+    if (state == NULL)
+        return false;
+
+    allocator->state = state;
+    allocator->node_size = node_size;
+    allocator->dir_size = dir_size;
+    allocator->page_group_size = page_group_size;
+    return true;
+}
 
 void memfs_allocator_destroy(MemfsAllocator* allocator) {
-	MemfsBootstrap* bootstrap;
-	int i;
+    if (allocator == NULL)
+        return;
 
-	if (allocator == NULL)
-		return;
-
-	bootstrap = bootstrap_from_pool(allocator->node_pool);
-	if (bootstrap == NULL)
-		bootstrap = bootstrap_from_pool(allocator->dir_pool);
-	if (bootstrap == NULL)
-		bootstrap = bootstrap_from_pool(allocator->page_group_pool);
-	for (i = 0; i < MEMFS_ALLOC_NAME_POOL_COUNT && bootstrap == NULL; i++)
-		bootstrap = bootstrap_from_pool(allocator->name_pools[i]);
-
-	pool_destroy(allocator->node_pool);
-	pool_destroy(allocator->dir_pool);
-	pool_destroy(allocator->page_group_pool);
-
-	for (i = 0; i < MEMFS_ALLOC_NAME_POOL_COUNT; i++)
-		pool_destroy(allocator->name_pools[i]);
-
-	for (i = 0; i < MEMFS_ALLOC_GENERIC_POOL_COUNT; i++)
-		pool_destroy(allocator->generic_pools[i]);
-
-	while (allocator->dedicated != NULL) {
-		MemfsDedicatedBlock* block = allocator->dedicated;
-		allocator->dedicated = block->next;
-		VirtualFree(block, 0, MEM_RELEASE);
-	}
-
-	memset(allocator, 0, sizeof(*allocator));
-	bootstrap_destroy(bootstrap);
+    state_destroy(allocator->state);
+    memset(allocator, 0, sizeof(*allocator));
 }
 
 void* memfs_allocator_alloc_node(MemfsAllocator* allocator) {
-	if (allocator == NULL || memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_NODE))
-		return NULL;
-	return pool_alloc(allocator->node_pool);
+    if (allocator == NULL || memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_NODE))
+        return NULL;
+    return allocator_alloc_internal(allocator, allocator->node_size);
 }
 
 void memfs_allocator_free_node(MemfsAllocator* allocator, void* ptr) {
-	if (allocator != NULL)
-		pool_free(allocator->node_pool, ptr);
+    if (allocator)
+        allocator_free_internal(allocator, ptr, allocator->node_size);
 }
 
 void* memfs_allocator_alloc_dir(MemfsAllocator* allocator) {
-	if (allocator == NULL || memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_DIR))
-		return NULL;
-	return pool_alloc(allocator->dir_pool);
+    if (allocator == NULL || memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_DIR))
+        return NULL;
+    return allocator_alloc_internal(allocator, allocator->dir_size);
 }
 
 void memfs_allocator_free_dir(MemfsAllocator* allocator, void* ptr) {
-	if (allocator != NULL)
-		pool_free(allocator->dir_pool, ptr);
+    if (allocator)
+        allocator_free_internal(allocator, ptr, allocator->dir_size);
 }
 
 void* memfs_allocator_alloc_page_group(MemfsAllocator* allocator) {
-	if (allocator == NULL || memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_GROUP))
-		return NULL;
-	return pool_alloc(allocator->page_group_pool);
+    if (allocator == NULL || memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_GROUP))
+        return NULL;
+    return allocator_alloc_internal(allocator, allocator->page_group_size);
 }
 
 void memfs_allocator_free_page_group(MemfsAllocator* allocator, void* ptr) {
-	if (allocator != NULL)
-		pool_free(allocator->page_group_pool, ptr);
+    if (allocator)
+        allocator_free_internal(allocator, ptr, allocator->page_group_size);
 }
 
 void* memfs_allocator_alloc_name(MemfsAllocator* allocator, size_t bytes) {
-	int index;
-
-	if (allocator == NULL || bytes == 0)
-		return NULL;
-	if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_NAME))
-		return NULL;
-
-	index = name_pool_index(bytes);
-	if (index < 0)
-		return dedicated_alloc(allocator, bytes);
-
-	return pool_alloc(allocator->name_pools[index]);
+    if (allocator == NULL || bytes == 0 ||
+        memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_NAME))
+        return NULL;
+    return allocator_alloc_internal(allocator, bytes);
 }
 
 void memfs_allocator_free_name(MemfsAllocator* allocator, void* ptr, size_t bytes) {
-	int index;
-
-	if (allocator == NULL || ptr == NULL)
-		return;
-
-	index = name_pool_index(bytes);
-	if (index < 0) {
-		dedicated_free(allocator, ptr);
-		return;
-	}
-
-	pool_free(allocator->name_pools[index], ptr);
+    allocator_free_internal(allocator, ptr, bytes);
 }
+
 void* memfs_allocator_alloc(MemfsAllocator* allocator, size_t bytes) {
-	int index;
-
-	if (allocator == NULL || bytes == 0)
-		return NULL;
-	if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_GENERIC))
-		return NULL;
-
-	index = generic_pool_index(bytes);
-	if (index >= 0)
-		return pool_alloc(allocator->generic_pools[index]);
-
-	return dedicated_alloc(allocator, bytes);
+    if (allocator == NULL || bytes == 0 ||
+        memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_GENERIC))
+        return NULL;
+    return allocator_alloc_internal(allocator, bytes);
 }
 
 void* memfs_allocator_alloc_zero(MemfsAllocator* allocator, size_t bytes) {
-	return memfs_allocator_alloc(allocator, bytes);
+    return memfs_allocator_alloc(allocator, bytes);
 }
 
 void memfs_allocator_free(MemfsAllocator* allocator, void* ptr, size_t bytes) {
-	int index;
-
-	if (allocator == NULL || ptr == NULL)
-		return;
-
-	index = generic_pool_index(bytes);
-	if (index >= 0) {
-		pool_free(allocator->generic_pools[index], ptr);
-		return;
-	}
-
-	dedicated_free(allocator, ptr);
+    allocator_free_internal(allocator, ptr, bytes);
 }
 
-void* memfs_allocator_realloc(MemfsAllocator* allocator, void* ptr, size_t old_bytes, size_t new_bytes) {
-	void* next;
-	size_t copy_bytes;
-	int old_index;
-	int new_index;
+void* memfs_allocator_realloc(MemfsAllocator* allocator,
+                              void* ptr,
+                              size_t old_bytes,
+                              size_t new_bytes) {
+    void* next;
+    size_t copy_bytes;
+    int old_index;
+    int new_index;
 
-	if (allocator == NULL)
-		return NULL;
+    if (allocator == NULL)
+        return NULL;
 
-	if (ptr == NULL)
-		return memfs_allocator_alloc(allocator, new_bytes);
+    if (ptr == NULL)
+        return memfs_allocator_alloc(allocator, new_bytes);
 
-	if (new_bytes == 0) {
-		memfs_allocator_free(allocator, ptr, old_bytes);
-		return NULL;
-	}
+    if (new_bytes == 0) {
+        memfs_allocator_free(allocator, ptr, old_bytes);
+        return NULL;
+    }
 
-	old_index = generic_pool_index(old_bytes);
-	new_index = generic_pool_index(new_bytes);
+    old_index = class_index(old_bytes);
+    new_index = class_index(new_bytes);
 
-	if (old_index >= 0 && new_index >= 0 && old_index == new_index)
-		return ptr;
+    if (old_index >= 0 && old_index == new_index) {
+        pool_adjust_live_bytes(&allocator->state->pools[old_index], old_bytes, new_bytes);
+        return ptr;
+    }
 
-	next = memfs_allocator_alloc(allocator, new_bytes);
-	if (next == NULL)
-		return NULL;
+    next = memfs_allocator_alloc(allocator, new_bytes);
+    if (next == NULL)
+        return NULL;
 
-	copy_bytes = old_bytes < new_bytes ? old_bytes : new_bytes;
-	memcpy(next, ptr, copy_bytes);
-	memfs_allocator_free(allocator, ptr, old_bytes);
-	return next;
+    copy_bytes = old_bytes < new_bytes ? old_bytes : new_bytes;
+    memcpy(next, ptr, copy_bytes);
+    memfs_allocator_free(allocator, ptr, old_bytes);
+    return next;
 }
 
 void memfs_allocator_get_stats(MemfsAllocator* allocator, MemfsAllocatorStats* stats) {
-	MemfsBootstrap* bootstrap;
-	int i;
+    MemfsAllocatorState* state;
+    int i;
 
-	if (stats == NULL)
-		return;
+    if (stats == NULL)
+        return;
 
-	memset(stats, 0, sizeof(*stats));
-	if (allocator == NULL)
-		return;
+    memset(stats, 0, sizeof(*stats));
+    if (allocator == NULL || allocator->state == NULL)
+        return;
 
-	bootstrap = bootstrap_from_pool(allocator->node_pool);
-	if (bootstrap == NULL)
-		bootstrap = bootstrap_from_pool(allocator->dir_pool);
-	if (bootstrap == NULL)
-		bootstrap = bootstrap_from_pool(allocator->page_group_pool);
-	if (bootstrap != NULL) {
-		uint64_t bootstrap_bytes = virtual_region_bytes(bootstrap);
+    state = allocator->state;
+    stats->reserved_bytes += state->region_bytes;
+    stats->committed_bytes += state->region_bytes;
 
-		stats->reserved_bytes += bootstrap_bytes;
-		stats->committed_bytes += bootstrap_bytes;
-	}
+    for (i = 0; i < MEMFS_ALLOC_CLASS_COUNT; i++)
+        pool_add_stats(&state->pools[i], stats);
 
-	pool_add_stats(allocator->node_pool, stats);
-	pool_add_stats(allocator->dir_pool, stats);
-	pool_add_stats(allocator->page_group_pool, stats);
+    area_add_stats(state, stats);
+    stats->physical_bytes = stats->committed_bytes;
+    stats->scavenged_bytes = (uint64_t)InterlockedCompareExchange64(&allocator->scavenged_bytes, 0, 0);
+    stats->scavenge_count = (uint64_t)InterlockedCompareExchange64(&allocator->scavenge_count, 0, 0);
+}
 
-	for (i = 0; i < MEMFS_ALLOC_NAME_POOL_COUNT; i++)
-		pool_add_stats(allocator->name_pools[i], stats);
+uint64_t memfs_allocator_scavenge(MemfsAllocator* allocator) {
+    uint64_t released = 0;
+    int i;
 
-	for (i = 0; i < MEMFS_ALLOC_GENERIC_POOL_COUNT; i++)
-		pool_add_stats(allocator->generic_pools[i], stats);
+    if (allocator == NULL || allocator->state == NULL)
+        return 0;
 
-	dedicated_add_stats(allocator, stats);
-	stats->physical_bytes = stats->committed_bytes;
+    for (i = 0; i < MEMFS_ALLOC_CLASS_COUNT; i++)
+        released += pool_scavenge(&allocator->state->pools[i]);
+
+    if (released)
+        InterlockedAdd64(&allocator->scavenged_bytes, (LONG64)released);
+    InterlockedIncrement64(&allocator->scavenge_count);
+    return released;
+}
+
+static INIT_ONCE g_control_once = INIT_ONCE_STATIC_INIT;
+static MemfsAllocator g_control_allocator;
+
+static BOOL CALLBACK control_allocator_init_once(PINIT_ONCE once, PVOID parameter, PVOID* context) {
+    (void)once;
+    (void)parameter;
+    (void)context;
+    return memfs_allocator_init(&g_control_allocator, sizeof(void*), sizeof(void*), sizeof(void*)) ? TRUE : FALSE;
+}
+
+static bool control_allocator_ready(void) {
+    return !!InitOnceExecuteOnce(&g_control_once, control_allocator_init_once, NULL, NULL);
+}
+
+void* memfs_allocator_alloc_control(size_t bytes) {
+    if (bytes == 0 || !control_allocator_ready())
+        return NULL;
+    return allocator_alloc_internal(&g_control_allocator, bytes);
+}
+
+void memfs_allocator_free_control(void* ptr, size_t bytes) {
+    if (ptr == NULL)
+        return;
+    if (!control_allocator_ready())
+        return;
+    allocator_free_internal(&g_control_allocator, ptr, bytes);
 }
