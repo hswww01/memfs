@@ -74,6 +74,7 @@ struct MemfsDirHash {
 	MemfsNode** slots;
 	uint32_t capacity;
 	uint32_t count;
+	MemfsAllocator* owner;
 };
 
 struct MemfsDir {
@@ -86,6 +87,7 @@ struct MemfsDir {
 struct MemfsSecurity {
 	volatile LONG ref_count;
 	uint32_t size;
+	MemfsAllocator* owner;
 	uint8_t data[];
 };
 

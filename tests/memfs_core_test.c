@@ -2066,6 +2066,7 @@ static void test_allocator_reclaim(void) {
 	enum { FILES = 20000 };
 	Memfs* fs = NULL;
 	MemfsNode* node;
+	MemfsAllocatorStats baseline;
 	MemfsAllocatorStats before_delete;
 	MemfsAllocatorStats after_delete;
 	uint32_t i;
@@ -2076,6 +2077,8 @@ static void test_allocator_reclaim(void) {
 	CHECK(memfs_create(8 * 1024 * 1024ULL, L"ALLOC", &fs) == MEMFS_OK);
 	if (fs == NULL)
 		return;
+
+	memfs_allocator_get_stats(&fs->allocator, &baseline);
 
 	for (i = 0; i < FILES; i++) {
 		swprintf_s(name, _countof(name), L"f%05u", i);
@@ -2096,7 +2099,9 @@ static void test_allocator_reclaim(void) {
 	}
 
 	memfs_allocator_get_stats(&fs->allocator, &after_delete);
-	CHECK(after_delete.live_objects == 3);
+	CHECK(after_delete.live_objects == baseline.live_objects);
+	CHECK(after_delete.reserved_bytes == baseline.reserved_bytes);
+	CHECK(after_delete.dedicated_count == baseline.dedicated_count);
 	CHECK(after_delete.reserved_bytes < 1024 * 1024ULL);
 
 	memfs_destroy(fs);
