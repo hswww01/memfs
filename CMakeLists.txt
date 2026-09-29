@@ -193,6 +193,39 @@ if(MEMFS_STATIC_WINFSP)
 			shlwapi
 			version
 			wldap32)
+	add_executable(memfs_winfsp_probe EXCLUDE_FROM_ALL
+		tests/memfs_winfsp_probe.c
+		src/memfs_winfsp.c
+		src/memfs_driver.c
+		${CMAKE_CURRENT_BINARY_DIR}/memfs_resources.rc)
+
+	target_include_directories(memfs_winfsp_probe
+		SYSTEM PRIVATE
+			${WINFSP_INCLUDE_DIR})
+	target_include_directories(memfs_winfsp_probe
+		PRIVATE
+			${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+	target_compile_definitions(memfs_winfsp_probe
+		PRIVATE
+			WINFSP_STATIC
+			MEMFS_WINFSP_STATIC=1
+			_CRT_SECURE_NO_WARNINGS
+			UNICODE
+			_UNICODE)
+
+	target_link_libraries(memfs_winfsp_probe
+		PRIVATE
+			memfs_core
+			${WINFSP_LIBRARY}
+			advapi32
+			credui
+			netapi32
+			rpcrt4
+			secur32
+			shlwapi
+			version
+			wldap32)
 else()
 	target_link_libraries(memfs PRIVATE delayimp)
 	target_link_options(memfs
@@ -215,6 +248,22 @@ add_executable(memfs_no_crt_heap_guard
 add_executable(memfs_resource_test
 	tests/memfs_resource_test.c)
 
+add_executable(memfs_driver_test
+	tests/memfs_driver_test.c
+	src/memfs_driver.c)
+
+target_include_directories(memfs_driver_test
+	PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+target_compile_definitions(memfs_driver_test
+	PRIVATE
+		MEMFS_DRIVER_TESTING
+		_CRT_SECURE_NO_WARNINGS)
+
+target_link_libraries(memfs_driver_test
+	PRIVATE
+		advapi32)
 target_include_directories(memfs_resource_test
 	PRIVATE
 		${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -262,7 +311,7 @@ endif()
 add_test(NAME memfs_mt_stress_test COMMAND memfs_mt_stress_test)
 
 if(MSVC)
-	foreach(target memfs_core memfs memfs_core_test memfs_bench memfs_alloc_mt_bench memfs_no_crt_heap_guard memfs_resource_test)
+	foreach(target memfs_core memfs memfs_core_test memfs_bench memfs_alloc_mt_bench memfs_no_crt_heap_guard memfs_resource_test memfs_driver_test)
 		target_compile_options(${target}
 			PRIVATE
 				/W4
@@ -288,6 +337,8 @@ add_test(NAME memfs_no_crt_heap_guard_bad_fixture
 set_tests_properties(memfs_no_crt_heap_guard_bad_fixture PROPERTIES
 	WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 	WILL_FAIL TRUE)
+
+add_test(NAME memfs_driver_test COMMAND memfs_driver_test)
 
 add_test(NAME memfs_cli_help COMMAND memfs --help)
 

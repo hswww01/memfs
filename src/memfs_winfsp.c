@@ -567,6 +567,11 @@ static NTSTATUS memfs_win32_status(DWORD error) {
 	return STATUS_UNSUCCESSFUL;
 }
 
+static bool memfs_winfsp_should_install_embedded_driver(NTSTATUS status) {
+	return status == STATUS_NO_SUCH_DEVICE ||
+		   status == STATUS_DRIVER_UNABLE_TO_LOAD;
+}
+
 NTSTATUS memfs_winfsp_create(const MemfsOptions* options, MemfsWinFsp** out_instance) {
 	FSP_FSCTL_VOLUME_PARAMS volume_params;
 	MemfsWinFsp* instance;
@@ -617,7 +622,7 @@ NTSTATUS memfs_winfsp_create(const MemfsOptions* options, MemfsWinFsp** out_inst
 
 	status =
 		FspFileSystemCreate(L"" FSP_FSCTL_DISK_DEVICE_NAME, &volume_params, &g_memfs_interface, &instance->file_system);
-	if (!NT_SUCCESS(status)) {
+	if (!NT_SUCCESS(status) && memfs_winfsp_should_install_embedded_driver(status)) {
 		runtime_error = memfs_winfsp_install_embedded_driver();
 		if (runtime_error == ERROR_SUCCESS) {
 			status = FspFileSystemCreate(L"" FSP_FSCTL_DISK_DEVICE_NAME, &volume_params,
