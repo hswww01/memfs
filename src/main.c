@@ -31,7 +31,7 @@ static void print_usage(const wchar_t* exe) {
 			 L"\n"
 			 L"Options:\n"
 			 L"  --mount <path>          Drive letter or directory mount point.\n"
-			 L"  --size <bytes>          Capacity; supports K/M/G suffix. Default: 512M.\n"
+			 L"  --size <bytes|auto>     Capacity; supports K/M/G suffix. Default: auto.\n"
 			 L"  --label <name>          Volume label. Default: MEMFS.\n"
 			 L"  --threads <n>           WinFsp dispatcher threads. 0 = automatic.\n"
 			 L"  --compress              Enable per-page Zstd compression (level 1).\n"
@@ -44,13 +44,24 @@ static void print_usage(const wchar_t* exe) {
 			 exe);
 }
 
-static bool parse_size(const wchar_t* text, uint64_t* out) {
+static bool parse_size(const wchar_t* text, uint64_t* out, bool* auto_size) {
 	wchar_t* end;
 	unsigned long long value;
 	uint64_t multiplier = 1;
 
 	if (text == NULL || *text == L'\0' || out == NULL)
 		return false;
+
+	if (auto_size)
+		*auto_size = false;
+
+	if (_wcsicmp(text, L"auto") == 0) {
+		if (auto_size)
+			*auto_size = true;
+		if (out)
+			*out = 0;
+		return true;
+	}
 
 	errno = 0;
 	value = wcstoull(text, &end, 0);
@@ -132,7 +143,8 @@ static bool parse_key_hex(const wchar_t* text, uint8_t key[MEMFS_ENCRYPTION_KEY_
 int wmain(int argc, wchar_t** argv) {
 	const wchar_t* mount_point = NULL;
 	const wchar_t* volume_label = L"MEMFS";
-	uint64_t capacity = 512ULL * 1024ULL * 1024ULL;
+	uint64_t capacity = 0;
+	bool capacity_auto = true;
 	uint32_t thread_count = 0;
 	uint32_t compression_level = 1;
 	bool compression_enabled = false;
@@ -150,10 +162,13 @@ int wmain(int argc, wchar_t** argv) {
 		if (_wcsicmp(argv[i], L"--mount") == 0 && i + 1 < argc) {
 			mount_point = argv[++i];
 		} else if (_wcsicmp(argv[i], L"--size") == 0 && i + 1 < argc) {
-			if (!parse_size(argv[++i], &capacity)) {
+			if (!parse_size(argv[++i], &capacity, &capacity_auto)) {
 				fwprintf(stderr, L"Invalid --size value.\n");
 				return 2;
 			}
+		} else if (_wcsicmp(argv[i], L"--auto-size") == 0) {
+			capacity = 0;
+			capacity_auto = true;
 		} else if (_wcsicmp(argv[i], L"--label") == 0 && i + 1 < argc) {
 			volume_label = argv[++i];
 		} else if (_wcsicmp(argv[i], L"--threads") == 0 && i + 1 < argc) {
@@ -207,6 +222,7 @@ int wmain(int argc, wchar_t** argv) {
 
 	memset(&options, 0, sizeof(options));
 	options.capacity = capacity;
+	options.capacity_auto = capacity_auto;
 	options.volume_label = volume_label;
 	options.compression_enabled = compression_enabled;
 	options.compression_level = (int)compression_level;
@@ -248,9 +264,13 @@ int wmain(int argc, wchar_t** argv) {
 
 	SetConsoleCtrlHandler(console_handler, TRUE);
 
-	wprintf(L"MEMFS mounted at %s (%llu MiB)%s%s. Press Ctrl+C to stop.\n", mount_point,
-			(unsigned long long)(capacity / (1024ULL * 1024ULL)), compression_enabled ? L", compressed" : L"",
-			encryption_enabled ? L", encrypted" : L"");
+	if (capacity_auto)
+		wprintf(L"MEMFS mounted at %s (auto capacity)%s%s. Press Ctrl+C to stop.\n", mount_point,
+				compression_enabled ? L", compressed" : L"", encryption_enabled ? L", encrypted" : L"");
+	else
+		wprintf(L"MEMFS mounted at %s (%llu MiB)%s%s. Press Ctrl+C to stop.\n", mount_point,
+				(unsigned long long)(capacity / (1024ULL * 1024ULL)), compression_enabled ? L", compressed" : L"",
+				encryption_enabled ? L", encrypted" : L"");
 
 	WaitForSingleObject(g_stop_event, INFINITE);
 	exit_code = 0;

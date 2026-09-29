@@ -146,6 +146,64 @@ static void test_memory_accounting_layers(void) {
 	memfs_destroy(fs);
 }
 
+static void test_adaptive_capacity_mode(void) {
+	MemfsOptions options = {0};
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	uint8_t input[1024];
+	uint8_t output[1024];
+	uint32_t transferred;
+	uint32_t i;
+	uint64_t allowance;
+
+	printf("== adaptive capacity mode ==\n");
+
+	options.capacity = 0;
+	options.capacity_auto = true;
+	options.volume_label = L"AUTO";
+	CHECK(memfs_create_ex(&options, &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	if (fs == NULL)
+		return;
+
+	CHECK(fs->capacity_auto);
+	CHECK(fs->capacity == 0);
+	CHECK(memfs_auto_allowance_bytes(fs) > 0);
+	CHECK(memfs_free_bytes(fs) > 0);
+
+	CHECK(memfs_node_create(fs, fs->root, L"auto.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(file != NULL);
+	if (file == NULL) {
+		memfs_destroy(fs);
+		return;
+	}
+
+	for (i = 0; i < sizeof(input); i++)
+		input[i] = (uint8_t)(0x31 + (i % 251U));
+
+	CHECK(memfs_node_write(file, input, 0, sizeof(input), false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	CHECK(file->file_size == sizeof(input));
+	CHECK((uint64_t)fs->used_bytes == sizeof(input));
+	CHECK(memfs_free_bytes(fs) > 0);
+
+	memset(output, 0xff, sizeof(output));
+	CHECK(memfs_node_read(file, output, 0, sizeof(input), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	CHECK(memcmp(input, output, sizeof(input)) == 0);
+
+	allowance = memfs_auto_allowance_bytes(fs);
+	CHECK(allowance > 0);
+	CHECK(memfs_free_bytes(fs) <= allowance);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	CHECK((uint64_t)fs->used_bytes == 0);
+	CHECK(memfs_free_bytes(fs) > 0);
+
+	memfs_destroy(fs);
+}
+
 static void test_tree_and_lookup(void) {
 	Memfs* fs = NULL;
 	MemfsNode* root;
@@ -361,6 +419,7 @@ static void test_rename_and_delete(void) {
 }
 
 static void test_capacity(void) {
+	MemfsOptions options = {0};
 	Memfs* fs = NULL;
 	MemfsNode* a;
 	MemfsNode* b;
@@ -369,7 +428,10 @@ static void test_capacity(void) {
 
 	printf("== capacity ==\n");
 
-	CHECK(memfs_create(1536, L"TINY", &fs) == MEMFS_OK);
+	options.capacity = 1536;
+	options.capacity_auto = false;
+	options.volume_label = L"TINY";
+	CHECK(memfs_create_ex(&options, &fs) == MEMFS_OK);
 	CHECK(memfs_node_create(fs, fs->root, L"a", false, FILE_ATTRIBUTE_NORMAL, NULL, 1024, &a) == MEMFS_OK);
 	CHECK(memfs_node_write(a, buffer, 0, 1024, false, false, &written) == MEMFS_OK);
 	CHECK(written == 1024);
@@ -389,7 +451,56 @@ static void test_capacity(void) {
 	memfs_node_close(b);
 	memfs_destroy(fs);
 }
+
+static void test_explicit_size_hard_limit_with_auto_flag_false(void) {
+	MemfsOptions options = {0};
+	Memfs* fs = NULL;
+	MemfsNode* file;
+	uint8_t input[1024];
+	uint32_t transferred;
+	uint32_t i;
+	uint64_t capacity = 1536;
+
+	printf("== explicit size hard limit ==\n");
+
+	options.capacity = capacity;
+	options.capacity_auto = false;
+	options.volume_label = L"LIMIT";
+	CHECK(memfs_create_ex(&options, &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	if (fs == NULL)
+		return;
+
+	CHECK(!fs->capacity_auto);
+	CHECK(fs->capacity == capacity);
+	CHECK(memfs_free_bytes(fs) == capacity);
+
+	CHECK(memfs_node_create(fs, fs->root, L"limit.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(file != NULL);
+	if (file == NULL) {
+		memfs_destroy(fs);
+		return;
+	}
+
+	for (i = 0; i < sizeof(input); i++)
+		input[i] = (uint8_t)(0x42 + (i % 251U));
+
+	CHECK(memfs_node_write(file, input, 0, sizeof(input), false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	CHECK(memfs_free_bytes(fs) == capacity - sizeof(input));
+
+	CHECK(memfs_node_write(file, input, sizeof(input), sizeof(input), false, false, &transferred) == MEMFS_ERR_NO_SPACE);
+	CHECK(memfs_free_bytes(fs) == capacity - sizeof(input));
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	CHECK(memfs_free_bytes(fs) == capacity);
+
+	memfs_destroy(fs);
+}
+
 static void test_no_space_rollback(void) {
+	MemfsOptions options = {0};
 	Memfs* fs = NULL;
 	MemfsNode* file;
 	uint8_t input[1024];
@@ -405,7 +516,10 @@ static void test_no_space_rollback(void) {
 
 	printf("== no space rollback ==\n");
 
-	CHECK(memfs_create(capacity, L"NO_SPACE", &fs) == MEMFS_OK);
+	options.capacity = capacity;
+	options.capacity_auto = false;
+	options.volume_label = L"NO_SPACE";
+	CHECK(memfs_create_ex(&options, &fs) == MEMFS_OK);
 	CHECK(fs != NULL);
 	CHECK(memfs_node_create(fs, fs->root, L"file", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
 	CHECK(file != NULL);

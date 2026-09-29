@@ -55,6 +55,85 @@ void memfs_node_set_change_time(MemfsNode* node, uint64_t value) {
 		node->change_time = value;
 }
 
+#define MEMFS_AUTO_SAFETY_MARGIN_BYTES (256ULL * 1024ULL * 1024ULL)
+#define MEMFS_AUTO_REFRESH_INTERVAL_MS 250ULL
+
+static uint64_t memfs_min_u64(uint64_t a, uint64_t b) {
+	return a < b ? a : b;
+}
+
+static uint64_t memfs_system_allowance_bytes(void) {
+	MEMORYSTATUSEX status;
+	uint64_t physical;
+	uint64_t commit;
+	uint64_t allowance;
+
+	status.dwLength = sizeof(status);
+	if (!GlobalMemoryStatusEx(&status))
+		return 0;
+
+	physical = status.ullAvailPhys;
+	commit = status.ullAvailPageFile;
+	allowance = memfs_min_u64(physical, commit);
+
+	if (allowance > MEMFS_AUTO_SAFETY_MARGIN_BYTES)
+		allowance -= MEMFS_AUTO_SAFETY_MARGIN_BYTES;
+	else
+		allowance = 0;
+
+	return allowance;
+}
+
+uint64_t memfs_auto_allowance_bytes(Memfs* fs) {
+	uint64_t system_allowance;
+	uint64_t committed;
+	uint64_t resident;
+	uint64_t allowance;
+
+	if (fs == NULL || !fs->capacity_auto)
+		return 0;
+
+	system_allowance = memfs_system_allowance_bytes();
+	committed = memfs_committed_bytes(fs);
+	resident = memfs_resident_bytes(fs);
+
+	if (committed > system_allowance)
+		return 0;
+
+	allowance = system_allowance - committed;
+	if (resident > allowance)
+		return 0;
+
+	return allowance;
+}
+
+static bool memfs_auto_capacity_allows(Memfs* fs, uint64_t request) {
+	if (fs == NULL || !fs->capacity_auto)
+		return true;
+	if (request == 0)
+		return true;
+
+	return request <= memfs_auto_allowance_bytes(fs);
+}
+
+static bool memfs_capacity_allows(Memfs* fs, uint64_t request) {
+	uint64_t used;
+	uint64_t capacity;
+
+	if (fs == NULL)
+		return false;
+	if (request == 0)
+		return true;
+
+	used = (uint64_t)fs->used_bytes;
+	capacity = fs->capacity;
+
+	if (fs->capacity_auto)
+		return memfs_auto_capacity_allows(fs, request);
+
+	return used <= capacity && request <= capacity - used;
+}
+
 static void memfs_dir_hash_free(MemfsDirHash* hash) {
 	if (hash == NULL)
 		return;
@@ -2081,7 +2160,7 @@ static MemfsResult memfs_account_file_size(MemfsNode* node, uint64_t old_size, u
 	if (new_size > old_size) {
 		uint64_t delta = new_size - old_size;
 
-		if (!memfs_atomic_reserve(&fs->used_bytes, fs->capacity, delta)) {
+		if (!memfs_capacity_allows(fs, delta) || !memfs_atomic_reserve(&fs->used_bytes, fs->capacity, delta)) {
 			return MEMFS_ERR_NO_SPACE;
 		}
 	} else {
@@ -2114,6 +2193,9 @@ uint64_t memfs_free_bytes(Memfs* fs) {
 
 	if (fs == NULL)
 		return 0;
+
+	if (fs->capacity_auto)
+		return memfs_auto_allowance_bytes(fs);
 
 	used = memfs_atomic_load_u64(&fs->used_bytes);
 	return used <= fs->capacity ? fs->capacity - used : 0;
@@ -2171,7 +2253,8 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 	const wchar_t* volume_label;
 	size_t label_chars;
 
-	if (options == NULL || out_fs == NULL || options->capacity == 0 || options->capacity > INT64_MAX) {
+	if (options == NULL || out_fs == NULL || (!options->capacity_auto && options->capacity == 0) ||
+		options->capacity > INT64_MAX) {
 		return MEMFS_ERR_INVALID;
 	}
 
@@ -2192,6 +2275,7 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 	}
 
 	fs->capacity = options->capacity;
+	fs->capacity_auto = options->capacity_auto;
 	fs->next_index = 1;
 	randombytes_buf(&fs->treap_seed, sizeof(fs->treap_seed));
 	if (fs->treap_seed == 0)
@@ -2256,6 +2340,7 @@ MemfsResult memfs_create(uint64_t capacity, const wchar_t* volume_label, Memfs**
 
 	memset(&options, 0, sizeof(options));
 	options.capacity = capacity;
+	options.capacity_auto = false;
 	options.volume_label = volume_label;
 	return memfs_create_ex(&options, out_fs);
 }

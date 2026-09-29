@@ -62,6 +62,7 @@ typedef struct MemfsPageGroupEntry MemfsPageGroupEntry;
 
 typedef struct MemfsOptions {
 	uint64_t capacity;
+	bool capacity_auto;
 	const wchar_t* volume_label;
 	bool compression_enabled;
 	int compression_level;
@@ -186,6 +187,7 @@ struct Memfs {
 	// WinFsp FINE guard 负责 namespace + per-file I/O 并发。
 	// accounting_lock 只保护跨文件共享容量/驻留统计。
 	uint64_t capacity;
+	bool capacity_auto;
 	volatile LONG64 used_bytes;
 	volatile LONG64 resident_bytes;
 	uint64_t next_index;
@@ -206,6 +208,7 @@ struct Memfs {
 uint64_t memfs_now(void);
 uint64_t memfs_align_allocation(uint64_t size);
 uint64_t memfs_free_bytes(Memfs* fs);
+uint64_t memfs_auto_allowance_bytes(Memfs* fs);
 uint64_t memfs_resident_bytes(Memfs* fs);
 uint64_t memfs_node_resident_bytes(const MemfsNode* node);
 
