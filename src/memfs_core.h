@@ -190,6 +190,7 @@ struct Memfs {
 	bool capacity_auto;
 	volatile LONG64 used_bytes;
 	volatile LONG64 resident_bytes;
+	volatile LONG64 pressure_last_scavenge_tick;
 	uint64_t next_index;
 	uint64_t treap_seed;
 
@@ -216,6 +217,11 @@ uint64_t memfs_node_resident_bytes(const MemfsNode* node);
 // not resident payload; use it for capacity policy that needs real backing.
 uint64_t memfs_committed_bytes(Memfs* fs);
 uint64_t memfs_physical_bytes(Memfs* fs);
+
+#if !defined(NDEBUG)
+void memfs_test_set_system_available_bytes(uint64_t bytes);
+void memfs_test_clear_system_available_bytes(void);
+#endif
 
 MemfsResult memfs_create(uint64_t capacity, const wchar_t* volume_label, Memfs** out_fs);
 MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs);

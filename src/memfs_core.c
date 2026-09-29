@@ -55,36 +55,46 @@ void memfs_node_set_change_time(MemfsNode* node, uint64_t value) {
 		node->change_time = value;
 }
 
-#define MEMFS_AUTO_SAFETY_MARGIN_BYTES (256ULL * 1024ULL * 1024ULL)
+#define MEMFS_AUTO_HARD_MARGIN_BYTES (256ULL * 1024ULL * 1024ULL)
+#define MEMFS_AUTO_SOFT_MARGIN_BYTES (512ULL * 1024ULL * 1024ULL)
 #define MEMFS_AUTO_REFRESH_INTERVAL_MS 250ULL
+
+#if !defined(NDEBUG)
+static volatile LONG64 g_memfs_test_system_available_bytes = -1;
+
+void memfs_test_set_system_available_bytes(uint64_t bytes) {
+	InterlockedExchange64(&g_memfs_test_system_available_bytes, (LONG64)bytes);
+}
+
+void memfs_test_clear_system_available_bytes(void) {
+	InterlockedExchange64(&g_memfs_test_system_available_bytes, -1);
+}
+#endif
 
 static uint64_t memfs_min_u64(uint64_t a, uint64_t b) {
 	return a < b ? a : b;
 }
 
-static uint64_t memfs_system_allowance_bytes(void) {
+static uint64_t memfs_system_available_bytes(void) {
 	MEMORYSTATUSEX status;
-	uint64_t physical;
-	uint64_t commit;
-	uint64_t allowance;
+
+#if !defined(NDEBUG)
+	{
+		LONG64 forced = InterlockedCompareExchange64(
+			&g_memfs_test_system_available_bytes, 0, 0);
+		if (forced >= 0)
+			return (uint64_t)forced;
+	}
+#endif
 
 	status.dwLength = sizeof(status);
 	if (!GlobalMemoryStatusEx(&status))
 		return 0;
 
-	physical = status.ullAvailPhys;
-	commit = status.ullAvailPageFile;
-	allowance = memfs_min_u64(physical, commit);
-
-	if (allowance > MEMFS_AUTO_SAFETY_MARGIN_BYTES)
-		allowance -= MEMFS_AUTO_SAFETY_MARGIN_BYTES;
-	else
-		allowance = 0;
-
-	return allowance;
+	return memfs_min_u64(status.ullAvailPhys, status.ullAvailPageFile);
 }
 
-uint64_t memfs_auto_allowance_bytes(Memfs* fs) {
+static uint64_t memfs_auto_allowance_for_available(Memfs* fs, uint64_t available) {
 	uint64_t system_allowance;
 	uint64_t committed;
 	uint64_t resident;
@@ -93,7 +103,9 @@ uint64_t memfs_auto_allowance_bytes(Memfs* fs) {
 	if (fs == NULL || !fs->capacity_auto)
 		return 0;
 
-	system_allowance = memfs_system_allowance_bytes();
+	system_allowance = available > MEMFS_AUTO_HARD_MARGIN_BYTES
+		? available - MEMFS_AUTO_HARD_MARGIN_BYTES
+		: 0;
 	committed = memfs_committed_bytes(fs);
 	resident = memfs_resident_bytes(fs);
 
@@ -107,13 +119,67 @@ uint64_t memfs_auto_allowance_bytes(Memfs* fs) {
 	return allowance;
 }
 
+uint64_t memfs_auto_allowance_bytes(Memfs* fs) {
+	return memfs_auto_allowance_for_available(
+		fs, memfs_system_available_bytes());
+}
+
+static bool memfs_auto_pressure_scavenge_due(Memfs* fs) {
+	uint64_t now;
+	LONG64 previous;
+
+	if (fs == NULL)
+		return false;
+
+	now = GetTickCount64();
+	previous = InterlockedCompareExchange64(
+		&fs->pressure_last_scavenge_tick, 0, 0);
+	if (previous > 0 &&
+		now >= (uint64_t)previous &&
+		now - (uint64_t)previous < MEMFS_AUTO_REFRESH_INTERVAL_MS) {
+		return false;
+	}
+
+	return InterlockedCompareExchange64(
+		&fs->pressure_last_scavenge_tick,
+		(LONG64)now,
+		previous) == previous;
+}
+
+static void memfs_auto_pressure_scavenge(Memfs* fs) {
+	if (fs == NULL || !fs->capacity_auto)
+		return;
+	if (!memfs_auto_pressure_scavenge_due(fs))
+		return;
+
+	(void)memfs_allocator_scavenge(&fs->allocator);
+}
+
 static bool memfs_auto_capacity_allows(Memfs* fs, uint64_t request) {
+	uint64_t available;
+	uint64_t allowance;
+
 	if (fs == NULL || !fs->capacity_auto)
 		return true;
 	if (request == 0)
 		return true;
 
-	return request <= memfs_auto_allowance_bytes(fs);
+	available = memfs_system_available_bytes();
+	allowance = memfs_auto_allowance_for_available(fs, available);
+
+	/*
+	 * Soft pressure is a reclaim hint, not an allocation failure. Reclaim only
+	 * allocator-owned idle backing (empty slabs and cached area blocks), then
+	 * recompute the hard allowance. If the request still cannot fit above the
+	 * hard reserve, report NO_SPACE without touching file data.
+	 */
+	if (available <= MEMFS_AUTO_SOFT_MARGIN_BYTES || request > allowance) {
+		memfs_auto_pressure_scavenge(fs);
+		available = memfs_system_available_bytes();
+		allowance = memfs_auto_allowance_for_available(fs, available);
+	}
+
+	return request <= allowance;
 }
 
 static bool memfs_capacity_allows(Memfs* fs, uint64_t request) {
@@ -2295,6 +2361,7 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 
 	fs->capacity = options->capacity;
 	fs->capacity_auto = options->capacity_auto;
+	fs->pressure_last_scavenge_tick = 0;
 	fs->next_index = 1;
 	randombytes_buf(&fs->treap_seed, sizeof(fs->treap_seed));
 	if (fs->treap_seed == 0)

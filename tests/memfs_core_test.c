@@ -204,6 +204,93 @@ static void test_adaptive_capacity_mode(void) {
 	memfs_destroy(fs);
 }
 
+
+#if !defined(NDEBUG)
+static void test_adaptive_memory_pressure_scavenger(void) {
+	MemfsOptions options = {0};
+	Memfs* fs = NULL;
+	MemfsNode* file = NULL;
+	MemfsAllocatorStats cached;
+	MemfsAllocatorStats scavenged;
+	void* area = NULL;
+	uint8_t input[32];
+	uint8_t output[32];
+	uint32_t transferred = 0;
+	uint64_t used_before;
+	uint32_t i;
+
+	printf("== adaptive memory pressure scavenger ==\n");
+	memfs_test_clear_system_available_bytes();
+
+	options.capacity_auto = true;
+	options.volume_label = L"PRESSURE";
+	CHECK(memfs_create_ex(&options, &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	if (fs == NULL)
+		return;
+
+	CHECK(memfs_node_create(fs, fs->root, L"pressure.bin", false,
+		FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(file != NULL);
+	if (file == NULL) {
+		memfs_destroy(fs);
+		return;
+	}
+
+	for (i = 0; i < _countof(input); i++)
+		input[i] = (uint8_t)(0x80U + i);
+	CHECK(memfs_node_write(file, input, 0, sizeof(input), false, false,
+		&transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+
+	area = memfs_allocator_alloc(&fs->allocator, 16U * 1024U);
+	CHECK(area != NULL);
+	if (area != NULL)
+		memfs_allocator_free(&fs->allocator, area, 16U * 1024U);
+
+	memfs_allocator_get_stats(&fs->allocator, &cached);
+	CHECK(cached.area_cached_count >= 1U);
+	CHECK(cached.area_cached_bytes > 0U);
+
+	/* Above the hard reserve but below the soft threshold: reclaim and proceed. */
+	fs->pressure_last_scavenge_tick = 0;
+	memfs_test_set_system_available_bytes(320ULL * 1024ULL * 1024ULL);
+	CHECK(memfs_node_set_file_size(file, sizeof(input) + 1U) == MEMFS_OK);
+	memfs_allocator_get_stats(&fs->allocator, &scavenged);
+	CHECK(scavenged.area_cached_count == 0U);
+	CHECK(scavenged.area_cached_bytes == 0U);
+	CHECK(scavenged.scavenge_count > cached.scavenge_count);
+
+	memset(output, 0, sizeof(output));
+	CHECK(memfs_node_read(file, output, 0, sizeof(output), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(output));
+	CHECK(memcmp(input, output, sizeof(input)) == 0);
+
+	/* Below the hard reserve: fail atomically without damaging existing data. */
+	fs->pressure_last_scavenge_tick = 0;
+	memfs_test_set_system_available_bytes(128ULL * 1024ULL * 1024ULL);
+	used_before = (uint64_t)fs->used_bytes;
+	CHECK(memfs_node_set_file_size(file, sizeof(input) + 2U) == MEMFS_ERR_NO_SPACE);
+	CHECK(file->file_size == sizeof(input) + 1U);
+	CHECK((uint64_t)fs->used_bytes == used_before);
+
+	memset(output, 0, sizeof(output));
+	CHECK(memfs_node_read(file, output, 0, sizeof(output), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(output));
+	CHECK(memcmp(input, output, sizeof(input)) == 0);
+
+	/* Pressure relief restores forward progress. */
+	fs->pressure_last_scavenge_tick = 0;
+	memfs_test_set_system_available_bytes(2ULL * 1024ULL * 1024ULL * 1024ULL);
+	CHECK(memfs_node_set_file_size(file, sizeof(input) + 2U) == MEMFS_OK);
+
+	memfs_test_clear_system_available_bytes();
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	memfs_destroy(fs);
+}
+#endif
+
 static void test_tree_and_lookup(void) {
 	Memfs* fs = NULL;
 	MemfsNode* root;
@@ -3802,6 +3889,9 @@ int main(void) {
 #endif
 
 	test_adaptive_capacity_mode();
+#if !defined(NDEBUG)
+	test_adaptive_memory_pressure_scavenger();
+#endif
 	test_io_and_resize();
 	test_write_to_end_semantics();
 	test_rename_and_delete();

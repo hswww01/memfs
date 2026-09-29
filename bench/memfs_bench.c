@@ -19,7 +19,8 @@ typedef enum BenchMode {
 	BENCH_MODE_PLAIN,
 	BENCH_MODE_COMPRESSION,
 	BENCH_MODE_ENCRYPTION,
-	BENCH_MODE_COMBINED
+	BENCH_MODE_COMBINED,
+	BENCH_MODE_PRESSURE_POLICY
 } BenchMode;
 
 typedef struct BenchConfig {
@@ -1154,6 +1155,103 @@ cleanup:
 }
 
 
+
+static int bench_pressure_policy(LARGE_INTEGER frequency) {
+#if defined(NDEBUG)
+	(void)frequency;
+	fprintf(stderr, "--pressure-policy requires a Debug build with deterministic pressure hooks\n");
+	return 2;
+#else
+	MemfsOptions options = {0};
+	Memfs* fs = NULL;
+	MemfsNode* file = NULL;
+	MemfsAllocatorStats before;
+	MemfsAllocatorStats after_soft;
+	void* cached[4] = {0};
+	LARGE_INTEGER start;
+	LARGE_INTEGER end;
+	double soft_seconds;
+	uint32_t i;
+	int rc = 1;
+
+	options.capacity_auto = true;
+	options.volume_label = L"PRESSBENCH";
+	memfs_test_clear_system_available_bytes();
+
+	if (memfs_create_ex(&options, &fs) != MEMFS_OK || fs == NULL)
+		goto cleanup;
+	if (memfs_node_create(fs, fs->root, L"pressure.bin", false,
+		FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) != MEMFS_OK || file == NULL)
+		goto cleanup;
+
+	for (i = 0; i < _countof(cached); i++) {
+		cached[i] = memfs_allocator_alloc(&fs->allocator, 16U * 1024U);
+		if (cached[i] == NULL)
+			goto cleanup;
+	}
+	for (i = 0; i < _countof(cached); i++) {
+		memfs_allocator_free(&fs->allocator, cached[i], 16U * 1024U);
+		cached[i] = NULL;
+	}
+
+	memfs_allocator_get_stats(&fs->allocator, &before);
+	fs->pressure_last_scavenge_tick = 0;
+	memfs_test_set_system_available_bytes(320ULL * 1024ULL * 1024ULL);
+
+	QueryPerformanceCounter(&start);
+	if (memfs_node_set_file_size(file, 1U) != MEMFS_OK)
+		goto cleanup;
+	QueryPerformanceCounter(&end);
+	soft_seconds = seconds_between(start, end, frequency);
+	memfs_allocator_get_stats(&fs->allocator, &after_soft);
+
+	printf("\n[adaptive pressure policy]\n");
+	printf("soft_available=320MiB cached_before=%u/%lluB cached_after=%u/%lluB "
+		   "scavenge_count=%llu latency_us=%.2f\n",
+		   before.area_cached_count,
+		   (unsigned long long)before.area_cached_bytes,
+		   after_soft.area_cached_count,
+		   (unsigned long long)after_soft.area_cached_bytes,
+		   (unsigned long long)after_soft.scavenge_count,
+		   soft_seconds * 1000000.0);
+
+	if (before.area_cached_count == 0U ||
+		after_soft.area_cached_count != 0U ||
+		after_soft.area_cached_bytes != 0U)
+		goto cleanup;
+
+	fs->pressure_last_scavenge_tick = 0;
+	memfs_test_set_system_available_bytes(128ULL * 1024ULL * 1024ULL);
+	if (memfs_node_set_file_size(file, 2U) != MEMFS_ERR_NO_SPACE)
+		goto cleanup;
+	printf("hard_available=128MiB result=NO_SPACE file_size=%llu\n",
+		   (unsigned long long)file->file_size);
+
+	fs->pressure_last_scavenge_tick = 0;
+	memfs_test_set_system_available_bytes(2ULL * 1024ULL * 1024ULL * 1024ULL);
+	if (memfs_node_set_file_size(file, 2U) != MEMFS_OK)
+		goto cleanup;
+	printf("relief_available=2GiB result=OK file_size=%llu\n",
+		   (unsigned long long)file->file_size);
+
+	rc = 0;
+
+cleanup:
+	memfs_test_clear_system_available_bytes();
+	for (i = 0; i < _countof(cached); i++) {
+		if (cached[i] != NULL)
+			memfs_allocator_free(&fs->allocator, cached[i], 16U * 1024U);
+	}
+	if (file != NULL) {
+		(void)memfs_node_unlink(file);
+		memfs_node_close(file);
+	}
+	if (fs != NULL)
+		memfs_destroy(fs);
+	return rc;
+#endif
+}
+
 static int run_suite(const BenchConfig* config, const char* label, LARGE_INTEGER frequency, BenchResult* results) {
 	Memfs* fs = NULL;
 	uint64_t private_before;
@@ -1358,6 +1456,8 @@ static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* co
 			*mode = BENCH_MODE_ENCRYPTION;
 		} else if (strcmp(argv[i], "--combined") == 0) {
 			*mode = BENCH_MODE_COMBINED;
+		} else if (strcmp(argv[i], "--pressure-policy") == 0) {
+			*mode = BENCH_MODE_PRESSURE_POLICY;
 		} else if (strcmp(argv[i], "--compare") == 0) {
 			*mode = BENCH_MODE_COMPARE;
 		} else if (strcmp(argv[i], "--csv") == 0) {
@@ -1375,6 +1475,7 @@ static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* co
 			printf("  --compression        run compression mode only\n");
 			printf("  --encryption         run encryption mode only\n");
 			printf("  --combined           run compression+encryption combined mode only\n");
+			printf("  --pressure-policy    run deterministic auto-capacity pressure/scavenge benchmark (Debug)\n");
 			printf("  --compression-level N set compression level for compression mode\n");
 			printf("  --csv                append CSV comparison data after --compare table\n");
 			return 2;
@@ -1445,6 +1546,8 @@ int main(int argc, char** argv) {
 		rc = run_suite(&encryption, "encryption", frequency, encryption_results);
 	} else if (mode == BENCH_MODE_COMBINED) {
 		rc = run_suite(&combined, "combined", frequency, combined_results);
+	} else if (mode == BENCH_MODE_PRESSURE_POLICY) {
+		rc = bench_pressure_policy(frequency);
 	}
 
 	return rc;
