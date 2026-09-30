@@ -116,6 +116,7 @@ Options:
 --key-env <name>        Read a 64-hex key from an environment variable
 --debug                 Enable WinFsp debug logging
 --service               Run under the Windows Service Control Manager
+--uninstall-private-driver  Remove only MemfsC-owned private WinFsp fallback service/files
 --stats                 Print a human-readable runtime snapshot at mount and stop
 --stats-json            Print stable one-line JSON runtime snapshots at mount and stop
 --help
@@ -150,11 +151,32 @@ A helper that still uses `sc.exe` for all service control is included:
 .\scripts\memfs-service.ps1 query
 .\scripts\memfs-service.ps1 stop
 .\scripts\memfs-service.ps1 delete
+.\scripts\memfs-service.ps1 purge-driver -Exe .\build\x64-release\memfs.exe
 ```
 
 The service runs as LocalSystem by default. The first driver installation requires administrator rights. If a compatible official WinFsp SxS driver is already installed, memfs reuses it and does not create a parallel driver service. If the driver is missing or unloadable, memfs extracts the embedded signed WinFsp SYS resource, registers it through SCM, starts it, and retries `FspFileSystemCreate`.
 
 If Service initialization fails, `sc.exe query MemfsC` preserves the underlying WinFsp/NTSTATUS value in `SERVICE_EXIT_CODE` instead of exposing only the generic Windows service error 1066.
+
+### Deployment verification harness
+
+`scripts\verify-deployment.ps1` provides repeatable deployment checks without silently modifying an official WinFsp installation.
+
+On a development machine with official WinFsp already installed:
+
+```powershell
+.\scripts\verify-deployment.ps1 -Scenario All -Report .agent\deployment.json
+```
+
+This runs the release deployment gate tests, verifies the no-`MemfsC` service state, mounts a real filesystem through the installed official WinFsp driver, exercises normal file I/O, and confirms that no private `WinFsp+MemfsC` fallback service or `memfs-winfsp-*.sys` file was created.
+
+The embedded private-driver path requires a genuinely clean VM with no official WinFsp SxS driver installed. It is intentionally opt-in:
+
+```powershell
+.\scripts\verify-deployment.ps1 -Scenario PrivateFallback -ExercisePrivateFallback -Report C:\temp\memfs-private-fallback.json
+```
+
+That scenario requires administrator rights, refuses to run if an official WinFsp driver is detected, mounts memfs to force the embedded fallback path, validates that the private driver points only to MemfsC-owned filenames, and removes the private service/files afterward unless `-KeepPrivateDriver` is specified.
 
 ## Directory design
 
@@ -335,6 +357,7 @@ tests/
 scripts/
   prepare-winfsp-static.ps1 derive/build a static WinFsp runtime matching the signed driver
   memfs-service.ps1         install/start/query/stop/delete wrapper around sc.exe
+  verify-deployment.ps1     repeatable official/no-service/private-fallback deployment harness
 ```
 
 ## Planned next steps

@@ -200,17 +200,53 @@ The single-pool experiments were reverted rather than accepting a 4-7x concurren
 regression. Future allocator work should target magazines/remote-free or a comparable
 scheme that preserves the one-size-class abstraction without paying that lock cost.
 
+## Repeatable deployment verification
+
+`scripts\verify-deployment.ps1` separates safe development-machine checks from the destructive clean-machine fallback path.
+
+Current x64 development-machine verification:
+
+```powershell
+.\scripts\verify-deployment.ps1 -Scenario All -Report .agent\deployment-current.json
+```
+
+Result on 2026-09-30:
+
+- release executable/CLI gate: PASS;
+- driver/static-version/no-WinFsp-DLL-import/resource CTest gate: PASS;
+- no `MemfsC` service: PASS;
+- no private `WinFsp+MemfsC` fallback service/file before mount: PASS;
+- real mounted-drive smoke using official `WinFsp+20251221T124141Z`: PASS;
+- no private fallback service/file after official-driver mount: PASS;
+- private-fallback execution: SKIP by default.
+
+The guard was also tested explicitly:
+
+```powershell
+.\scripts\verify-deployment.ps1 -Scenario PrivateFallback -ExercisePrivateFallback
+```
+
+On this machine it fails closed because an official WinFsp SxS driver is present. The script will not remove, stop, overwrite, or repoint an official WinFsp installation merely to exercise the fallback.
+
+The remaining clean-VM validation is therefore explicit and reproducible rather than simulated. On a disposable elevated Windows VM with no WinFsp installation:
+
+```powershell
+.\scripts\verify-deployment.ps1 -Scenario PrivateFallback -ExercisePrivateFallback -Report C:\temp\memfs-private-fallback.json
+```
+
+The harness verifies private service creation, MemfsC-owned driver filename/path, a real mounted-drive I/O smoke test, and uninstall cleanup. It refuses to run this scenario if an official WinFsp driver is detected.
+
 ## Current binaries
 
 Debug:
 
-- size: 3,135,488 bytes
-- SHA-256: `84E718E0D2D62BC4FBBFEE74ED9B581B86419EB31E26CF0EB85A553C07A38D35`
+- size: 3,139,584 bytes
+- SHA-256: `06B1C533285448329678DAC9C0BC21CA8DA1D13485B8B41E6BB8BF45C22F71E9`
 
 Release:
 
-- size: 1,145,856 bytes
-- SHA-256: `29050EEDB7A3DDBBE7102616398A0C3D98F704CF0CE9D77DC6C0EB257404C13B`
+- size: 1,148,416 bytes
+- SHA-256: `D86B3B36081710E58DB71BC10A36D85CECE99AD38573D4E3D2A9FA11FCCF1C0F`
 
 These hashes are verification artifacts for this local build, not permanent release
 identifiers.
@@ -240,7 +276,7 @@ Before broad external distribution, separately validate:
 - code-signing policy for the final EXE;
 - final WinFsp distribution-license decision for static linking (for proprietary distribution, obtain appropriate commercial permission or use distribution terms compatible with the applicable WinFsp/GPLv3 obligations);
 - Windows 10 and Windows 11 clean-machine installation;
-- ARM64 build/package and matching signed ARM64 driver;
-- upgrade/uninstall behavior when an older or newer official WinFsp installation exists;
+- full memfs ARM64 configure/build/package after the Visual Studio ARM64 C/C++ toolchain is installed (the driver-matched ARM64 WinFsp static runtime already builds);
+- coexistence testing against materially older/newer official WinFsp installations, while preserving the private-service isolation rules already implemented;
 - service recovery after reboot and abnormal termination;
-- clean-machine embedded-driver fallback with no WinFsp installation present.
+- clean-machine embedded-driver fallback with no WinFsp installation present, using the now-checked-in `verify-deployment.ps1 -Scenario PrivateFallback -ExercisePrivateFallback` harness.
