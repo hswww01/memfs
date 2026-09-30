@@ -113,6 +113,15 @@ try {
         throw "directory enumeration mismatch: $($names -join ',')"
     }
 
+    $filtered = @(
+        Get-ChildItem "$Drive\dir" -Filter "*.TXT" |
+            Sort-Object Name |
+            Select-Object -ExpandProperty Name
+    )
+    if (($filtered -join ",") -ne "moved.txt") {
+        throw "wildcard directory filter mismatch: $($filtered -join ',')"
+    }
+
     Remove-Item "$Drive\dir\moved.txt"
     Remove-Item "$Drive\dir\data.bin"
     Remove-Item "$Drive\dir\sparse.bin"

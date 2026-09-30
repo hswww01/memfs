@@ -32,6 +32,9 @@ NTSTATUS memfs_winfsp_dispatcher_result(const MemfsWinFsp* instance);
 void memfs_winfsp_test_dispatcher_stopped(
     MemfsWinFsp* instance,
     bool normally);
+bool memfs_winfsp_test_name_matches_pattern(
+    const wchar_t* pattern,
+    const wchar_t* name);
 #endif
 
 void memfs_winfsp_stop(MemfsWinFsp* instance);

@@ -3,10 +3,93 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <winternl.h>
 
 static MemfsWinFsp* memfs_instance(FSP_FILE_SYSTEM* file_system) {
 	return (MemfsWinFsp*)file_system->UserContext;
 }
+
+typedef BOOLEAN (NTAPI *MemfsRtlIsNameInUnUpcasedExpressionFn)(
+	PUNICODE_STRING Expression,
+	PUNICODE_STRING Name,
+	BOOLEAN IgnoreCase,
+	PWCH UpcaseTable);
+
+static INIT_ONCE g_name_expression_once = INIT_ONCE_STATIC_INIT;
+static MemfsRtlIsNameInUnUpcasedExpressionFn g_name_expression_match;
+
+static BOOL CALLBACK memfs_name_expression_init(
+	PINIT_ONCE once, PVOID parameter, PVOID* context) {
+	HMODULE ntdll;
+
+	(void)once;
+	(void)parameter;
+	(void)context;
+
+	ntdll = GetModuleHandleW(L"ntdll.dll");
+	if (ntdll != NULL) {
+		g_name_expression_match =
+			(MemfsRtlIsNameInUnUpcasedExpressionFn)GetProcAddress(
+				ntdll, "RtlIsNameInUnUpcasedExpression");
+	}
+
+	return TRUE;
+}
+
+static bool memfs_name_matches_pattern(
+	const wchar_t* pattern,
+	const wchar_t* name) {
+	UNICODE_STRING expression;
+	UNICODE_STRING candidate;
+	size_t pattern_chars;
+	size_t name_chars;
+
+	if (pattern == NULL || *pattern == L'\0')
+		return true;
+	if (name == NULL)
+		return false;
+
+	if (!InitOnceExecuteOnce(
+			&g_name_expression_once,
+			memfs_name_expression_init,
+			NULL,
+			NULL)) {
+		/*
+		 * Pattern prefiltering is an optimization only. If the helper cannot
+		 * be initialized, return every entry and let WinFsp/FSD perform the
+		 * authoritative filtering.
+		 */
+		return true;
+	}
+	if (g_name_expression_match == NULL)
+		return true;
+
+	pattern_chars = wcslen(pattern);
+	name_chars = wcslen(name);
+	if (pattern_chars > USHRT_MAX / sizeof(wchar_t) ||
+		name_chars > USHRT_MAX / sizeof(wchar_t)) {
+		return true;
+	}
+
+	expression.Length = (USHORT)(pattern_chars * sizeof(wchar_t));
+	expression.MaximumLength = expression.Length;
+	expression.Buffer = (PWSTR)pattern;
+	candidate.Length = (USHORT)(name_chars * sizeof(wchar_t));
+	candidate.MaximumLength = candidate.Length;
+	candidate.Buffer = (PWSTR)name;
+
+	return FALSE != g_name_expression_match(
+		&expression, &candidate, TRUE, NULL);
+}
+
+#if defined(MEMFS_WINFSP_TESTING)
+bool memfs_winfsp_test_name_matches_pattern(
+	const wchar_t* pattern,
+	const wchar_t* name) {
+	return memfs_name_matches_pattern(pattern, name);
+}
+#endif
+
 
 static NTSTATUS memfs_status(MemfsResult result) {
 	switch (result) {
@@ -449,15 +532,13 @@ static NTSTATUS fs_ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_contex
 	MemfsNode* dir = file_context;
 	MemfsNode* node;
 
-	(void)pattern;
-
 	if (!memfs_node_is_directory(dir))
 		return STATUS_NOT_A_DIRECTORY;
 
 	*bytes_transferred = 0;
 
 	if (dir != instance->store->root) {
-		if (marker == NULL) {
+		if (marker == NULL && memfs_name_matches_pattern(pattern, L".")) {
 			if (!memfs_add_dir_info(dir, L".", buffer, length, bytes_transferred)) {
 				return STATUS_SUCCESS;
 			}
@@ -466,7 +547,8 @@ static NTSTATUS fs_ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_contex
 		if (marker == NULL || (marker[0] == L'.' && marker[1] == L'\0')) {
 			MemfsNode* parent = dir->parent;
 
-			if (!memfs_add_dir_info(parent, L"..", buffer, length, bytes_transferred)) {
+			if (memfs_name_matches_pattern(pattern, L"..") &&
+				!memfs_add_dir_info(parent, L"..", buffer, length, bytes_transferred)) {
 				return STATUS_SUCCESS;
 			}
 			marker = NULL;
@@ -479,6 +561,8 @@ static NTSTATUS fs_ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_contex
 
 	for (; node; node = memfs_dir_next(node)) {
 		if (node->deleted)
+			continue;
+		if (!memfs_name_matches_pattern(pattern, node->name))
 			continue;
 
 		if (!memfs_add_dir_info(node, node->name, buffer, length, bytes_transferred)) {
@@ -663,6 +747,7 @@ NTSTATUS memfs_winfsp_create_ex(
 	volume_params.PersistentAcls = 1;
 	volume_params.PostCleanupWhenModifiedOnly = 1;
 	volume_params.PassQueryDirectoryFileName = 1;
+	volume_params.PassQueryDirectoryPattern = 1;
 	volume_params.PostDispositionWhenNecessaryOnly = 1;
 	volume_params.AllowOpenInKernelMode = 1;
 	volume_params.SupportsPosixUnlinkRename = 0;

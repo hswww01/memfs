@@ -54,6 +54,14 @@ int main(void) {
           MEMFS_DISPATCHER_STOPPED_NORMALLY);
     CHECK(memfs_winfsp_dispatcher_result(&instance) == STATUS_SUCCESS);
 
+    CHECK(memfs_winfsp_test_name_matches_pattern(NULL, L"anything.bin"));
+    CHECK(memfs_winfsp_test_name_matches_pattern(L"*", L"anything.bin"));
+    CHECK(memfs_winfsp_test_name_matches_pattern(L"*.TXT", L"readme.txt"));
+    CHECK(memfs_winfsp_test_name_matches_pattern(L"file?.dat", L"FILE1.DAT"));
+    CHECK(memfs_winfsp_test_name_matches_pattern(L"foo*", L"Foobar"));
+    CHECK(!memfs_winfsp_test_name_matches_pattern(L"*.txt", L"image.bin"));
+    CHECK(!memfs_winfsp_test_name_matches_pattern(L"file?.dat", L"file12.dat"));
+
     CloseHandle(event);
 
     if (g_failures != 0) {
