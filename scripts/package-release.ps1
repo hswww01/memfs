@@ -5,9 +5,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "provenance-common.ps1")
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $repoRoot = [IO.Path]::GetFullPath($repoRoot)
+$BuildDir = [IO.Path]::GetFullPath($BuildDir)
 $distRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot "dist"))
 $OutputDir = [IO.Path]::GetFullPath($OutputDir)
 
@@ -39,6 +41,34 @@ function Assert-SafeReleaseOutput {
 }
 
 Assert-SafeReleaseOutput -Path $OutputDir
+
+$trackedDirty = @(Get-GitTrackedDirty -Repo $repoRoot)
+if ($trackedDirty.Count -ne 0) {
+    throw "Refusing to package a tracked-dirty memfs tree: $($trackedDirty -join '; ')"
+}
+
+$cachePath = Join-Path $BuildDir "CMakeCache.txt"
+if (-not (Test-Path -LiteralPath $cachePath -PathType Leaf)) {
+    throw "Release CMake cache not found: $cachePath"
+}
+$buildType = Get-CMakeCacheValue -CachePath $cachePath -Name "CMAKE_BUILD_TYPE"
+if ($buildType -ne "Release") {
+    throw "Release packaging requires CMAKE_BUILD_TYPE=Release; got '$buildType'"
+}
+$triplet = Get-CMakeCacheValue -CachePath $cachePath -Name "VCPKG_TARGET_TRIPLET"
+if ($triplet -ne "x64-windows-static") {
+    throw "Release packaging requires x64-windows-static; got '$triplet'"
+}
+
+& cmake --build $BuildDir
+if ($LASTEXITCODE -ne 0) {
+    throw "Release build failed with exit code $LASTEXITCODE"
+}
+
+& ctest --test-dir $BuildDir --output-on-failure
+if ($LASTEXITCODE -ne 0) {
+    throw "Release CTest failed with exit code $LASTEXITCODE"
+}
 $exe = Join-Path $BuildDir "memfs.exe"
 $notice = Join-Path $repoRoot "THIRD_PARTY_NOTICES.md"
 $winfspLicense = Join-Path $WinFspSourceRoot "License.txt"
@@ -67,6 +97,21 @@ try {
     Copy-Item -LiteralPath $winfspLicense -Destination (Join-Path $stagingLicenses "WinFsp-License.txt")
     Copy-Item -LiteralPath $sodiumLicense -Destination (Join-Path $stagingLicenses "libsodium.txt")
     Copy-Item -LiteralPath $zstdLicense -Destination (Join-Path $stagingLicenses "zstd.txt")
+    $stagingProvenance = Join-Path $stagingDir "BUILD_PROVENANCE.json"
+    $provenanceScript = Join-Path $PSScriptRoot "build-provenance.ps1"
+
+    $provenanceArgs = @(
+        "-Mode", "Write",
+        "-SourceDir", $repoRoot,
+        "-BuildDir", $BuildDir,
+        "-ExePath", $exe,
+        "-OutputPath", $stagingProvenance,
+        "-RequireClean"
+    )
+    & $provenanceScript @provenanceArgs
+    $provenanceArgs[1] = "Verify"
+    & $provenanceScript @provenanceArgs
+
 
     $stagingManifest = Join-Path $stagingDir "SHA256SUMS.txt"
     $files = Get-ChildItem -LiteralPath $stagingDir -File -Recurse |

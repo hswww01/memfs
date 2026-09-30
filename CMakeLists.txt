@@ -19,6 +19,9 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|arm64|aarch64")
 		"Native ARM64 memfs.exe is intentionally not built. Build the x64 executable; "
 		"Windows 11 on Arm runs it under x64 emulation and memfs selects the ARM64 SYS at runtime.")
 endif()
+find_program(MEMFS_POWERSHELL_EXECUTABLE
+	NAMES pwsh.exe powershell.exe
+	REQUIRED)
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -142,9 +145,27 @@ else()
 		HINTS ${_winfsp_bin_hints}
 		REQUIRED)
 endif()
+set(_winfsp_driver_provenance_json
+	"${CMAKE_CURRENT_BINARY_DIR}/winfsp-driver-provenance.json")
+execute_process(
+	COMMAND "${MEMFS_POWERSHELL_EXECUTABLE}" -NoLogo -NoProfile -NonInteractive
+		-ExecutionPolicy Bypass
+		-File "${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify-winfsp-drivers.ps1"
+		-X64Path "${WINFSP_DRIVER_X64}"
+		-Arm64Path "${WINFSP_DRIVER_ARM64}"
+		-OutputJson "${_winfsp_driver_provenance_json}"
+	RESULT_VARIABLE _winfsp_provenance_result
+	OUTPUT_VARIABLE _winfsp_provenance_output
+	ERROR_VARIABLE _winfsp_provenance_error)
+if(NOT _winfsp_provenance_result EQUAL 0)
+	message(FATAL_ERROR
+		"WinFsp driver provenance verification failed: "
+		"${_winfsp_provenance_error}${_winfsp_provenance_output}")
+endif()
+message(STATUS "WinFsp driver PE/signature provenance gate passed")
 function(_memfs_read_driver_version driver_path out_full out_canonical)
 	execute_process(
-		COMMAND powershell.exe -NoLogo -NoProfile -NonInteractive -Command
+		COMMAND "${MEMFS_POWERSHELL_EXECUTABLE}" -NoLogo -NoProfile -NonInteractive -Command
 			"(Get-Item -LiteralPath '${driver_path}').VersionInfo.FileVersion"
 		RESULT_VARIABLE _driver_version_result
 		OUTPUT_VARIABLE _driver_file_version
@@ -542,5 +563,11 @@ add_test(NAME memfs_cli_help COMMAND memfs --help)
 
 add_test(NAME memfs_embedded_winfsp_resources
 	COMMAND memfs_resource_test $<TARGET_FILE:memfs>)
+add_test(NAME memfs_winfsp_driver_provenance
+	COMMAND "${MEMFS_POWERSHELL_EXECUTABLE}" -NoLogo -NoProfile -NonInteractive
+		-ExecutionPolicy Bypass
+		-File "${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify-winfsp-drivers.ps1"
+		-X64Path "${WINFSP_DRIVER_X64}"
+		-Arm64Path "${WINFSP_DRIVER_ARM64}")
 
 install(TARGETS memfs RUNTIME DESTINATION bin)

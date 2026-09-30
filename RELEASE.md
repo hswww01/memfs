@@ -15,6 +15,11 @@ Verified on 2026-09-30 on Windows x64.
   - x64: `03553FFFACD362F4A9A08C00B4F236A82354A183BC6028494FB32055386E13C9`
   - ARM64: `BF3B1BF90A7C070D456FC43C8552CCF8BE85CDDDEF4F3B19091B4A64AE4E686C`
 - generated matching static worktree: `D:\src\winfsp-memfs-static`
+- compiler: `clang-cl 22.1.3` (`e9846648fd6183ee6d8cbdb4502213fcf902a211`)
+- vcpkg builtin baseline: `6d332a018c433fad20822ff4b536e4ccdc3413bd`
+- release triplet: `x64-windows-static`
+
+The package's machine-readable `BUILD_PROVENANCE.json` is authoritative for the exact memfs Git commit, full WinFsp commit, WinFsp patch diff hash, static-library hash, both SYS hashes/PE machines/Authenticode signer, compiler binary hash/version, vcpkg commit/baseline/triplet hash, dependency versions and final EXE hash.
 
 Run this before a clean build:
 
@@ -30,12 +35,13 @@ This avoids mixing a newer user-mode runtime with an older signed kernel driver.
 
 ## Static WinFsp version contract
 
-The build now enforces the WinFsp version in three places:
+The build now enforces WinFsp provenance at several independent levels:
 
 1. CMake reads `MyCanonicalVersion` from the selected WinFsp source tree.
-2. CMake reads the embedded SYS FileVersion and rejects a different major/minor.
-3. `memfs_winfsp_version_test` calls `FspVersion()` from the linked static archive and
-   verifies the encoded version at runtime.
+2. CMake requires both SYS files to have the same complete FileVersion and the expected major/minor.
+3. `verify-winfsp-drivers.ps1` requires x64 SYS = `IMAGE_FILE_MACHINE_AMD64`, ARM64 SYS = `IMAGE_FILE_MACHINE_ARM64`, a `Valid` Authenticode signature, the Microsoft Windows Hardware Compatibility Publisher signer, and the same signer certificate for both drivers.
+4. `memfs_winfsp_version_test` calls `FspVersion()` from the linked static archive and verifies the encoded version at runtime.
+5. `memfs_resource_test` parses the PE headers of the actual embedded resources and verifies their machine architecture.
 
 A deliberate negative configure test using WinFsp v2.2 static source with the v2.1
 signed driver fails with:
@@ -67,7 +73,7 @@ cmake --build --preset x64-release
 ctest --preset x64-release --output-on-failure
 ```
 
-Both Debug and Release pass 11/11 tests:
+Both Debug and Release pass 13/13 tests:
 
 1. `memfs_mt_stress_test`
 2. `memfs_core_test`
@@ -78,8 +84,10 @@ Both Debug and Release pass 11/11 tests:
 7. `memfs_driver_test`
 8. `memfs_static_winfsp_no_dll_import`
 9. `memfs_static_winfsp_version`
-10. `memfs_cli_help`
-11. `memfs_embedded_winfsp_resources`
+10. `memfs_winfsp_dispatcher_state`
+11. `memfs_cli_help`
+12. `memfs_embedded_winfsp_resources`
+13. `memfs_winfsp_driver_provenance`
 
 
 ## Real mounted-drive integration
@@ -101,11 +109,11 @@ Matching v2.1 static libraries:
 - Debug:
   `D:\src\winfsp-memfs-static\build\VStudio\build\Debug\winfsp-static-x64.lib`
   SHA-256:
-  `4F7B338947B7D64A38F7C6D7905C445100F004430FAD38F9D63C949010A898A7`
+  `EB66B092EAC94C973ED929C6CACE2F3254EADE8DF48E7FECC20DB2CED6A104B1`
 - Release:
   `D:\src\winfsp-memfs-static\build\VStudio\build\Release\winfsp-static-x64.lib`
   SHA-256:
-  `7184AC5FACCDD24F266A980C0037AB261D05DC3DAD466741E029805742C8032F`
+  `7064859CC5085A4F68BD8A1F9C53B852263257E7B3CD57FDD785BECD313568E2`
 
 
 `memfs_static_winfsp_no_dll_import` verifies that the final EXE has no WinFsp DLL
@@ -256,13 +264,13 @@ The harness verifies private service creation, MemfsC-owned driver filename/path
 
 Debug:
 
-- size: 3,315,712 bytes
-- SHA-256: `B5A66BF622CB80B3E3449185738CF7DEB67BAAD3F94FA983CD4032A7053D1A5F`
+- size: 3,320,320 bytes
+- SHA-256: `D16B51C8FEB789649F72B94948CA1567DD49F770DCFC34BB9BAB48577C0605C2`
 
 Release:
 
-- size: 1,319,424 bytes
-- SHA-256: `9A2239E4DA8A63944B385B2BA7382F7188A057038590CC4F3D2615276DD09F52`
+- size: 1,325,568 bytes
+- SHA-256: `B3A8D631E7F8889A2782B1E21F732A2E48E094B0CE535EDC0091D289347D56AF`
 
 These hashes are verification artifacts for this local build, not permanent release
 identifiers.
@@ -274,11 +282,14 @@ identifiers.
 That same package is the Windows 11 ARM64 package; there is no separate ARM64 user-mode build.
 
 - `memfs.exe`
+- `BUILD_PROVENANCE.json`
 - `THIRD_PARTY_NOTICES.md`
 - `licenses/WinFsp-License.txt`
 - `licenses/libsodium.txt`
 - `licenses/zstd.txt`
 - `SHA256SUMS.txt`
+
+Packaging is a release gate, not a copy step. It rejects tracked-dirty source trees, requires a Release/x64-static CMake cache, rebuilds the build directory, runs the complete CTest suite, writes `BUILD_PROVENANCE.json`, immediately verifies it against the current files/toolchain, and only then atomically publishes the staging directory.
 
 The package intentionally includes the original third-party license texts rather
 than paraphrasing them as the authoritative legal terms. The static WinFsp build
