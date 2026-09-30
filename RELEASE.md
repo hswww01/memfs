@@ -215,12 +215,30 @@ Release:
 These hashes are verification artifacts for this local build, not permanent release
 identifiers.
 
+## Release packaging
+
+`scripts\package-release.ps1` creates the current x64 release directory with:
+
+- `memfs.exe`
+- `THIRD_PARTY_NOTICES.md`
+- `licenses/WinFsp-License.txt`
+- `licenses/libsodium.txt`
+- `licenses/zstd.txt`
+- `SHA256SUMS.txt`
+
+The package intentionally includes the original third-party license texts rather
+than paraphrasing them as the authoritative legal terms. The static WinFsp build
+also has an explicit release gate in `THIRD_PARTY_NOTICES.md`: the WinFsp
+FLOSS exception in the local source tree names platform DLL linking, while this
+build statically links user-mode WinFsp code. Proprietary distribution therefore
+requires an appropriate licensing decision before release.
+
 ## Remaining productization items
 
 Before broad external distribution, separately validate:
 
 - code-signing policy for the final EXE;
-- WinFsp redistribution/license notices;
+- final WinFsp distribution-license decision for static linking (for proprietary distribution, obtain appropriate commercial permission or use distribution terms compatible with the applicable WinFsp/GPLv3 obligations);
 - Windows 10 and Windows 11 clean-machine installation;
 - ARM64 build/package and matching signed ARM64 driver;
 - upgrade/uninstall behavior when an older or newer official WinFsp installation exists;

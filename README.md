@@ -48,6 +48,24 @@ cmake --build --preset x64-release
 ctest --preset x64-release
 ```
 
+## Release package and third-party notices
+
+Create the current x64 release package with:
+
+```powershell
+.\scripts\package-release.ps1
+```
+
+The package contains `memfs.exe`, `THIRD_PARTY_NOTICES.md`, SHA-256 sums,
+and the authoritative license texts for WinFsp, libsodium and zstd.
+
+The current build statically links WinFsp user-mode code. WinFsp's local
+`License.txt` states GPLv3 and its FLOSS special exception explicitly covers
+linking with the platform WinFsp DLLs, not a general static-linking exception.
+Before proprietary distribution, obtain appropriate WinFsp commercial
+permission or otherwise ensure the chosen distribution terms satisfy the
+applicable WinFsp/GPLv3 obligations. See `THIRD_PARTY_NOTICES.md`.
+
 ## Run
 
 Basic 512 MiB RAM disk:
