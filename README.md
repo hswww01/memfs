@@ -107,9 +107,9 @@ Options:
 
 ```text
 --mount <path>          Drive letter or directory mount point
---size <bytes>          Capacity; K/M/G suffix supported
+--size <bytes|auto>     Capacity 1..INT64_MAX; K/M/G suffix supported
 --label <name>          Volume label
---threads <n>           WinFsp dispatcher threads; 0 = automatic
+--threads <n>           Dispatcher threads; 0 = automatic, otherwise 2..64
 --compress              Enable Zstd compression at level 1
 --compression-level <n> Enable Zstd level 1..22
 --encrypt               Use a random XChaCha20-Poly1305 key

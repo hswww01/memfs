@@ -300,6 +300,7 @@ target_link_libraries(memfs_core
 
 add_executable(memfs
 	src/main.c
+	src/memfs_cli.c
 	src/memfs_winfsp.c
 	src/memfs_driver.c
 	${CMAKE_CURRENT_BINARY_DIR}/memfs_resources.rc)
@@ -427,6 +428,14 @@ add_executable(memfs_driver_test
 	tests/memfs_driver_test.c
 	src/memfs_driver.c)
 
+add_executable(memfs_cli_test
+	tests/memfs_cli_test.c
+	src/memfs_cli.c)
+
+target_include_directories(memfs_cli_test
+	PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 if(MEMFS_STATIC_WINFSP)
 	add_executable(memfs_static_import_test
 		tests/memfs_static_import_test.c)
@@ -519,7 +528,7 @@ endif()
 add_test(NAME memfs_mt_stress_test COMMAND memfs_mt_stress_test)
 
 if(MSVC)
-	foreach(target memfs_core memfs memfs_core_test memfs_bench memfs_alloc_mt_bench memfs_soak_bench memfs_no_crt_heap_guard memfs_resource_test memfs_driver_test)
+	foreach(target memfs_core memfs memfs_core_test memfs_bench memfs_alloc_mt_bench memfs_soak_bench memfs_no_crt_heap_guard memfs_resource_test memfs_driver_test memfs_cli_test)
 		target_compile_options(${target}
 			PRIVATE
 				/W4
@@ -549,6 +558,7 @@ set_tests_properties(memfs_no_crt_heap_guard_bad_fixture PROPERTIES
 	WILL_FAIL TRUE)
 
 add_test(NAME memfs_driver_test COMMAND memfs_driver_test)
+add_test(NAME memfs_cli_test COMMAND memfs_cli_test)
 
 if(MEMFS_STATIC_WINFSP)
 	add_test(NAME memfs_static_winfsp_no_dll_import
@@ -560,6 +570,21 @@ if(MEMFS_STATIC_WINFSP)
 endif()
 
 add_test(NAME memfs_cli_help COMMAND memfs --help)
+
+add_test(NAME memfs_cli_reject_negative_size
+	COMMAND memfs --mount R: --size -1)
+add_test(NAME memfs_cli_reject_oversized_size
+	COMMAND memfs --mount R: --size 9223372036854775808)
+add_test(NAME memfs_cli_reject_thread_one
+	COMMAND memfs --mount R: --threads 1)
+add_test(NAME memfs_cli_reject_thread_over_limit
+	COMMAND memfs --mount R: --threads 65)
+set_tests_properties(
+	memfs_cli_reject_negative_size
+	memfs_cli_reject_oversized_size
+	memfs_cli_reject_thread_one
+	memfs_cli_reject_thread_over_limit
+	PROPERTIES WILL_FAIL TRUE)
 
 add_test(NAME memfs_embedded_winfsp_resources
 	COMMAND memfs_resource_test $<TARGET_FILE:memfs>)
