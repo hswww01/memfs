@@ -2809,6 +2809,79 @@ static void test_allocator_area_cache_reuse(void) {
 	memfs_allocator_destroy(&allocator);
 }
 
+static void test_allocator_area_cache_size_policy(void) {
+	MemfsAllocator allocator;
+	MemfsAllocatorStats baseline;
+	MemfsAllocatorStats small_cached;
+	MemfsAllocatorStats large_cached;
+	MemfsAllocatorStats after;
+	void* small_a = NULL;
+	void* small_b = NULL;
+	void* large_a = NULL;
+	void* large_b = NULL;
+	const size_t small_bytes = 16U * 1024U;
+	const size_t large_bytes = 64U * 1024U;
+
+	printf("== allocator area cache size policy ==\n");
+	memset(&allocator, 0, sizeof(allocator));
+	CHECK(memfs_allocator_init(&allocator, 64U, 64U, 64U));
+	if (allocator.state == NULL)
+		return;
+
+	memfs_allocator_get_stats(&allocator, &baseline);
+
+	small_a = memfs_allocator_alloc_uninit(&allocator, small_bytes);
+	small_b = memfs_allocator_alloc_uninit(&allocator, small_bytes);
+	CHECK(small_a != NULL);
+	CHECK(small_b != NULL);
+	if (small_a == NULL || small_b == NULL)
+		goto cleanup;
+
+	memfs_allocator_free(&allocator, small_a, small_bytes);
+	small_a = NULL;
+	memfs_allocator_free(&allocator, small_b, small_bytes);
+	small_b = NULL;
+	memfs_allocator_get_stats(&allocator, &small_cached);
+	CHECK(small_cached.area_cached_count == 2U);
+	CHECK(small_cached.area_cached_bytes > 0U);
+	CHECK(memfs_allocator_scavenge(&allocator) > 0U);
+
+	large_a = memfs_allocator_alloc_uninit(&allocator, large_bytes);
+	large_b = memfs_allocator_alloc_uninit(&allocator, large_bytes);
+	CHECK(large_a != NULL);
+	CHECK(large_b != NULL);
+	if (large_a == NULL || large_b == NULL)
+		goto cleanup;
+
+	memfs_allocator_free(&allocator, large_a, large_bytes);
+	large_a = NULL;
+	memfs_allocator_free(&allocator, large_b, large_bytes);
+	large_b = NULL;
+	memfs_allocator_get_stats(&allocator, &large_cached);
+	CHECK(large_cached.area_cached_count == 1U);
+	CHECK(large_cached.area_cached_bytes > 0U);
+	CHECK(large_cached.area_cached_bytes < large_bytes * 2U);
+
+cleanup:
+	if (small_a != NULL)
+		memfs_allocator_free(&allocator, small_a, small_bytes);
+	if (small_b != NULL)
+		memfs_allocator_free(&allocator, small_b, small_bytes);
+	if (large_a != NULL)
+		memfs_allocator_free(&allocator, large_a, large_bytes);
+	if (large_b != NULL)
+		memfs_allocator_free(&allocator, large_b, large_bytes);
+
+	(void)memfs_allocator_scavenge(&allocator);
+	memfs_allocator_get_stats(&allocator, &after);
+	CHECK(after.live_objects == baseline.live_objects);
+	CHECK(after.area_cached_count == 0U);
+	CHECK(after.area_cached_bytes == 0U);
+	CHECK(after.reserved_bytes == baseline.reserved_bytes);
+	CHECK(after.committed_bytes == baseline.committed_bytes);
+	memfs_allocator_destroy(&allocator);
+}
+
 static void test_allocator_name_pool_boundaries(void) {
 	MemfsAllocator allocator;
 	MemfsAllocatorStats before;
@@ -4313,6 +4386,7 @@ int main(void) {
 	test_allocator_reclaim();
 	test_allocator_unified_pool_layout();
 	test_allocator_area_cache_reuse();
+	test_allocator_area_cache_size_policy();
 	test_allocator_name_pool_boundaries();
 	test_allocator_generic_size_classes();
 #if !defined(NDEBUG)

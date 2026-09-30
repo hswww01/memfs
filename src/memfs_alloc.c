@@ -12,6 +12,7 @@
 #define MEMFS_AREA_CACHE_MAX_BLOCKS 32U
 #define MEMFS_AREA_CACHE_MAX_BYTES (4U * 1024U * 1024U)
 #define MEMFS_AREA_CACHE_MAX_BLOCK_BYTES (256U * 1024U)
+#define MEMFS_AREA_CACHE_LARGE_BLOCK_BYTES (64U * 1024U)
 #define MEMFS_AREA_CACHE_BLOCKS_PER_SHARD (MEMFS_AREA_CACHE_MAX_BLOCKS / MEMFS_POOL_SHARD_COUNT)
 #define MEMFS_AREA_CACHE_BYTES_PER_SHARD (MEMFS_AREA_CACHE_MAX_BYTES / MEMFS_POOL_SHARD_COUNT)
 #define MEMFS_MIN_SLAB_BYTES (4U * 1024U)
@@ -784,10 +785,17 @@ static void* area_alloc(MemfsAllocatorState* state, size_t bytes, bool zero_memo
     return (uint8_t*)block + header_size;
 }
 
+static uint32_t area_cache_block_limit(uint64_t region_bytes) {
+    if (region_bytes > MEMFS_AREA_CACHE_LARGE_BLOCK_BYTES)
+        return 1U;
+    return MEMFS_AREA_CACHE_BLOCKS_PER_SHARD;
+}
+
 static void area_free(MemfsAllocatorState* state, void* ptr) {
     MemfsAreaBlock* block;
     MemfsAreaShard* shard;
     size_t header_size;
+    uint32_t cache_block_limit;
     bool cache_block;
 
     if (state == NULL || ptr == NULL)
@@ -816,9 +824,10 @@ static void area_free(MemfsAllocatorState* state, void* ptr) {
     else
         shard->live_bytes = 0;
 
+    cache_block_limit = area_cache_block_limit(block->region_bytes);
     cache_block =
         block->region_bytes <= MEMFS_AREA_CACHE_MAX_BLOCK_BYTES &&
-        shard->cached_count < MEMFS_AREA_CACHE_BLOCKS_PER_SHARD &&
+        shard->cached_count < cache_block_limit &&
         block->region_bytes <= MEMFS_AREA_CACHE_BYTES_PER_SHARD &&
         shard->cached_bytes <= MEMFS_AREA_CACHE_BYTES_PER_SHARD - block->region_bytes;
 
