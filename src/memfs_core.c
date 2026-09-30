@@ -2053,12 +2053,42 @@ static MemfsResult memfs_default_security(MemfsAllocator* allocator, MemfsSecuri
 	return result;
 }
 
+static inline uint32_t memfs_ascii_fold(uint32_t c) {
+	if (c >= (uint32_t)L'A' && c <= (uint32_t)L'Z')
+		return c + ((uint32_t)L'a' - (uint32_t)L'A');
+	return c;
+}
+
+static int memfs_name_compare(const wchar_t* left, const wchar_t* right) {
+	const wchar_t* left_start = left;
+	const wchar_t* right_start = right;
+
+	for (;;) {
+		uint32_t a = (uint32_t)*left;
+		uint32_t b = (uint32_t)*right;
+
+		if (a >= 0x80U || b >= 0x80U)
+			return _wcsicmp(left_start, right_start);
+
+		a = memfs_ascii_fold(a);
+		b = memfs_ascii_fold(b);
+		if (a != b)
+			return a < b ? -1 : 1;
+		if (a == 0)
+			return 0;
+
+		left++;
+		right++;
+	}
+}
+
 static uint32_t memfs_name_hash(const wchar_t* name) {
 	uint32_t hash = 2166136261U;
 
 	while (*name) {
-		uint32_t c = (uint32_t)towlower(*name++);
+		uint32_t c = (uint32_t)*name++;
 
+		c = c < 0x80U ? memfs_ascii_fold(c) : (uint32_t)towlower((wint_t)c);
 		hash ^= c;
 		hash *= 16777619U;
 	}
@@ -2090,7 +2120,7 @@ static MemfsNode* memfs_dir_hash_lookup(MemfsDirHash* hash, const wchar_t* name)
 		if (node_distance < distance)
 			return NULL;
 
-		if (node->name_hash == name_hash && _wcsicmp(node->name, name) == 0) {
+		if (node->name_hash == name_hash && memfs_name_compare(node->name, name) == 0) {
 			return node;
 		}
 
@@ -2363,7 +2393,7 @@ static void memfs_dir_insert(MemfsNode* parent, MemfsNode* node) {
 
 	while (current) {
 		tree_parent = current;
-		cmp = _wcsicmp(node->name, current->name);
+		cmp = memfs_name_compare(node->name, current->name);
 		current = cmp < 0 ? current->tree_left : current->tree_right;
 	}
 
@@ -2807,7 +2837,7 @@ MemfsNode* memfs_dir_lookup(MemfsNode* dir_node, const wchar_t* name) {
 
 	node = dir_node->dir->root;
 	while (node) {
-		int cmp = _wcsicmp(name, node->name);
+		int cmp = memfs_name_compare(name, node->name);
 
 		if (cmp == 0)
 			return node->deleted ? NULL : node;
@@ -2844,7 +2874,7 @@ MemfsNode* memfs_dir_upper_bound(MemfsNode* dir_node, const wchar_t* marker) {
 
 	node = dir_node->dir->root;
 	while (node) {
-		int cmp = _wcsicmp(node->name, marker);
+		int cmp = memfs_name_compare(node->name, marker);
 
 		if (cmp > 0) {
 			candidate = node;

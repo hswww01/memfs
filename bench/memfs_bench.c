@@ -13,6 +13,9 @@
 #define BENCH_COMPRESSION_PAGE_REWRITE_COUNT 200000U
 #define BENCH_SPARSE_GROUP_COUNT 4096U
 #define BENCH_SPARSE_GROUP_ROUNDS 16U
+#define BENCH_NAME_HOT_COUNT 50000U
+#define BENCH_NAME_HOT_ROUNDS 10U
+#define BENCH_NAME_HOT_CHARS 40U
 #define BENCH_1MB_SIZE (1ULL * 1024ULL * 1024ULL)
 #define BENCH_4KB_SIZE 4096U
 #define BENCH_1B_SIZE 1U
@@ -25,6 +28,7 @@ typedef enum BenchMode {
 	BENCH_MODE_COMBINED,
 	BENCH_MODE_COMPRESSION_PAGE,
 	BENCH_MODE_SPARSE_GROUPS,
+	BENCH_MODE_NAME_HOT,
 	BENCH_MODE_PRESSURE_POLICY
 } BenchMode;
 
@@ -1607,6 +1611,90 @@ cleanup:
 	return rc;
 }
 
+static int bench_name_hot_path(const BenchConfig* config, LARGE_INTEGER frequency) {
+	typedef wchar_t NameSlot[BENCH_NAME_HOT_CHARS];
+	Memfs* fs = NULL;
+	NameSlot* canonical = NULL;
+	NameSlot* lookup = NULL;
+	LARGE_INTEGER start;
+	LARGE_INTEGER end;
+	double create_seconds;
+	double lookup_seconds;
+	double delete_seconds;
+	uint32_t i;
+	uint32_t round;
+	int rc = 1;
+
+	if (create_fs(config, &fs) != MEMFS_OK || fs == NULL)
+		return 1;
+
+	canonical = malloc((size_t)BENCH_NAME_HOT_COUNT * sizeof(*canonical));
+	lookup = malloc((size_t)BENCH_NAME_HOT_COUNT * sizeof(*lookup));
+	if (canonical == NULL || lookup == NULL)
+		goto cleanup;
+
+	for (i = 0; i < BENCH_NAME_HOT_COUNT; i++) {
+		swprintf_s(canonical[i], BENCH_NAME_HOT_CHARS,
+				   L"some_MODULE_name_%05u.obj", i);
+		swprintf_s(lookup[i], BENCH_NAME_HOT_CHARS,
+				   L"SOME_module_NAME_%05u.OBJ", i);
+	}
+
+	QueryPerformanceCounter(&start);
+	for (i = 0; i < BENCH_NAME_HOT_COUNT; i++) {
+		MemfsNode* node = NULL;
+		if (memfs_node_create(fs, fs->root, canonical[i], false,
+							  FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) != MEMFS_OK ||
+			node == NULL)
+			goto cleanup;
+		memfs_node_close(node);
+	}
+	QueryPerformanceCounter(&end);
+	create_seconds = seconds_between(start, end, frequency);
+
+	QueryPerformanceCounter(&start);
+	for (round = 0; round < BENCH_NAME_HOT_ROUNDS; round++) {
+		for (i = 0; i < BENCH_NAME_HOT_COUNT; i++) {
+			uint32_t index = (uint32_t)(((uint64_t)i * 2654435761ULL +
+										 (uint64_t)round * 2246822519ULL) %
+										BENCH_NAME_HOT_COUNT);
+			if (memfs_dir_lookup(fs->root, lookup[index]) == NULL)
+				goto cleanup;
+		}
+	}
+	QueryPerformanceCounter(&end);
+	lookup_seconds = seconds_between(start, end, frequency);
+
+	QueryPerformanceCounter(&start);
+	for (i = 0; i < BENCH_NAME_HOT_COUNT; i++) {
+		MemfsNode* node = memfs_dir_lookup(fs->root, lookup[i]);
+		if (node == NULL || memfs_node_unlink(node) != MEMFS_OK)
+			goto cleanup;
+	}
+	QueryPerformanceCounter(&end);
+	delete_seconds = seconds_between(start, end, frequency);
+
+	printf("\n[ASCII case-insensitive directory hot path]\n");
+	printf("files:            %u\n", BENCH_NAME_HOT_COUNT);
+	printf("lookup rounds:    %u\n", BENCH_NAME_HOT_ROUNDS);
+	print_rate("create", BENCH_NAME_HOT_COUNT, create_seconds);
+	print_rate("lookup", BENCH_NAME_HOT_COUNT * BENCH_NAME_HOT_ROUNDS, lookup_seconds);
+	print_rate("delete", BENCH_NAME_HOT_COUNT, delete_seconds);
+	printf("lookup ns/op:     %.1f\n",
+		   lookup_seconds * 1000000000.0 /
+			   (double)(BENCH_NAME_HOT_COUNT * BENCH_NAME_HOT_ROUNDS));
+	rc = 0;
+
+cleanup:
+	if (canonical != NULL)
+		free(canonical);
+	if (lookup != NULL)
+		free(lookup);
+	if (fs != NULL)
+		memfs_destroy(fs);
+	return rc;
+}
+
 static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* compression, BenchConfig* encryption,
 					  BenchConfig* combined, BenchMode* mode, bool* csv_enabled) {
 	int i;
@@ -1644,6 +1732,8 @@ static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* co
 			*mode = BENCH_MODE_COMPRESSION_PAGE;
 		} else if (strcmp(argv[i], "--sparse-groups") == 0) {
 			*mode = BENCH_MODE_SPARSE_GROUPS;
+		} else if (strcmp(argv[i], "--name-hot") == 0) {
+			*mode = BENCH_MODE_NAME_HOT;
 		} else if (strcmp(argv[i], "--pressure-policy") == 0) {
 			*mode = BENCH_MODE_PRESSURE_POLICY;
 		} else if (strcmp(argv[i], "--compare") == 0) {
@@ -1665,6 +1755,7 @@ static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* co
 			printf("  --combined           run compression+encryption combined mode only\n");
 			printf("  --compression-page   run 200k repeated compressible 4KB page rewrites\n");
 			printf("  --sparse-groups      write one 4KB page into each of 4096 distinct page groups\n");
+			printf("  --name-hot           benchmark 50k ASCII names and 500k case-insensitive lookups\n");
 			printf("  --pressure-policy    run deterministic auto-capacity pressure/scavenge benchmark (Debug)\n");
 			printf("  --compression-level N set compression level for compression mode\n");
 			printf("  --csv                append CSV comparison data after --compare table\n");
@@ -1740,6 +1831,8 @@ int main(int argc, char** argv) {
 		rc = bench_compression_page_rewrite(&compression, frequency);
 	} else if (mode == BENCH_MODE_SPARSE_GROUPS) {
 		rc = bench_sparse_single_page_groups(&plain, frequency);
+	} else if (mode == BENCH_MODE_NAME_HOT) {
+		rc = bench_name_hot_path(&plain, frequency);
 	} else if (mode == BENCH_MODE_PRESSURE_POLICY) {
 		rc = bench_pressure_policy(frequency);
 	}

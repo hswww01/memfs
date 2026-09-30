@@ -1577,6 +1577,50 @@ exit:
 
 static bool test_orphan_contains(const Memfs* fs, const MemfsNode* target);
 
+static void test_unicode_name_fallback_with_hash(void) {
+	Memfs* fs = NULL;
+	MemfsNode* node = NULL;
+	MemfsNode* found;
+	MemfsNode* duplicate = NULL;
+	wchar_t name[32];
+	uint32_t i;
+
+	printf("== Unicode name fallback with directory hash ==\n");
+	CHECK(memfs_create(32ULL * 1024ULL * 1024ULL, L"UNICODENAME", &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	if (fs == NULL)
+		return;
+
+	for (i = 0; i < 300; i++) {
+		node = NULL;
+		swprintf_s(name, _countof(name), L"filler_%03u.tmp", i);
+		CHECK(memfs_node_create(fs, fs->root, name, false,
+								FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) == MEMFS_OK);
+		CHECK(node != NULL);
+		if (node != NULL)
+			memfs_node_close(node);
+	}
+
+	node = NULL;
+	CHECK(memfs_node_create(fs, fs->root, L"\u03A9Case.TXT", false,
+							FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) == MEMFS_OK);
+	CHECK(node != NULL);
+	if (node != NULL)
+		memfs_node_close(node);
+
+	found = memfs_dir_lookup(fs->root, L"\u03A9cASE.txt");
+	CHECK(found != NULL);
+	if (found != NULL)
+		CHECK(wcscmp(found->name, L"\u03A9Case.TXT") == 0);
+
+	CHECK(memfs_dir_lookup(fs->root, L"\u03A8cASE.txt") == NULL);
+	CHECK(memfs_node_create(fs, fs->root, L"\u03A9CASE.txt", false,
+							FILE_ATTRIBUTE_NORMAL, NULL, 0, &duplicate) == MEMFS_ERR_EXISTS);
+	CHECK(duplicate == NULL);
+
+	memfs_destroy(fs);
+}
+
 static void test_large_directory_case_insensitive_hash_stress(void) {
 	enum { COUNT = 1024 };
 	Memfs* fs = NULL;
@@ -4504,6 +4548,7 @@ int main(void) {
 	test_small_to_paged_promotion();
 	test_truncate_regrow_zero_fill();
 	test_large_directory();
+	test_unicode_name_fallback_with_hash();
 	test_large_directory_case_insensitive_hash_stress();
 	test_compression();
 	test_adaptive_compression();
