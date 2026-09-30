@@ -8,6 +8,7 @@
 #include <wctype.h>
 
 #include "memfs_winfsp.h"
+#include "memfs_driver.h"
 
 #define MEMFS_SERVICE_NAME L"MemfsC"
 
@@ -23,6 +24,7 @@ typedef struct MemfsRunConfig {
     bool have_fixed_key;
     bool debug;
     bool service_mode;
+    bool uninstall_private_driver;
     bool stats_enabled;
     bool stats_json;
     uint8_t encryption_key[MEMFS_ENCRYPTION_KEY_SIZE];
@@ -123,7 +125,7 @@ static void print_usage(const wchar_t* exe) {
              L"  --key-hex <64hex>       Enable encryption with a fixed 256-bit key.\n"
              L"  --key-env <name>        Read the 64-hex encryption key from an env variable.\n"
              L"  --debug                 Enable all WinFsp debug logging.\n"
-             L"  --service               Run under the Windows Service Control Manager.\n"
+             L"  --service               Run under the Windows Service Control Manager.\n"             L"  --uninstall-private-driver  Remove only MemfsC private WinFsp driver files/service.\n"
              L"  --stats                 Print human-readable runtime stats at mount/stop.\n"
              L"  --stats-json            Print machine-readable JSON stats at mount/stop.\n"
              L"  --help                  Show this help.\n"
@@ -287,6 +289,8 @@ static int parse_config(int argc, wchar_t** argv, MemfsRunConfig* config) {
             config->debug = true;
         } else if (_wcsicmp(argv[i], L"--service") == 0) {
             config->service_mode = true;
+        } else if (_wcsicmp(argv[i], L"--uninstall-private-driver") == 0) {
+            config->uninstall_private_driver = true;
         } else if (_wcsicmp(argv[i], L"--stats") == 0) {
             config->stats_enabled = true;
         } else if (_wcsicmp(argv[i], L"--stats-json") == 0) {
@@ -302,7 +306,7 @@ static int parse_config(int argc, wchar_t** argv, MemfsRunConfig* config) {
         }
     }
 
-    if (config->mount_point == NULL) {
+    if (!config->uninstall_private_driver && config->mount_point == NULL) {
         fwprintf(stderr, L"--mount is required.\n");
         return 2;
     }
@@ -546,6 +550,22 @@ int wmain(int argc, wchar_t** argv) {
         print_usage(argv[0]);
         SecureZeroMemory(g_config.encryption_key, sizeof(g_config.encryption_key));
         return parse_result;
+    }
+
+    if (g_config.uninstall_private_driver) {
+        DWORD error = memfs_winfsp_uninstall_embedded_driver();
+
+        if (error == ERROR_SUCCESS) {
+            wprintf(L"MemfsC private WinFsp driver is removed.\n");
+            return 0;
+        }
+        if (error == ERROR_SUCCESS_REBOOT_REQUIRED) {
+            wprintf(L"MemfsC private WinFsp driver removal is scheduled; reboot required.\n");
+            return 0;
+        }
+
+        fwprintf(stderr, L"Cannot remove MemfsC private WinFsp driver: %lu\n", error);
+        return 6;
     }
 
     if (g_config.service_mode) {

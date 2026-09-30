@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("install","start","query","stop","delete","restart")]
+    [ValidateSet("install","start","query","stop","delete","restart","purge-driver")]
     [string]$Action = "query",
     [string]$Exe = "",
     [string]$Mount = "R:",
@@ -119,6 +119,30 @@ switch ($Action) {
         & sc.exe stop $ServiceName *> $null
         Invoke-Sc delete $ServiceName
         Write-Output "Deleted $ServiceName"
+    }
+    "purge-driver" {
+        Assert-Admin
+        if (-not $Exe) {
+            $Exe = Join-Path (Split-Path $PSScriptRoot -Parent) "build\x64-release\memfs.exe"
+        }
+        $Exe = [IO.Path]::GetFullPath($Exe)
+        if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
+            throw "memfs.exe not found: $Exe"
+        }
+
+        $serviceText = (& sc.exe query $ServiceName 2>&1 | Out-String)
+        $queryExit = $LASTEXITCODE
+        if ($queryExit -eq 0 -and $serviceText -match "STATE\s+:\s+4\s+RUNNING") {
+            throw "Stop MemfsC before purging the private WinFsp driver."
+        }
+        if ($queryExit -notin 0, 1060) {
+            throw "sc query failed with exit code $queryExit"
+        }
+
+        & $Exe --uninstall-private-driver
+        if ($LASTEXITCODE -ne 0) {
+            throw "memfs private driver uninstall failed with exit code $LASTEXITCODE"
+        }
     }
     "restart" {
         Assert-Admin

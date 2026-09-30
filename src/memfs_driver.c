@@ -11,9 +11,11 @@
 #if defined(_M_ARM64)
 #define MEMFS_WINFSP_DLL_FILE L"winfsp-a64.dll"
 #define MEMFS_WINFSP_SYS_FILE L"memfs-winfsp-a64.sys"
+#define MEMFS_WINFSP_SYS_ALT_FILE L"memfs-winfsp-a64.alt.sys"
 #else
 #define MEMFS_WINFSP_DLL_FILE L"winfsp-x64.dll"
 #define MEMFS_WINFSP_SYS_FILE L"memfs-winfsp-x64.sys"
+#define MEMFS_WINFSP_SYS_ALT_FILE L"memfs-winfsp-x64.alt.sys"
 #endif
 
 static INIT_ONCE g_runtime_once = INIT_ONCE_STATIC_INIT;
@@ -237,34 +239,167 @@ const wchar_t* memfs_winfsp_runtime_directory(void) {
     return g_runtime_dir;
 }
 
-static DWORD embedded_driver_path(wchar_t path[MAX_PATH]) {
+static DWORD private_driver_path_for(const wchar_t* file_name,
+                                     wchar_t path[MAX_PATH]) {
     wchar_t system_dir[MAX_PATH];
-    UINT chars = GetSystemDirectoryW(system_dir, _countof(system_dir));
+    UINT chars;
 
+    if (file_name == NULL || path == NULL)
+        return ERROR_INVALID_PARAMETER;
+
+    chars = GetSystemDirectoryW(system_dir, _countof(system_dir));
     if (chars == 0)
         return GetLastError();
     if (chars >= _countof(system_dir))
         return ERROR_BUFFER_OVERFLOW;
 
     if (_snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\drivers\\%s",
-                     system_dir, MEMFS_WINFSP_SYS_FILE) < 0)
+                     system_dir, file_name) < 0)
         return ERROR_BUFFER_OVERFLOW;
-
     return ERROR_SUCCESS;
 }
+
+static DWORD embedded_driver_paths(wchar_t primary[MAX_PATH],
+                                   wchar_t alternate[MAX_PATH]) {
+    DWORD error = private_driver_path_for(MEMFS_WINFSP_SYS_FILE, primary);
+    if (error != ERROR_SUCCESS)
+        return error;
+    return private_driver_path_for(MEMFS_WINFSP_SYS_ALT_FILE, alternate);
+}
+
+static DWORD resource_matches_file(WORD resource_id,
+                                   const wchar_t* path,
+                                   BOOL* matches) {
+    const void* data;
+    DWORD size;
+    DWORD error;
+
+    error = resource_view(resource_id, &data, &size);
+    if (error != ERROR_SUCCESS)
+        return error;
+    return file_matches_buffer(path, data, size, matches);
+}
+
+static DWORD query_service_state(SC_HANDLE service, DWORD* state) {
+    SERVICE_STATUS_PROCESS status;
+    DWORD bytes = 0;
+
+    if (service == NULL || state == NULL)
+        return ERROR_INVALID_PARAMETER;
+    if (!QueryServiceStatusEx(service,
+                              SC_STATUS_PROCESS_INFO,
+                              (LPBYTE)&status,
+                              sizeof(status),
+                              &bytes))
+        return GetLastError();
+
+    *state = status.dwCurrentState;
+    return ERROR_SUCCESS;
+}
+
+static DWORD query_service_binary_path(SC_HANDLE service,
+                                       wchar_t path[MAX_PATH]) {
+    BYTE buffer[8192];
+    QUERY_SERVICE_CONFIGW* config = (QUERY_SERVICE_CONFIGW*)buffer;
+    DWORD needed = 0;
+    const wchar_t* source;
+    size_t length;
+
+    if (service == NULL || path == NULL)
+        return ERROR_INVALID_PARAMETER;
+    path[0] = L'\0';
+
+    if (!QueryServiceConfigW(service, config, sizeof(buffer), &needed))
+        return GetLastError();
+    if (config->lpBinaryPathName == NULL || config->lpBinaryPathName[0] == L'\0')
+        return ERROR_INVALID_DATA;
+
+    source = config->lpBinaryPathName;
+    if (*source == L'"') {
+        source++;
+        length = wcscspn(source, L"\"");
+    } else {
+        length = wcslen(source);
+    }
+    if (length == 0 || length >= MAX_PATH)
+        return ERROR_BUFFER_OVERFLOW;
+
+    wmemcpy(path, source, length);
+    path[length] = L'\0';
+    return ERROR_SUCCESS;
+}
+
+static DWORD wait_service_stopped(SC_HANDLE service, DWORD timeout_ms) {
+    ULONGLONG deadline = GetTickCount64() + timeout_ms;
+    DWORD state;
+    DWORD error;
+
+    for (;;) {
+        error = query_service_state(service, &state);
+        if (error != ERROR_SUCCESS)
+            return error;
+        if (state == SERVICE_STOPPED)
+            return ERROR_SUCCESS;
+        if (GetTickCount64() >= deadline)
+            return ERROR_TIMEOUT;
+        Sleep(100);
+    }
+}
+
+static DWORD delete_private_file(const wchar_t* path, BOOL* reboot_required) {
+    DWORD error;
+
+    if (DeleteFileW(path))
+        return ERROR_SUCCESS;
+
+    error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)
+        return ERROR_SUCCESS;
+
+    if (error == ERROR_SHARING_VIOLATION ||
+        error == ERROR_ACCESS_DENIED ||
+        error == ERROR_USER_MAPPED_FILE) {
+        if (MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)) {
+            if (reboot_required)
+                *reboot_required = TRUE;
+            return ERROR_SUCCESS;
+        }
+        error = GetLastError();
+    }
+    return error;
+}
+
+static const wchar_t* select_private_update_path(const wchar_t* running_path,
+                                                 const wchar_t* primary_path,
+                                                 const wchar_t* alternate_path) {
+    if (running_path != NULL && primary_path != NULL &&
+        _wcsicmp(running_path, primary_path) == 0)
+        return alternate_path;
+    return primary_path;
+}
+
+#if defined(MEMFS_DRIVER_TESTING)
+const wchar_t* memfs_driver_test_select_update_path(const wchar_t* running_path,
+                                                    const wchar_t* primary_path,
+                                                    const wchar_t* alternate_path) {
+    return select_private_update_path(running_path, primary_path, alternate_path);
+}
+#endif
 
 DWORD memfs_winfsp_install_embedded_driver(void) {
     SC_HANDLE manager = NULL;
     SC_HANDLE service = NULL;
-    wchar_t driver_path[MAX_PATH];
+    wchar_t primary_path[MAX_PATH];
+    wchar_t alternate_path[MAX_PATH];
+    wchar_t current_path[MAX_PATH];
+    const wchar_t* install_path = primary_path;
+    DWORD service_state = SERVICE_STOPPED;
     DWORD error;
+    DWORD open_error;
     DWORD start_error;
+    BOOL matches = FALSE;
 
-    error = embedded_driver_path(driver_path);
-    if (error != ERROR_SUCCESS)
-        return error;
-
-    error = extract_resource(IDR_MEMFS_WINFSP_SYS, driver_path);
+    error = embedded_driver_paths(primary_path, alternate_path);
     if (error != ERROR_SUCCESS)
         return error;
 
@@ -272,53 +407,198 @@ DWORD memfs_winfsp_install_embedded_driver(void) {
     if (manager == NULL)
         return GetLastError();
 
-    service = OpenServiceW(manager, MEMFS_WINFSP_DRIVER_SERVICE,
-                           SERVICE_START | SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG);
-    if (service == NULL && GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) {
+    service = OpenServiceW(manager,
+                           MEMFS_WINFSP_DRIVER_SERVICE,
+                           SERVICE_START |
+                           SERVICE_QUERY_STATUS |
+                           SERVICE_QUERY_CONFIG |
+                           SERVICE_CHANGE_CONFIG);
+    if (service == NULL) {
+        open_error = GetLastError();
+        if (open_error != ERROR_SERVICE_DOES_NOT_EXIST) {
+            CloseServiceHandle(manager);
+            return open_error;
+        }
+
+        error = extract_resource(IDR_MEMFS_WINFSP_SYS, primary_path);
+        if (error != ERROR_SUCCESS) {
+            CloseServiceHandle(manager);
+            return error;
+        }
+
         service = CreateServiceW(manager,
                                  MEMFS_WINFSP_DRIVER_SERVICE,
                                  MEMFS_WINFSP_DRIVER_SERVICE,
-                                 SERVICE_START | SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG,
+                                 SERVICE_START |
+                                 SERVICE_QUERY_STATUS |
+                                 SERVICE_QUERY_CONFIG |
+                                 SERVICE_CHANGE_CONFIG,
                                  SERVICE_FILE_SYSTEM_DRIVER,
                                  SERVICE_DEMAND_START,
                                  SERVICE_ERROR_NORMAL,
-                                 driver_path,
+                                 primary_path,
                                  NULL, NULL, NULL, NULL, NULL);
-    }
+        if (service == NULL) {
+            error = GetLastError();
+            CloseServiceHandle(manager);
+            return error;
+        }
+    } else {
+        error = query_service_state(service, &service_state);
+        if (error != ERROR_SUCCESS)
+            goto exit;
 
-    if (service == NULL) {
-        error = GetLastError();
-        CloseServiceHandle(manager);
-        return error;
-    }
+        if (service_state != SERVICE_STOPPED) {
+            const wchar_t* running_path;
 
-    /*
-     * A previous install may have been disabled. Restore demand-start rather
-     * than requiring the user to repair it manually.
-     */
-    if (!ChangeServiceConfigW(service,
-                              SERVICE_FILE_SYSTEM_DRIVER,
-                              SERVICE_DEMAND_START,
-                              SERVICE_ERROR_NORMAL,
-                              driver_path,
-                              NULL, NULL, NULL, NULL, NULL, NULL)) {
-        error = GetLastError();
-        CloseServiceHandle(service);
-        CloseServiceHandle(manager);
-        return error;
+            /*
+             * Fail closed while the driver is active. If SCM cannot tell us
+             * exactly which image is running, never guess a private path and
+             * never attempt an in-place upgrade.
+             */
+            error = query_service_binary_path(service, current_path);
+            if (error != ERROR_SUCCESS)
+                goto exit;
+            running_path = current_path;
+
+            error = resource_matches_file(
+                IDR_MEMFS_WINFSP_SYS, running_path, &matches);
+            if (error != ERROR_SUCCESS)
+                goto exit;
+            if (!matches) {
+                /*
+                 * Never stop a running private driver automatically: another
+                 * memfs process may still depend on it. Write the new payload
+                 * to the other private path and switch SCM configuration for
+                 * the next boot/service start.
+                 */
+                install_path = select_private_update_path(
+                    running_path, primary_path, alternate_path);
+                error = extract_resource(IDR_MEMFS_WINFSP_SYS, install_path);
+                if (error != ERROR_SUCCESS)
+                    goto exit;
+
+                if (!ChangeServiceConfigW(service,
+                                          SERVICE_FILE_SYSTEM_DRIVER,
+                                          SERVICE_DEMAND_START,
+                                          SERVICE_ERROR_NORMAL,
+                                          install_path,
+                                          NULL, NULL, NULL, NULL, NULL, NULL)) {
+                    error = GetLastError();
+                    goto exit;
+                }
+
+                error = ERROR_SUCCESS_REBOOT_REQUIRED;
+                goto exit;
+            }
+
+            error = ERROR_SUCCESS;
+            goto exit;
+        }
+
+        error = extract_resource(IDR_MEMFS_WINFSP_SYS, primary_path);
+        if (error != ERROR_SUCCESS)
+            goto exit;
+        install_path = primary_path;
+
+        if (!ChangeServiceConfigW(service,
+                                  SERVICE_FILE_SYSTEM_DRIVER,
+                                  SERVICE_DEMAND_START,
+                                  SERVICE_ERROR_NORMAL,
+                                  install_path,
+                                  NULL, NULL, NULL, NULL, NULL, NULL)) {
+            error = GetLastError();
+            goto exit;
+        }
     }
 
     if (!StartServiceW(service, 0, NULL)) {
         start_error = GetLastError();
-        if (start_error != ERROR_SERVICE_ALREADY_RUNNING)
-            error = start_error;
-        else
-            error = ERROR_SUCCESS;
+        error = start_error == ERROR_SERVICE_ALREADY_RUNNING
+                    ? ERROR_SUCCESS
+                    : start_error;
     } else {
         error = ERROR_SUCCESS;
     }
 
-    CloseServiceHandle(service);
-    CloseServiceHandle(manager);
+exit:
+    if (service)
+        CloseServiceHandle(service);
+    if (manager)
+        CloseServiceHandle(manager);
     return error;
+}
+
+DWORD memfs_winfsp_uninstall_embedded_driver(void) {
+    SC_HANDLE manager = NULL;
+    SC_HANDLE service = NULL;
+    wchar_t primary_path[MAX_PATH];
+    wchar_t alternate_path[MAX_PATH];
+    SERVICE_STATUS status;
+    DWORD state;
+    DWORD error;
+    DWORD first_error = ERROR_SUCCESS;
+    BOOL reboot_required = FALSE;
+
+    error = embedded_driver_paths(primary_path, alternate_path);
+    if (error != ERROR_SUCCESS)
+        return error;
+
+    manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (manager == NULL)
+        return GetLastError();
+
+    service = OpenServiceW(manager,
+                           MEMFS_WINFSP_DRIVER_SERVICE,
+                           SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE);
+    if (service == NULL) {
+        error = GetLastError();
+        if (error != ERROR_SERVICE_DOES_NOT_EXIST) {
+            CloseServiceHandle(manager);
+            return error;
+        }
+    } else {
+        error = query_service_state(service, &state);
+        if (error != ERROR_SUCCESS) {
+            first_error = error;
+        } else if (state != SERVICE_STOPPED) {
+            if (!ControlService(service, SERVICE_CONTROL_STOP, &status)) {
+                error = GetLastError();
+                if (error != ERROR_SERVICE_NOT_ACTIVE)
+                    first_error = error;
+            }
+            if (first_error == ERROR_SUCCESS) {
+                error = wait_service_stopped(service, 15000);
+                if (error != ERROR_SUCCESS)
+                    first_error = error;
+            }
+        }
+
+        if (first_error == ERROR_SUCCESS &&
+            !DeleteService(service)) {
+            error = GetLastError();
+            if (error != ERROR_SERVICE_MARKED_FOR_DELETE)
+                first_error = error;
+        }
+    }
+
+    if (service)
+        CloseServiceHandle(service);
+    CloseServiceHandle(manager);
+
+    /*
+     * Only ever remove our private payload names. Never use the configured
+     * service path as a deletion target: a tampered/legacy service must not
+     * make us delete an official WinFsp binary.
+     */
+    error = delete_private_file(primary_path, &reboot_required);
+    if (first_error == ERROR_SUCCESS && error != ERROR_SUCCESS)
+        first_error = error;
+    error = delete_private_file(alternate_path, &reboot_required);
+    if (first_error == ERROR_SUCCESS && error != ERROR_SUCCESS)
+        first_error = error;
+
+    if (first_error != ERROR_SUCCESS)
+        return first_error;
+    return reboot_required ? ERROR_SUCCESS_REBOOT_REQUIRED : ERROR_SUCCESS;
 }

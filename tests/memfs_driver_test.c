@@ -52,6 +52,18 @@ int wmain(void) {
     CHECK(_snwprintf_s(path, _countof(path), _TRUNCATE,
                        L"%smemfs-driver-test-%lu.bin",
                        temp_dir, GetCurrentProcessId()) >= 0);
+    {
+        const wchar_t* primary = L"C:\\Windows\\System32\\drivers\\memfs-winfsp-x64.sys";
+        const wchar_t* alternate = L"C:\\Windows\\System32\\drivers\\memfs-winfsp-x64.alt.sys";
+
+        CHECK(memfs_driver_test_select_update_path(primary, primary, alternate) == alternate);
+        CHECK(memfs_driver_test_select_update_path(alternate, primary, alternate) == primary);
+        CHECK(memfs_driver_test_select_update_path(L"C:\\legacy\\driver.sys", primary, alternate) == primary);
+        CHECK(memfs_driver_test_select_update_path(
+                  L"C:\\Program Files (x86)\\WinFsp\\SxS\\sxs.test\\bin\\winfsp-x64.sys",
+                  primary, alternate) == primary);
+    }
+
     DeleteFileW(path);
 
     for (i = 0; i < (DWORD)sizeof(expected); i++)
