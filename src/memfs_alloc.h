@@ -153,6 +153,12 @@ void memfs_allocator_free(MemfsAllocator* allocator, void* ptr, size_t bytes);
  * See MemfsAllocatorStats above: concurrent results are approximate aggregates;
  * call while quiescent when exact cross-field relationships are required.
  */
+/*
+ * O(1) committed backing query used by auto-capacity admission. This counter
+ * tracks allocator VM backing only; detailed per-shard diagnostics still come
+ * from memfs_allocator_get_stats().
+ */
+uint64_t memfs_allocator_committed_bytes(MemfsAllocator* allocator);
 void memfs_allocator_get_stats(MemfsAllocator* allocator, MemfsAllocatorStats* stats);
 uint64_t memfs_allocator_scavenge(MemfsAllocator* allocator);
 

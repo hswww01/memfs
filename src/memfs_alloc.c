@@ -100,6 +100,7 @@ struct MemfsAllocatorState {
     uint32_t class_count;
     size_t allocation_granularity;
     uint64_t region_bytes;
+    volatile LONG64 committed_total_bytes;
     MemfsPool pools[MEMFS_ALLOC_CLASS_COUNT];
 
     MemfsAreaShard area_shards[MEMFS_POOL_SHARD_COUNT];
@@ -112,6 +113,25 @@ static const size_t g_class_sizes[MEMFS_ALLOC_CLASS_COUNT] = {
 
 static INIT_ONCE g_control_allocator_once = INIT_ONCE_STATIC_INIT;
 static MemfsAllocator g_control_allocator;
+
+static void state_add_committed(MemfsAllocatorState* state, uint64_t bytes) {
+    if (state == NULL || bytes == 0)
+        return;
+    InterlockedAdd64(&state->committed_total_bytes, (LONG64)bytes);
+}
+
+static void state_sub_committed(MemfsAllocatorState* state, uint64_t bytes) {
+    if (state == NULL || bytes == 0)
+        return;
+    InterlockedAdd64(&state->committed_total_bytes, -(LONG64)bytes);
+}
+
+static uint64_t state_committed_bytes(MemfsAllocatorState* state) {
+    if (state == NULL)
+        return 0;
+    return (uint64_t)InterlockedCompareExchange64(
+        &state->committed_total_bytes, 0, 0);
+}
 
 #if !defined(NDEBUG)
 static volatile LONG g_memfs_alloc_fail_point = MEMFS_ALLOC_FAIL_NONE;
@@ -355,6 +375,7 @@ static MemfsSlab* slab_create(MemfsPool* pool, MemfsPoolShard* shard) {
     shard->slab_count++;
     shard->reserved_bytes += slab->region_bytes;
     shard->committed_bytes += slab->region_bytes;
+    state_add_committed(pool->state, slab->region_bytes);
     return slab;
 }
 
@@ -536,6 +557,7 @@ static void pool_free(MemfsPool* pool, void* ptr, size_t requested_bytes) {
     MemfsSlab* slab;
     MemfsPoolShard* shard;
     bool release_slab = false;
+    uint64_t release_bytes = 0;
 
     if (pool == NULL || ptr == NULL)
         return;
@@ -579,14 +601,17 @@ static void pool_free(MemfsPool* pool, void* ptr, size_t requested_bytes) {
         shard->slab_count--;
         shard->reserved_bytes -= slab->region_bytes;
         shard->committed_bytes -= slab->region_bytes;
+        release_bytes = slab->region_bytes;
         slab->magic = 0;
         release_slab = true;
     }
 
     ReleaseSRWLockExclusive(&shard->lock);
 
-    if (release_slab)
+    if (release_slab) {
         memfs_vm_release(slab);
+        state_sub_committed(pool->state, release_bytes);
+    }
 }
 
 static uint64_t pool_scavenge(MemfsPool* pool) {
@@ -618,6 +643,7 @@ static uint64_t pool_scavenge(MemfsPool* pool) {
                 slab->magic = 0;
                 memfs_vm_release(slab);
                 released += bytes;
+                state_sub_committed(pool->state, bytes);
             }
 
             slab = next;
@@ -779,6 +805,7 @@ static void* area_alloc(MemfsAllocatorState* state, size_t bytes, bool zero_memo
     block->requested_bytes = bytes;
     block->region_bytes = memfs_vm_region_bytes(block);
     block->magic = MEMFS_AREA_MAGIC;
+    state_add_committed(state, block->region_bytes);
 
     AcquireSRWLockExclusive(&shard->lock);
     area_list_insert(&shard->active, block);
@@ -858,9 +885,13 @@ static void area_free(MemfsAllocatorState* state, void* ptr) {
     else
         shard->committed_bytes = 0;
 
-    block->magic = 0;
-    ReleaseSRWLockExclusive(&shard->lock);
-    memfs_vm_release(block);
+    {
+        uint64_t release_bytes = block->region_bytes;
+        block->magic = 0;
+        ReleaseSRWLockExclusive(&shard->lock);
+        memfs_vm_release(block);
+        state_sub_committed(state, release_bytes);
+    }
 }
 
 static void area_destroy_list(MemfsAreaBlock* block) {
@@ -957,6 +988,7 @@ static uint64_t area_scavenge(MemfsAllocatorState* state) {
 
         area_destroy_list(cached);
         released += shard_released;
+        state_sub_committed(state, shard_released);
     }
 
     return released;
@@ -985,6 +1017,7 @@ static MemfsAllocatorState* state_create(void) {
     state->class_count = MEMFS_ALLOC_CLASS_COUNT;
     state->allocation_granularity = vm_info.allocation_granularity;
     state->region_bytes = memfs_vm_region_bytes(state);
+    state->committed_total_bytes = (LONG64)state->region_bytes;
     for (shard_index = 0; shard_index < MEMFS_POOL_SHARD_COUNT; ++shard_index)
         InitializeSRWLock(&state->area_shards[shard_index].lock);
 
@@ -1211,6 +1244,12 @@ uint32_t memfs_allocator_test_shard_count(void) {
     return MEMFS_POOL_SHARD_COUNT;
 }
 #endif
+
+uint64_t memfs_allocator_committed_bytes(MemfsAllocator* allocator) {
+    if (allocator == NULL || allocator->state == NULL)
+        return 0;
+    return state_committed_bytes(allocator->state);
+}
 
 void memfs_allocator_get_stats(MemfsAllocator* allocator, MemfsAllocatorStats* stats) {
     MemfsAllocatorState* state;

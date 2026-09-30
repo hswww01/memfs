@@ -4583,6 +4583,60 @@ cleanup:
 #endif
 
 
+static void test_allocator_fast_committed_counter(void) {
+	MemfsAllocator allocator;
+	MemfsAllocatorStats stats;
+	void* small_ptr = NULL;
+	void* area = NULL;
+	uint64_t before_area_free;
+	uint64_t released;
+
+	printf("== allocator fast committed counter ==\n");
+	memset(&allocator, 0, sizeof(allocator));
+
+	CHECK(memfs_allocator_init(&allocator, 64U, 64U, 64U));
+	if (allocator.state == NULL)
+		return;
+
+	memfs_allocator_get_stats(&allocator, &stats);
+	CHECK(memfs_allocator_committed_bytes(&allocator) == stats.committed_bytes);
+
+	small_ptr = memfs_allocator_alloc(&allocator, 512U);
+	CHECK(small_ptr != NULL);
+	memfs_allocator_get_stats(&allocator, &stats);
+	CHECK(memfs_allocator_committed_bytes(&allocator) == stats.committed_bytes);
+
+	area = memfs_allocator_alloc(&allocator, 16U * 1024U);
+	CHECK(area != NULL);
+	memfs_allocator_get_stats(&allocator, &stats);
+	CHECK(memfs_allocator_committed_bytes(&allocator) == stats.committed_bytes);
+
+	if (area != NULL) {
+		before_area_free = memfs_allocator_committed_bytes(&allocator);
+		memfs_allocator_free(&allocator, area, 16U * 1024U);
+		area = NULL;
+		memfs_allocator_get_stats(&allocator, &stats);
+		CHECK(stats.area_cached_count >= 1U);
+		CHECK(memfs_allocator_committed_bytes(&allocator) == before_area_free);
+		CHECK(memfs_allocator_committed_bytes(&allocator) == stats.committed_bytes);
+	}
+
+	if (small_ptr != NULL) {
+		memfs_allocator_free(&allocator, small_ptr, 512U);
+		small_ptr = NULL;
+		memfs_allocator_get_stats(&allocator, &stats);
+		CHECK(memfs_allocator_committed_bytes(&allocator) == stats.committed_bytes);
+	}
+
+	released = memfs_allocator_scavenge(&allocator);
+	CHECK(released > 0U);
+	memfs_allocator_get_stats(&allocator, &stats);
+	CHECK(stats.area_cached_count == 0U);
+	CHECK(memfs_allocator_committed_bytes(&allocator) == stats.committed_bytes);
+
+	memfs_allocator_destroy(&allocator);
+}
+
 static void test_allocator_bootstrap_control(void) {
 	uint8_t* control;
 	uint8_t* control2;
@@ -4630,6 +4684,7 @@ int main(void) {
 	test_tree_and_lookup();
 	test_deep_namespace_destroy();
 	test_memory_accounting_layers();	test_allocator_fragmentation_reuse();
+	test_allocator_fast_committed_counter();
 	test_allocator_bootstrap_control();
 #if !defined(NDEBUG)
 	test_allocator_failure_injection_primitives();

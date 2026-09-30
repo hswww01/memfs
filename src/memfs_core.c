@@ -2610,13 +2610,10 @@ uint64_t memfs_free_bytes(Memfs* fs) {
 }
 
 uint64_t memfs_committed_bytes(Memfs* fs) {
-	MemfsAllocatorStats stats;
-
 	if (fs == NULL)
 		return 0;
 
-	memfs_allocator_get_stats(&fs->allocator, &stats);
-	return stats.committed_bytes;
+	return memfs_allocator_committed_bytes(&fs->allocator);
 }
 
 uint64_t memfs_physical_bytes(Memfs* fs) {
