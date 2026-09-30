@@ -569,6 +569,8 @@ static NTSTATUS memfs_win32_status(DWORD error) {
 		return STATUS_OBJECT_NAME_NOT_FOUND;
 	if (error == ERROR_NOT_ENOUGH_MEMORY || error == ERROR_OUTOFMEMORY)
 		return STATUS_INSUFFICIENT_RESOURCES;
+	if (error == ERROR_SUCCESS_REBOOT_REQUIRED)
+		return STATUS_DEVICE_NOT_READY;
 	return STATUS_UNSUCCESSFUL;
 }
 
@@ -577,7 +579,10 @@ static bool memfs_winfsp_should_install_embedded_driver(NTSTATUS status) {
 		   status == STATUS_DRIVER_UNABLE_TO_LOAD;
 }
 
-NTSTATUS memfs_winfsp_create(const MemfsOptions* options, MemfsWinFsp** out_instance) {
+NTSTATUS memfs_winfsp_create_ex(
+    const MemfsOptions* options,
+    MemfsWinFsp** out_instance,
+    DWORD* detail_error) {
 	FSP_FSCTL_VOLUME_PARAMS volume_params;
 	MemfsWinFsp* instance;
 	Memfs* instance_store;
@@ -589,10 +594,15 @@ NTSTATUS memfs_winfsp_create(const MemfsOptions* options, MemfsWinFsp** out_inst
 		return STATUS_INVALID_PARAMETER;
 
 	*out_instance = NULL;
+	if (detail_error)
+		*detail_error = ERROR_SUCCESS;
 
 	runtime_error = memfs_winfsp_prepare_runtime();
-	if (runtime_error != ERROR_SUCCESS)
+	if (runtime_error != ERROR_SUCCESS) {
+		if (detail_error)
+			*detail_error = runtime_error;
 		return memfs_win32_status(runtime_error);
+	}
 
 	result = memfs_create_ex(options, &instance_store);
 	if (result != MEMFS_OK)
@@ -632,6 +642,8 @@ NTSTATUS memfs_winfsp_create(const MemfsOptions* options, MemfsWinFsp** out_inst
 		if (runtime_error == ERROR_SUCCESS) {
 			status = FspFileSystemCreate(L"" FSP_FSCTL_DISK_DEVICE_NAME, &volume_params,
 									 &g_memfs_interface, &instance->file_system);
+		} else if (detail_error) {
+			*detail_error = runtime_error;
 		}
 	}
 	if (!NT_SUCCESS(status)) {
@@ -648,6 +660,12 @@ NTSTATUS memfs_winfsp_create(const MemfsOptions* options, MemfsWinFsp** out_inst
 	*out_instance = instance;
 	return STATUS_SUCCESS;
 }
+NTSTATUS memfs_winfsp_create(
+    const MemfsOptions* options,
+    MemfsWinFsp** out_instance) {
+	return memfs_winfsp_create_ex(options, out_instance, NULL);
+}
+
 NTSTATUS memfs_winfsp_mount(MemfsWinFsp* instance, const wchar_t* mount_point) {
 	if (instance == NULL || mount_point == NULL)
 		return STATUS_INVALID_PARAMETER;

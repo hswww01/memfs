@@ -503,11 +503,46 @@ static const wchar_t* select_private_update_path(const wchar_t* running_path,
     return primary_path;
 }
 
+static DWORD plan_running_private_driver_update(
+    const wchar_t* configured_path,
+    BOOL configured_matches_payload,
+    const wchar_t* primary_path,
+    const wchar_t* alternate_path,
+    const wchar_t** stage_path) {
+    if (stage_path == NULL)
+        return ERROR_INVALID_PARAMETER;
+    *stage_path = NULL;
+
+    /*
+     * QueryServiceConfig reports the image configured for the next service
+     * start; it does not identify the image that is already loaded in the
+     * kernel. Therefore a matching configured file only proves that an upgrade
+     * has been staged, never that the running driver has changed.
+     */
+    if (configured_matches_payload)
+        return ERROR_SUCCESS_REBOOT_REQUIRED;
+
+    *stage_path = select_private_update_path(
+        configured_path, primary_path, alternate_path);
+    return ERROR_SUCCESS;
+}
+
 #if defined(MEMFS_DRIVER_TESTING)
 const wchar_t* memfs_driver_test_select_update_path(const wchar_t* running_path,
                                                     const wchar_t* primary_path,
                                                     const wchar_t* alternate_path) {
     return select_private_update_path(running_path, primary_path, alternate_path);
+}
+
+DWORD memfs_driver_test_plan_running_update(
+    const wchar_t* configured_path,
+    BOOL configured_matches_payload,
+    const wchar_t* primary_path,
+    const wchar_t* alternate_path,
+    const wchar_t** stage_path) {
+    return plan_running_private_driver_update(
+        configured_path, configured_matches_payload,
+        primary_path, alternate_path, stage_path);
 }
 #endif
 
@@ -517,7 +552,7 @@ DWORD memfs_winfsp_install_embedded_driver(void) {
     MemfsEmbeddedDriverSpec driver_spec;
     wchar_t primary_path[MAX_PATH];
     wchar_t alternate_path[MAX_PATH];
-    wchar_t current_path[MAX_PATH];
+    wchar_t configured_path[MAX_PATH];
     const wchar_t* install_path = primary_path;
     DWORD service_state = SERVICE_STOPPED;
     DWORD error;
@@ -579,50 +614,52 @@ DWORD memfs_winfsp_install_embedded_driver(void) {
             goto exit;
 
         if (service_state != SERVICE_STOPPED) {
-            const wchar_t* running_path;
+            const wchar_t* stage_path = NULL;
 
             /*
-             * Fail closed while the driver is active. If SCM cannot tell us
-             * exactly which image is running, never guess a private path and
-             * never attempt an in-place upgrade.
+             * SCM exposes the configured image for the next start, not the
+             * image already loaded in the kernel. Never use this path as proof
+             * that a running driver has been upgraded.
              */
-            error = query_service_binary_path(service, current_path);
+            error = query_service_binary_path(service, configured_path);
             if (error != ERROR_SUCCESS)
                 goto exit;
-            running_path = current_path;
 
             error = resource_matches_file(
-                driver_spec.resource_id, running_path, &matches);
+                driver_spec.resource_id, configured_path, &matches);
             if (error != ERROR_SUCCESS)
                 goto exit;
-            if (!matches) {
-                /*
-                 * Never stop a running private driver automatically: another
-                 * memfs process may still depend on it. Write the new payload
-                 * to the other private path and switch SCM configuration for
-                 * the next boot/service start.
-                 */
-                install_path = select_private_update_path(
-                    running_path, primary_path, alternate_path);
-                error = extract_resource(driver_spec.resource_id, install_path);
-                if (error != ERROR_SUCCESS)
-                    goto exit;
 
-                if (!ChangeServiceConfigW(service,
-                                          SERVICE_FILE_SYSTEM_DRIVER,
-                                          SERVICE_DEMAND_START,
-                                          SERVICE_ERROR_NORMAL,
-                                          install_path,
-                                          NULL, NULL, NULL, NULL, NULL, NULL)) {
-                    error = GetLastError();
-                    goto exit;
-                }
+            error = plan_running_private_driver_update(
+                configured_path, matches, primary_path, alternate_path,
+                &stage_path);
+            if (error == ERROR_SUCCESS_REBOOT_REQUIRED)
+                goto exit;
+            if (error != ERROR_SUCCESS)
+                goto exit;
 
-                error = ERROR_SUCCESS_REBOOT_REQUIRED;
+            /*
+             * The running image remains untouched. Stage the payload in the
+             * other MemfsC-owned slot and configure that image for the next
+             * service start. Repeated calls are idempotent: once that configured
+             * file matches, the branch above returns REBOOT_REQUIRED without
+             * rewriting it or claiming the loaded image changed.
+             */
+            error = extract_resource(driver_spec.resource_id, stage_path);
+            if (error != ERROR_SUCCESS)
+                goto exit;
+
+            if (!ChangeServiceConfigW(service,
+                                      SERVICE_FILE_SYSTEM_DRIVER,
+                                      SERVICE_DEMAND_START,
+                                      SERVICE_ERROR_NORMAL,
+                                      stage_path,
+                                      NULL, NULL, NULL, NULL, NULL, NULL)) {
+                error = GetLastError();
                 goto exit;
             }
 
-            error = ERROR_SUCCESS;
+            error = ERROR_SUCCESS_REBOOT_REQUIRED;
             goto exit;
         }
 

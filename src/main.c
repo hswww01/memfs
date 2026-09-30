@@ -421,6 +421,7 @@ static int run_filesystem(const MemfsRunConfig* config,
     MemfsOptions options;
     MemfsWinFsp* instance = NULL;
     NTSTATUS status;
+    DWORD create_detail = ERROR_SUCCESS;
     int exit_code = 1;
 
     if (detail_error)
@@ -439,12 +440,29 @@ static int run_filesystem(const MemfsRunConfig* config,
         options.encryption_key_size = sizeof(config->encryption_key);
     }
 
-    status = memfs_winfsp_create(&options, &instance);
+    status = memfs_winfsp_create_ex(&options, &instance, &create_detail);
     if (!NT_SUCCESS(status)) {
         if (detail_error)
-            *detail_error = (DWORD)status;
-        if (console_mode)
-            fwprintf(stderr, L"memfs_winfsp_create failed: 0x%08X\n", (unsigned)status);
+            *detail_error = create_detail != ERROR_SUCCESS
+                                ? create_detail
+                                : (DWORD)status;
+        if (console_mode) {
+            if (create_detail == ERROR_SUCCESS_REBOOT_REQUIRED) {
+                fwprintf(stderr,
+                         L"WinFsp private driver upgrade is staged but the "
+                         L"currently loaded driver cannot be replaced safely; "
+                         L"reboot is required.\n");
+            } else if (create_detail != ERROR_SUCCESS) {
+                fwprintf(stderr,
+                         L"memfs_winfsp_create failed: 0x%08X "
+                         L"(driver/runtime Win32 error=%lu)\n",
+                         (unsigned)status, create_detail);
+            } else {
+                fwprintf(stderr,
+                         L"memfs_winfsp_create failed: 0x%08X\n",
+                         (unsigned)status);
+            }
+        }
         return 3;
     }
 

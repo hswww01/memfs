@@ -10,6 +10,10 @@ typedef struct MemfsWinFsp {
 } MemfsWinFsp;
 
 NTSTATUS memfs_winfsp_create(const MemfsOptions* options, MemfsWinFsp** out_instance);
+NTSTATUS memfs_winfsp_create_ex(
+    const MemfsOptions* options,
+    MemfsWinFsp** out_instance,
+    DWORD* detail_error);
 
 NTSTATUS memfs_winfsp_mount(MemfsWinFsp* instance, const wchar_t* mount_point);
 NTSTATUS memfs_winfsp_start(MemfsWinFsp* instance, uint32_t thread_count);

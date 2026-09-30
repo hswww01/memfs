@@ -102,6 +102,24 @@ int wmain(void) {
         CHECK(memfs_driver_test_select_update_path(
                   L"C:\\Program Files (x86)\\WinFsp\\SxS\\sxs.test\\bin\\winfsp-x64.sys",
                   primary, alternate) == primary);
+        {
+            const wchar_t* stage = (const wchar_t*)1;
+
+            CHECK(memfs_driver_test_plan_running_update(
+                      primary, TRUE, primary, alternate, &stage) ==
+                  ERROR_SUCCESS_REBOOT_REQUIRED);
+            CHECK(stage == NULL);
+
+            CHECK(memfs_driver_test_plan_running_update(
+                      primary, FALSE, primary, alternate, &stage) ==
+                  ERROR_SUCCESS);
+            CHECK(stage == alternate);
+
+            CHECK(memfs_driver_test_plan_running_update(
+                      alternate, FALSE, primary, alternate, &stage) ==
+                  ERROR_SUCCESS);
+            CHECK(stage == primary);
+        }
     }
 
     DeleteFileW(path);
