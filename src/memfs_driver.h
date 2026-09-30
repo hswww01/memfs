@@ -22,4 +22,5 @@ DWORD memfs_driver_test_spec_for_machine(
     const wchar_t** primary_file,
     const wchar_t** alternate_file);
 DWORD memfs_driver_test_native_machine(USHORT* native_machine);
+BOOL memfs_driver_test_payload_cleanup_allowed(DWORD service_error);
 #endif

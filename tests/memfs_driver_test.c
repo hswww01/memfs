@@ -91,6 +91,10 @@ int wmain(void) {
     {
         const wchar_t* primary = L"C:\\Windows\\System32\\drivers\\memfs-winfsp-x64.sys";
         const wchar_t* alternate = L"C:\\Windows\\System32\\drivers\\memfs-winfsp-x64.alt.sys";
+        CHECK(memfs_driver_test_payload_cleanup_allowed(ERROR_SUCCESS) == TRUE);
+        CHECK(memfs_driver_test_payload_cleanup_allowed(ERROR_ACCESS_DENIED) == FALSE);
+        CHECK(memfs_driver_test_payload_cleanup_allowed(ERROR_TIMEOUT) == FALSE);
+
 
         CHECK(memfs_driver_test_select_update_path(primary, primary, alternate) == alternate);
         CHECK(memfs_driver_test_select_update_path(alternate, primary, alternate) == primary);

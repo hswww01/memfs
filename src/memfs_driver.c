@@ -659,6 +659,16 @@ exit:
     return error;
 }
 
+static BOOL private_driver_payload_cleanup_allowed(DWORD service_error) {
+    return service_error == ERROR_SUCCESS;
+}
+
+#if defined(MEMFS_DRIVER_TESTING)
+BOOL memfs_driver_test_payload_cleanup_allowed(DWORD service_error) {
+    return private_driver_payload_cleanup_allowed(service_error);
+}
+#endif
+
 DWORD memfs_winfsp_uninstall_embedded_driver(void) {
     SC_HANDLE manager = NULL;
     SC_HANDLE service = NULL;
@@ -711,15 +721,21 @@ DWORD memfs_winfsp_uninstall_embedded_driver(void) {
     CloseServiceHandle(manager);
 
     /*
+     * A failed query/stop/wait/delete means SCM state is not known to be
+     * quiescent. Preserve every private payload so a still-referenced service
+     * can be retried safely; never turn an uninstall failure into a reboot-time
+     * file deletion.
+     */
+    if (!private_driver_payload_cleanup_allowed(first_error))
+        return first_error;
+
+    /*
      * Only ever remove our private payload names. Never use the configured
      * service path as a deletion target: a tampered/legacy service must not
      * make us delete an official WinFsp binary.
      */
     error = delete_all_private_driver_files(&reboot_required);
-    if (first_error == ERROR_SUCCESS && error != ERROR_SUCCESS)
-        first_error = error;
-
-    if (first_error != ERROR_SUCCESS)
-        return first_error;
+    if (error != ERROR_SUCCESS)
+        return error;
     return reboot_required ? ERROR_SUCCESS_REBOOT_REQUIRED : ERROR_SUCCESS;
 }
