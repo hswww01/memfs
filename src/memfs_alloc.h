@@ -15,6 +15,7 @@ typedef struct MemfsAllocatorState MemfsAllocatorState;
 
 enum { MEMFS_ALLOC_CLASS_COUNT = 19 };
 enum { MEMFS_ALLOC_AREA_THRESHOLD = 8192 };
+enum { MEMFS_ALLOC_ALIGNMENT = 16 };
 
 typedef enum MemfsAllocFailPoint {
     MEMFS_ALLOC_FAIL_NONE = 0,

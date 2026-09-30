@@ -913,10 +913,8 @@ static void test_sparse_pages(void) {
 
 	CHECK(memfs_node_write(file, &value, write_offset, 1, false, false, &transferred) == MEMFS_OK);
 	CHECK(transferred == 1);
-	CHECK(memfs_node_resident_bytes(file) >= MEMFS_PAGE_SIZE);
-	CHECK(memfs_node_resident_bytes(file) < MEMFS_PAGE_SIZE + 64U);
-	CHECK((uint64_t)fs->resident_bytes >= MEMFS_PAGE_SIZE);
-	CHECK((uint64_t)fs->resident_bytes < MEMFS_PAGE_SIZE + 64U);
+	CHECK(memfs_node_resident_bytes(file) == MEMFS_PAGE_SIZE);
+	CHECK((uint64_t)fs->resident_bytes == MEMFS_PAGE_SIZE);
 	CHECK(memfs_node_page_group_count(file) != 0);
 	CHECK(sizeof(MemfsPageGroup) <= 64U);
 	if (memfs_node_page_group_count(file) != 0) {
@@ -2710,6 +2708,8 @@ static void test_allocator_unified_pool_layout(void) {
 			{1537U, 2048U, 64U * 1024U},
 			{2049U, 3072U, 64U * 1024U},
 			{3073U, 4096U, 64U * 1024U},
+			{MEMFS_PAGE_SIZE, 4096U, 64U * 1024U},
+			{sizeof(MemfsPage) + MEMFS_PAGE_SIZE, 8192U, 64U * 1024U},
 			{4097U, 8192U, 64U * 1024U},
 			{8192U, 8192U, 64U * 1024U},
 		};
@@ -3802,6 +3802,127 @@ static bool failure_stats_equal(const MemfsAllocatorStats* a, const MemfsAllocat
 		   a->dedicated_live_bytes == b->dedicated_live_bytes;
 }
 
+static void test_raw_page_compact_representation(void) {
+	Memfs* fs = NULL;
+	MemfsNode* file = NULL;
+	MemfsNode* fail_file = NULL;
+	MemfsAllocatorStats baseline;
+	MemfsAllocatorStats after;
+	uint8_t input[2U * MEMFS_PAGE_SIZE];
+	uint8_t output[2U * MEMFS_PAGE_SIZE];
+	uint8_t patch[32];
+	uint8_t zero_page[MEMFS_PAGE_SIZE];
+	uint32_t transferred = 0;
+	uint32_t i;
+	bool is_raw = false;
+	size_t heap_bytes = 0;
+	uintptr_t allocation_address = 0;
+	uint64_t resident_before_zero;
+
+	printf("== raw page compact representation ==\n");
+
+	for (i = 0; i < sizeof(input); ++i)
+		input[i] = (uint8_t)((i * 17U + 3U) & 0xffU);
+	for (i = 0; i < sizeof(patch); ++i)
+		patch[i] = (uint8_t)(0xe0U + i);
+	memset(zero_page, 0, sizeof(zero_page));
+
+	CHECK(memfs_create(32ULL * 1024ULL * 1024ULL, L"RAW4K", &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	if (fs == NULL)
+		goto cleanup;
+
+	CHECK(memfs_node_create(fs, fs->root, L"raw.bin", false,
+							FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(file != NULL);
+	if (file == NULL)
+		goto cleanup;
+
+	CHECK(memfs_node_write(file, input, 0, sizeof(input), false, false,
+						   &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(input));
+	CHECK(memfs_node_resident_bytes(file) == sizeof(input));
+
+	for (i = 0; i < 2U; ++i) {
+		is_raw = false;
+		heap_bytes = 0;
+		allocation_address = 0;
+		CHECK(memfs_test_page_info(file, i, &is_raw, &heap_bytes,
+								   &allocation_address));
+		CHECK(is_raw);
+		CHECK(heap_bytes == MEMFS_PAGE_SIZE);
+		CHECK((allocation_address & (MEMFS_ALLOC_ALIGNMENT - 1U)) == 0);
+	}
+
+	/* Existing raw pages stay on the in-place overwrite fast path. */
+	CHECK(memfs_node_write(file, patch, MEMFS_PAGE_SIZE - 16U, sizeof(patch),
+						   false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(patch));
+	memcpy(input + MEMFS_PAGE_SIZE - 16U, patch, sizeof(patch));
+	memset(output, 0, sizeof(output));
+	CHECK(memfs_node_read(file, output, 0, sizeof(output), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(output));
+	CHECK(memcmp(input, output, sizeof(input)) == 0);
+
+	/* A full zero write into a missing page remains sparse. */
+	resident_before_zero = memfs_node_resident_bytes(file);
+	CHECK(memfs_node_write(file, zero_page, 8ULL * MEMFS_PAGE_SIZE,
+						   sizeof(zero_page), false, false,
+						   &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(zero_page));
+	CHECK(!memfs_test_page_info(file, 8U, NULL, NULL, NULL));
+	CHECK(memfs_node_resident_bytes(file) == resident_before_zero);
+
+	/* Truncate/regrow keeps the raw tail zero-fill contract. */
+	CHECK(memfs_node_set_file_size(file, MEMFS_PAGE_SIZE + 100U) == MEMFS_OK);
+	CHECK(memfs_node_set_file_size(file, 2ULL * MEMFS_PAGE_SIZE) == MEMFS_OK);
+	memset(output, 0xcc, sizeof(output));
+	CHECK(memfs_node_read(file, output, MEMFS_PAGE_SIZE, MEMFS_PAGE_SIZE,
+						  &transferred) == MEMFS_OK);
+	CHECK(transferred == MEMFS_PAGE_SIZE);
+	CHECK(memcmp(output, input + MEMFS_PAGE_SIZE, 100U) == 0);
+	for (i = 100U; i < MEMFS_PAGE_SIZE; ++i)
+		CHECK(output[i] == 0);
+
+	/*
+	 * PAGE failure after one successful raw-page encode must not publish the
+	 * first replacement: the two-page write is all-or-nothing.
+	 */
+	CHECK(memfs_node_create(fs, fs->root, L"raw-fail.bin", false,
+							FILE_ATTRIBUTE_NORMAL, NULL, 0,
+							&fail_file) == MEMFS_OK);
+	CHECK(fail_file != NULL);
+	if (fail_file != NULL) {
+		memfs_allocator_get_stats(&fs->allocator, &baseline);
+		memfs_allocator_test_fail_after(MEMFS_ALLOC_FAIL_PAGE, 1, 1);
+		transferred = 1234;
+		CHECK(memfs_node_write(fail_file, input, 0, sizeof(input),
+							   false, false, &transferred) == MEMFS_ERR_NO_MEMORY);
+		CHECK(transferred == 0);
+		CHECK(fail_file->file_size == 0);
+		CHECK(fail_file->allocation_size == 0);
+		CHECK(memfs_node_resident_bytes(fail_file) == 0);
+		CHECK(memfs_node_page_group_count(fail_file) == 0);
+		CHECK(!memfs_test_page_info(fail_file, 0, NULL, NULL, NULL));
+		memfs_allocator_get_stats(&fs->allocator, &after);
+		CHECK(failure_stats_equal(&baseline, &after));
+		memfs_allocator_test_clear_failures();
+	}
+
+cleanup:
+	memfs_allocator_test_clear_failures();
+	if (fail_file) {
+		(void)memfs_node_unlink(fail_file);
+		memfs_node_close(fail_file);
+	}
+	if (file) {
+		(void)memfs_node_unlink(file);
+		memfs_node_close(file);
+	}
+	if (fs)
+		memfs_destroy(fs);
+}
+
 static void test_allocator_failure_injection_primitives(void) {
 	MemfsAllocator allocator;
 	MemfsAllocatorStats baseline;
@@ -4062,6 +4183,7 @@ int main(void) {
 	test_allocator_bootstrap_control();
 #if !defined(NDEBUG)
 	test_allocator_failure_injection_primitives();
+	test_raw_page_compact_representation();
 	test_failure_injection_transaction_rollback();
 #endif
 

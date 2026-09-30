@@ -251,6 +251,11 @@ void memfs_get_runtime_stats(Memfs* fs, MemfsRuntimeStats* stats);
 #if !defined(NDEBUG)
 void memfs_test_set_system_available_bytes(uint64_t bytes);
 void memfs_test_clear_system_available_bytes(void);
+bool memfs_test_page_info(MemfsNode* node,
+                          uint64_t page_index,
+                          bool* is_raw,
+                          size_t* heap_bytes,
+                          uintptr_t* allocation_address);
 #endif
 
 MemfsResult memfs_create(uint64_t capacity, const wchar_t* volume_label, Memfs** out_fs);

@@ -281,17 +281,72 @@ static void memfs_build_nonce(Memfs* fs, uint64_t sequence,
 }
 static void memfs_security_release(MemfsSecurity* security);
 
+#define MEMFS_PAGE_RAW_TAG ((uintptr_t)1U)
+#define MEMFS_PAGE_RAW_TAG_MASK ((uintptr_t)1U)
+_Static_assert((MEMFS_ALLOC_ALIGNMENT & MEMFS_PAGE_RAW_TAG_MASK) == 0,
+			   "raw-page pointer tag requires allocator alignment to keep bit 0 clear");
+
+static bool memfs_page_is_raw(const MemfsPage* page) {
+	return page != NULL &&
+		   (((uintptr_t)page & MEMFS_PAGE_RAW_TAG_MASK) == MEMFS_PAGE_RAW_TAG);
+}
+
+static uint8_t* memfs_page_raw_data(MemfsPage* page) {
+	return (uint8_t*)((uintptr_t)page & ~MEMFS_PAGE_RAW_TAG_MASK);
+}
+
+static const uint8_t* memfs_page_raw_const_data(const MemfsPage* page) {
+	return (const uint8_t*)((uintptr_t)page & ~MEMFS_PAGE_RAW_TAG_MASK);
+}
+
+static MemfsPage* memfs_page_tag_raw(void* allocation) {
+	if (allocation == NULL ||
+		((uintptr_t)allocation & MEMFS_PAGE_RAW_TAG_MASK) != 0) {
+		return NULL;
+	}
+	return (MemfsPage*)((uintptr_t)allocation | MEMFS_PAGE_RAW_TAG);
+}
+
+static MemfsPage* memfs_page_alloc_raw(MemfsNode* node) {
+	void* allocation;
+	MemfsPage* page;
+
+	if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_PAGE))
+		return NULL;
+
+	allocation = memfs_allocator_alloc_uninit(&node->fs->allocator, MEMFS_PAGE_SIZE);
+	if (allocation == NULL)
+		return NULL;
+
+	page = memfs_page_tag_raw(allocation);
+	if (page == NULL) {
+		memfs_allocator_free(&node->fs->allocator, allocation, MEMFS_PAGE_SIZE);
+		return NULL;
+	}
+
+	return page;
+}
+
 static size_t memfs_page_heap_size(const MemfsPage* page) {
 	if (page == NULL)
 		return 0;
+	if (memfs_page_is_raw(page))
+		return MEMFS_PAGE_SIZE;
 	return sizeof(*page) + page->stored_size;
 }
 
 static void memfs_page_free(MemfsNode* node, MemfsPage* page) {
+	size_t bytes;
+	void* allocation;
+
 	if (page == NULL)
 		return;
 
-	memfs_allocator_free(&node->fs->allocator, page, memfs_page_heap_size(page));
+	bytes = memfs_page_heap_size(page);
+	allocation = memfs_page_is_raw(page)
+		? (void*)memfs_page_raw_data(page)
+		: (void*)page;
+	memfs_allocator_free(&node->fs->allocator, allocation, bytes);
 }
 /* memfs_core.c heap migration marker: CRT heap calls removed; allocator/VirtualAlloc paths active. */
 
@@ -412,6 +467,18 @@ static MemfsResult memfs_page_encode(MemfsNode* node, uint64_t storage_index, co
 	if (plain_size == 0 || memfs_buffer_is_zero(plain, plain_size))
 		return MEMFS_OK;
 
+	if (plain_size == MEMFS_PAGE_SIZE &&
+		!node->fs->compression_enabled &&
+		!node->fs->encryption_enabled) {
+		MemfsPage* raw_page = memfs_page_alloc_raw(node);
+		if (raw_page == NULL)
+			return MEMFS_ERR_NO_MEMORY;
+
+		memcpy(memfs_page_raw_data(raw_page), plain, MEMFS_PAGE_SIZE);
+		*out_page = raw_page;
+		return MEMFS_OK;
+	}
+
 	if (memfs_compression_should_try(node, storage_index, plain_size)) {
 		size_t compressed_size;
 
@@ -510,6 +577,13 @@ static MemfsResult memfs_page_decode(MemfsNode* node, uint64_t storage_index, co
 
 	if (page == NULL)
 		return MEMFS_OK;
+
+	if (memfs_page_is_raw(page)) {
+		if (expected_plain_size != MEMFS_PAGE_SIZE)
+			return MEMFS_ERR_DATA;
+		memcpy(plain, memfs_page_raw_const_data(page), MEMFS_PAGE_SIZE);
+		return MEMFS_OK;
+	}
 
 	plain_size = page->plain_size;
 	if (plain_size != expected_plain_size)
@@ -894,6 +968,35 @@ static MemfsPage* memfs_storage_page(MemfsNode* node, uint64_t page_index) {
 
 	return memfs_group_get(group, (uint32_t)(page_index & MEMFS_PAGE_GROUP_MASK));
 }
+
+#if !defined(NDEBUG)
+bool memfs_test_page_info(MemfsNode* node,
+						  uint64_t page_index,
+						  bool* is_raw,
+						  size_t* heap_bytes,
+						  uintptr_t* allocation_address) {
+	MemfsPage* page;
+
+	if (node == NULL)
+		return false;
+
+	page = memfs_storage_page(node, page_index);
+	if (page == NULL)
+		return false;
+
+	if (is_raw)
+		*is_raw = memfs_page_is_raw(page);
+	if (heap_bytes)
+		*heap_bytes = memfs_page_heap_size(page);
+	if (allocation_address) {
+		*allocation_address = memfs_page_is_raw(page)
+			? (uintptr_t)memfs_page_raw_data(page)
+			: (uintptr_t)page;
+	}
+
+	return true;
+}
+#endif
 
 static MemfsResult memfs_storage_ensure_group(MemfsNode* node, uint64_t group_index, MemfsPageGroup** out_group) {
 	MemfsPageGroupEntry* entries;
@@ -1401,7 +1504,12 @@ static MemfsResult memfs_storage_read_range(MemfsNode* node, uint8_t* buffer, ui
 
 		if (page == NULL) {
 			memset(buffer + done, 0, span);
-		} else if (page->flags == 0 && page->plain_size == MEMFS_PAGE_SIZE && page->stored_size == MEMFS_PAGE_SIZE) {
+		} else if (memfs_page_is_raw(page)) {
+			memcpy(buffer + done,
+				   memfs_page_raw_const_data(page) + in_page, span);
+		} else if (page->flags == 0 &&
+				   page->plain_size == MEMFS_PAGE_SIZE &&
+				   page->stored_size == MEMFS_PAGE_SIZE) {
 			memcpy(buffer + done, page->data + in_page, span);
 		} else {
 			uint8_t plain[MEMFS_PAGE_SIZE];
@@ -1452,63 +1560,43 @@ static MemfsResult memfs_storage_write_small(MemfsNode* node, const uint8_t* buf
 	return MEMFS_OK;
 }
 
-static MemfsResult memfs_storage_write_raw_pages(MemfsNode* node, const uint8_t* buffer, uint64_t offset,
-												 uint64_t length) {
+static bool memfs_storage_range_all_raw(MemfsNode* node,
+									 uint64_t offset,
+									 uint64_t length) {
 	uint64_t end = offset + length;
 	uint64_t first_page = offset >> MEMFS_PAGE_SHIFT;
 	uint64_t last_page = (end - 1U) >> MEMFS_PAGE_SHIFT;
 	uint64_t page_index;
-	uint64_t done = 0;
-	MemfsResult result;
 
-	// 第一遍只准备缺失页，不写用户数据。
 	for (page_index = first_page; page_index <= last_page; page_index++) {
-		uint64_t group_index = page_index >> MEMFS_PAGE_GROUP_SHIFT;
-		uint32_t slot = (uint32_t)(page_index & MEMFS_PAGE_GROUP_MASK);
-		MemfsPageGroup* group;
 		MemfsPage* page = memfs_storage_page(node, page_index);
-
-		if (page == NULL) {
-			if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_PAGE))
-				return MEMFS_ERR_NO_MEMORY;
-
-			page = memfs_allocator_alloc_zero(&node->fs->allocator, sizeof(*page) + MEMFS_PAGE_SIZE);
-			if (page == NULL)
-				return MEMFS_ERR_NO_MEMORY;
-
-			page->stored_size = MEMFS_PAGE_SIZE;
-			page->plain_size = MEMFS_PAGE_SIZE;
-
-			result = memfs_storage_ensure_group(node, group_index, &group);
-			if (result != MEMFS_OK) {
-				memfs_page_free(node, page);
-				return result;
-			}
-
-			result = memfs_storage_replace_page(node, group, slot, page);
-			if (result != MEMFS_OK) {
-				memfs_page_free(node, page);
-				return result;
-			}
-		} else if (page->flags != 0 || page->plain_size != MEMFS_PAGE_SIZE || page->stored_size != MEMFS_PAGE_SIZE) {
-			return MEMFS_ERR_DATA;
-		}
+		if (page == NULL || !memfs_page_is_raw(page))
+			return false;
 	}
 
-	// 所有目标页存在后再写用户数据。
+	return true;
+}
+
+static MemfsResult memfs_storage_write_existing_raw_pages(
+	MemfsNode* node,
+	const uint8_t* buffer,
+	uint64_t offset,
+	uint64_t length) {
+	uint64_t done = 0;
+
 	while (done < length) {
 		uint64_t pos = offset + done;
+		uint64_t page_index = pos >> MEMFS_PAGE_SHIFT;
 		uint32_t in_page = (uint32_t)(pos & MEMFS_PAGE_MASK);
 		uint32_t span = MEMFS_PAGE_SIZE - in_page;
-		MemfsPage* page;
+		MemfsPage* page = memfs_storage_page(node, page_index);
 
-		page_index = pos >> MEMFS_PAGE_SHIFT;
-		page = memfs_storage_page(node, page_index);
-
+		if (page == NULL || !memfs_page_is_raw(page))
+			return MEMFS_ERR_DATA;
 		if (span > length - done)
 			span = (uint32_t)(length - done);
 
-		memcpy(page->data + in_page, buffer + done, span);
+		memcpy(memfs_page_raw_data(page) + in_page, buffer + done, span);
 		done += span;
 	}
 
@@ -1643,8 +1731,11 @@ static MemfsResult memfs_storage_write_range(MemfsNode* node, const uint8_t* buf
 	if (result != MEMFS_OK)
 		return result;
 
-	if (!node->fs->compression_enabled && !node->fs->encryption_enabled) {
-		return memfs_storage_write_raw_pages(node, buffer, offset, length);
+	if (!node->fs->compression_enabled &&
+		!node->fs->encryption_enabled &&
+		memfs_storage_range_all_raw(node, offset, length)) {
+		return memfs_storage_write_existing_raw_pages(
+			node, buffer, offset, length);
 	}
 
 	return memfs_storage_write_encoded_pages(node, buffer, offset, length);
