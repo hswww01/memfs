@@ -27,6 +27,37 @@ def replace_required(path: Path, old: str, new: str, *, count: int = -1) -> None
 
 
 def patch_sources(root: Path) -> None:
+    library = root / "src" / "dll" / "library.c"
+    replace_required(
+        library,
+        "        fsp_fuse_finalize(Dynamic);\n",
+        "",
+        count=1,
+    )
+    replace_required(
+        library,
+        "    case DLL_THREAD_DETACH:\n"
+        "        fsp_fuse_finalize_thread();\n"
+        "        break;\n",
+        "    case DLL_THREAD_DETACH:\n"
+        "        break;\n",
+        count=1,
+    )
+    replace_required(
+        library,
+        "    Result = FspNpRegister();\n"
+        "    FspDebugLog(\"FspNpRegister = %lx\\n\", Result);\n\n",
+        "",
+        count=1,
+    )
+    replace_required(
+        library,
+        "    Result = FspNpUnregister();\n"
+        "    FspDebugLog(\"FspNpUnregister = %lx\\n\", Result);\n\n",
+        "",
+        count=1,
+    )
+
     security = root / "src" / "dll" / "security.c"
     replace_required(
         security,

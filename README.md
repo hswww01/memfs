@@ -21,7 +21,7 @@ All file-system contents are volatile. Unmounting or terminating the process los
 
 ## Prerequisites
 
-- Windows 10/11 x64.
+- Windows 10/11 x64 for native local execution. ARM64 cross-builds are also supported; ARM64 runtime verification requires a Windows ARM64 machine/VM.
 - WinFsp Git source tree at `D:\\src\\winfsp`; `scripts\\prepare-winfsp-static.ps1` derives the exact source commit from the installed signed driver and prepares `D:\\src\\winfsp-memfs-static`.
 - Visual Studio C/C++ build tools.
 - LLVM/clang-cl.
@@ -48,12 +48,29 @@ cmake --build --preset x64-release
 ctest --preset x64-release
 ```
 
+ARM64 is built with the same clang-cl + Ninja + vcpkg stack. The wrapper imports the Visual Studio `x64_arm64` environment before invoking the ARM64 presets, so the correct ARM64 CRT/Windows SDK libraries are selected:
+
+```powershell
+.\scripts\build-arm64.ps1 -Configuration Debug -SkipPackage
+.\scripts\build-arm64.ps1 -Configuration Release
+```
+
+Use `-RefreshWinFsp` when you want to recreate the driver-matched `winfsp-static-a64.lib` worktree before building. The Release invocation also creates `dist\memfs-arm64`.
+
+The x64 development machine can compile and statically inspect ARM64 binaries but cannot execute them. Runtime CTest and mounted-drive verification for ARM64 therefore remain a Windows ARM64 machine/VM validation.
+
 ## Release package and third-party notices
 
 Create the current x64 release package with:
 
 ```powershell
 .\scripts\package-release.ps1
+```
+
+For ARM64:
+
+```powershell
+.\scripts\package-release.ps1 -Architecture arm64
 ```
 
 The package contains `memfs.exe`, `THIRD_PARTY_NOTICES.md`, SHA-256 sums,
@@ -365,6 +382,7 @@ tests/
   service-recovery.ps1  SCM abnormal-termination restart/remount integration test
 scripts/
   prepare-winfsp-static.ps1 derive/build a static WinFsp runtime matching the signed driver
+  build-arm64.ps1           import x64_arm64 VS environment, cross-build/verify/package ARM64
   memfs-service.ps1         install/start/query/stop/delete wrapper around sc.exe
   verify-deployment.ps1     repeatable official/no-service/private-fallback deployment harness
 ```

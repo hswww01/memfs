@@ -1,17 +1,32 @@
 param(
-    [string]$BuildDir = "D:\work\memfs\build\x64-release",
-    [string]$OutputDir = "D:\work\memfs\dist\memfs-x64",
-    [string]$WinFspSourceRoot = "D:\src\winfsp"
+    [string]$BuildDir = "",
+    [string]$OutputDir = "",
+    [string]$WinFspSourceRoot = "D:\src\winfsp",
+    [ValidateSet("x64", "arm64")]
+    [string]$Architecture = "x64"
 )
 
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
+$arch = $Architecture.ToLowerInvariant()
+$triplet = if ($arch -eq "arm64") { "arm64-windows-static" } else { "x64-windows-static" }
+
+if (-not $BuildDir) {
+    $BuildDir = Join-Path $repoRoot ("build\" + $arch + "-release")
+}
+if (-not $OutputDir) {
+    $OutputDir = Join-Path $repoRoot ("dist\memfs-" + $arch)
+}
+
+$BuildDir = [IO.Path]::GetFullPath($BuildDir)
+$OutputDir = [IO.Path]::GetFullPath($OutputDir)
+
 $exe = Join-Path $BuildDir "memfs.exe"
 $notice = Join-Path $repoRoot "THIRD_PARTY_NOTICES.md"
 $winfspLicense = Join-Path $WinFspSourceRoot "License.txt"
-$sodiumLicense = Join-Path $BuildDir "vcpkg_installed\x64-windows-static\share\libsodium\copyright"
-$zstdLicense = Join-Path $BuildDir "vcpkg_installed\x64-windows-static\share\zstd\copyright"
+$sodiumLicense = Join-Path $BuildDir ("vcpkg_installed\" + $triplet + "\share\libsodium\copyright")
+$zstdLicense = Join-Path $BuildDir ("vcpkg_installed\" + $triplet + "\share\zstd\copyright")
 
 foreach ($required in @($exe, $notice, $winfspLicense, $sodiumLicense, $zstdLicense)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
@@ -43,7 +58,7 @@ $lines = foreach ($file in $files) {
 }
 [IO.File]::WriteAllLines($manifestPath, $lines, [Text.UTF8Encoding]::new($false))
 
-Write-Output "Packaged release: $OutputDir"
+Write-Output "Packaged $Architecture release: $OutputDir"
 Write-Output ""
 Write-Output "IMPORTANT: this build statically links WinFsp user-mode code."
 Write-Output "Review THIRD_PARTY_NOTICES.md and the WinFsp license before distribution."
