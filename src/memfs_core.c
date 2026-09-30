@@ -1,4 +1,4 @@
-﻿#include "memfs_core.h"
+#include "memfs_core.h"
 #include "memfs_object.h"
 
 #include <intrin.h>
@@ -2582,7 +2582,12 @@ uint64_t memfs_now(void) {
 	FILETIME ft;
 	ULARGE_INTEGER value;
 
-	GetSystemTimeAsFileTime(&ft);
+	/*
+	 * Windows 10+ guarantees GetSystemTimePreciseAsFileTime. The precise
+	 * system clock is useful for build/cache workloads where multiple writes
+	 * can otherwise collapse onto the same coarse filesystem timestamp.
+	 */
+	GetSystemTimePreciseAsFileTime(&ft);
 	value.LowPart = ft.dwLowDateTime;
 	value.HighPart = ft.dwHighDateTime;
 	return value.QuadPart;
@@ -2904,7 +2909,10 @@ MemfsNode* memfs_dir_next(MemfsNode* node) {
 	}
 	return parent;
 }
-MemfsResult memfs_lookup_path(Memfs* fs, const wchar_t* path, MemfsNode** out_node) {
+static MemfsResult memfs_lookup_path_span(Memfs* fs,
+                                          const wchar_t* path,
+                                          const wchar_t* end,
+                                          MemfsNode** out_node) {
 	const wchar_t* p;
 	MemfsNode* node;
 	wchar_t component[MEMFS_MAX_NAME + 1];
@@ -2912,21 +2920,23 @@ MemfsResult memfs_lookup_path(Memfs* fs, const wchar_t* path, MemfsNode** out_no
 	if (out_node != NULL)
 		*out_node = NULL;
 
-	if (fs == NULL || path == NULL || out_node == NULL || path[0] != L'\\')
+	if (fs == NULL || path == NULL || end == NULL || out_node == NULL ||
+		path[0] != L'\\' || end < path) {
 		return MEMFS_ERR_INVALID;
+	}
 
 	node = fs->root;
 	p = path;
 
-	while (*p) {
+	while (p < end) {
 		size_t len = 0;
 
-		while (*p == L'\\')
+		while (p < end && *p == L'\\')
 			p++;
-		if (*p == L'\0')
+		if (p >= end)
 			break;
 
-		while (p[len] && p[len] != L'\\') {
+		while (p + len < end && p[len] != L'\\') {
 			if (len >= MEMFS_MAX_NAME)
 				return MEMFS_ERR_INVALID;
 			component[len] = p[len];
@@ -2959,13 +2969,23 @@ MemfsResult memfs_lookup_path(Memfs* fs, const wchar_t* path, MemfsNode** out_no
 	return MEMFS_OK;
 }
 
+MemfsResult memfs_lookup_path(Memfs* fs, const wchar_t* path, MemfsNode** out_node) {
+	const wchar_t* end;
+
+	if (out_node != NULL)
+		*out_node = NULL;
+	if (fs == NULL || path == NULL || out_node == NULL || path[0] != L'\\')
+		return MEMFS_ERR_INVALID;
+
+	end = path + wcslen(path);
+	return memfs_lookup_path_span(fs, path, end, out_node);
+}
+
 MemfsResult memfs_lookup_parent(Memfs* fs, const wchar_t* path, MemfsNode** out_parent,
 								wchar_t name[MEMFS_MAX_NAME + 1]) {
 	const wchar_t* end;
 	const wchar_t* sep;
 	size_t name_len;
-	size_t parent_len;
-	wchar_t* parent_path = NULL;
 	MemfsNode* parent;
 	MemfsResult result;
 
@@ -2998,22 +3018,15 @@ MemfsResult memfs_lookup_parent(Memfs* fs, const wchar_t* path, MemfsNode** out_
 	if (wcscmp(name, L".") == 0 || wcscmp(name, L"..") == 0)
 		return MEMFS_ERR_INVALID;
 
-	if (sep == path + 1) {
-		parent = fs->root;
-	} else {
-		parent_len = (size_t)(sep - path);
-		parent_path = memfs_allocator_alloc_uninit(&fs->allocator, (parent_len + 1) * sizeof(wchar_t));
-		if (parent_path == NULL)
-			return MEMFS_ERR_NO_MEMORY;
-
-		memcpy(parent_path, path, parent_len * sizeof(wchar_t));
-		parent_path[parent_len] = L'\0';
-
-		result = memfs_lookup_path(fs, parent_path, &parent);
-		memfs_allocator_free(&fs->allocator, parent_path, (parent_len + 1) * sizeof(wchar_t));
-		if (result != MEMFS_OK)
-			return MEMFS_ERR_PATH_NOT_FOUND;
-	}
+	/*
+	 * Resolve the parent directly against the original path span. This avoids
+	 * allocating/copying a temporary NUL-terminated parent path on every
+	 * Create/Rename while preserving the same component semantics as
+	 * memfs_lookup_path().
+	 */
+	result = memfs_lookup_path_span(fs, path, sep, &parent);
+	if (result != MEMFS_OK)
+		return MEMFS_ERR_PATH_NOT_FOUND;
 
 	if (!MEMFS_NODE_IS_DIRECTORY(parent))
 		return MEMFS_ERR_NOT_DIRECTORY;

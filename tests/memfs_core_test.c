@@ -4110,6 +4110,18 @@ static void test_path_name_boundaries(void) {
 	CHECK(parent == dir);
 	CHECK(wcscmp(name, L"NEW.TXT") == 0);
 
+#if !defined(NDEBUG)
+	/*
+	 * Parent lookup must not allocate a temporary path. Arm the generic
+	 * allocator failure hook and verify lookup still succeeds.
+	 */
+	memfs_allocator_test_fail_after(MEMFS_ALLOC_FAIL_GENERIC, 0, 1);
+	CHECK(memfs_lookup_parent(fs, L"\\Dir\\noalloc.bin", &parent, name) == MEMFS_OK);
+	CHECK(parent == dir);
+	CHECK(wcscmp(name, L"noalloc.bin") == 0);
+	memfs_allocator_test_clear_failures();
+#endif
+
 	CHECK(memfs_node_create(fs, file, L"child", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) == MEMFS_ERR_INVALID);
 	CHECK(memfs_lookup_parent(fs, L"\\file.txt\\child", &parent, name) == MEMFS_ERR_PATH_NOT_FOUND);
 	CHECK(memfs_lookup_parent(fs, L"\\Missing\\child", &parent, name) == MEMFS_ERR_PATH_NOT_FOUND);
@@ -4583,6 +4595,28 @@ cleanup:
 #endif
 
 
+static void test_precise_timestamp_clock(void) {
+	FILETIME ft;
+	ULARGE_INTEGER reference;
+	uint64_t value;
+	uint64_t delta;
+
+	printf("== precise timestamp clock ==\n");
+
+	GetSystemTimePreciseAsFileTime(&ft);
+	reference.LowPart = ft.dwLowDateTime;
+	reference.HighPart = ft.dwHighDateTime;
+	value = memfs_now();
+
+	delta = value >= reference.QuadPart
+		? value - reference.QuadPart
+		: reference.QuadPart - value;
+	CHECK(value != 0);
+	/* Both reads are adjacent; one second is a deliberately loose drift bound. */
+	CHECK(delta < 10ULL * 1000ULL * 1000ULL);
+}
+
+
 static void test_allocator_fast_committed_counter(void) {
 	MemfsAllocator allocator;
 	MemfsAllocatorStats stats;
@@ -4684,6 +4718,7 @@ int main(void) {
 	test_tree_and_lookup();
 	test_deep_namespace_destroy();
 	test_memory_accounting_layers();	test_allocator_fragmentation_reuse();
+	test_precise_timestamp_clock();
 	test_allocator_fast_committed_counter();
 	test_allocator_bootstrap_control();
 #if !defined(NDEBUG)

@@ -177,9 +177,6 @@ static NTSTATUS fs_Create(FSP_FILE_SYSTEM* file_system, PWSTR file_name, UINT32 
 	if (result != MEMFS_OK)
 		return memfs_status(result);
 
-	if (memfs_dir_lookup(parent, name))
-		return STATUS_OBJECT_NAME_COLLISION;
-
 	directory = 0 != (create_options & FILE_DIRECTORY_FILE);
 
 	result = memfs_node_create(instance->store, parent, name, directory, file_attributes, security_descriptor,
