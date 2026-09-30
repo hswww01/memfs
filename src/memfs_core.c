@@ -1766,40 +1766,50 @@ static void memfs_node_free(MemfsNode* node) {
 	memfs_object_free_name(fs, node->name);
 	memfs_object_free_node(fs, node);
 }
-static void memfs_destroy_namespace_node(MemfsNode* node);
+static void memfs_dir_remove(MemfsNode* node);
 
-static void memfs_destroy_child_tree(MemfsNode* node) {
-	MemfsNode* left;
-	MemfsNode* right;
+static void memfs_destroy_namespace_tree(MemfsNode* root) {
+	MemfsNode* current = root;
 
-	if (node == NULL)
-		return;
+	/*
+	 * Destruction must not depend on the process stack depth. Walk downward
+	 * through non-empty directories and use the namespace parent link to
+	 * return after the current directory becomes empty. Leaves are detached
+	 * through the normal treap/hash removal path before being freed.
+	 */
+	while (current != NULL) {
+		MemfsNode* child = NULL;
+		MemfsNode* parent;
 
-	left = node->tree_left;
-	right = node->tree_right;
+		if (MEMFS_NODE_IS_DIRECTORY(current)) {
+			child = current->dir->root;
+			while (child != NULL && child->tree_left != NULL)
+				child = child->tree_left;
+		}
 
-	memfs_destroy_child_tree(left);
-	memfs_destroy_child_tree(right);
+		if (child != NULL) {
+			if (MEMFS_NODE_IS_DIRECTORY(child) &&
+			    child->dir != NULL &&
+			    child->dir->root != NULL) {
+				current = child;
+				continue;
+			}
 
-	node->tree_left = NULL;
-	node->tree_right = NULL;
-	node->tree_parent = NULL;
-	node->parent = NULL;
+			memfs_dir_remove(child);
+			memfs_node_free(child);
+			continue;
+		}
 
-	memfs_destroy_namespace_node(node);
-}
+		if (current == root) {
+			memfs_node_free(current);
+			return;
+		}
 
-static void memfs_destroy_namespace_node(MemfsNode* node) {
-	if (node == NULL)
-		return;
-
-	if (MEMFS_NODE_IS_DIRECTORY(node)) {
-		memfs_destroy_child_tree(node->dir->root);
-		node->dir->root = NULL;
-		node->dir->child_count = 0;
+		parent = current->parent;
+		memfs_dir_remove(current);
+		memfs_node_free(current);
+		current = parent;
 	}
-
-	memfs_node_free(node);
 }
 
 static MemfsResult memfs_security_create(MemfsAllocator* allocator, PSECURITY_DESCRIPTOR security, MemfsSecurity** out_security) {
@@ -2588,7 +2598,7 @@ void memfs_destroy(Memfs* fs) {
 
 	node = fs->root;
 	fs->root = NULL;
-	memfs_destroy_namespace_node(node);
+	memfs_destroy_namespace_tree(node);
 
 	while ((node = fs->orphan_head) != NULL) {
 		memfs_orphan_remove(fs, node);

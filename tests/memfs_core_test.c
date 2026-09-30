@@ -363,6 +363,35 @@ static void test_runtime_stats_snapshot(void) {
 	memfs_destroy(fs);
 }
 
+static void test_deep_namespace_destroy(void) {
+	enum { DEPTH = 20000 };
+	Memfs* fs = NULL;
+	MemfsNode* parent;
+	uint32_t i;
+
+	printf("== deep namespace iterative destroy ==\n");
+	CHECK(memfs_create(64ULL * 1024ULL * 1024ULL, L"DEEP", &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	if (fs == NULL)
+		return;
+
+	parent = fs->root;
+	for (i = 0; i < DEPTH; ++i) {
+		MemfsNode* child = NULL;
+		MemfsResult result = memfs_node_create(
+			fs, parent, L"d", true, FILE_ATTRIBUTE_DIRECTORY,
+			NULL, 0, &child);
+		CHECK(result == MEMFS_OK);
+		CHECK(child != NULL);
+		if (result != MEMFS_OK || child == NULL)
+			break;
+		parent = child;
+	}
+
+	CHECK(i == DEPTH);
+	memfs_destroy(fs);
+}
+
 static void test_tree_and_lookup(void) {
 	Memfs* fs = NULL;
 	MemfsNode* root;
@@ -4345,6 +4374,7 @@ int main(void) {
 	setvbuf(stdout, NULL, _IONBF, 0);
 
 	test_tree_and_lookup();
+	test_deep_namespace_destroy();
 	test_memory_accounting_layers();	test_allocator_fragmentation_reuse();
 	test_allocator_bootstrap_control();
 #if !defined(NDEBUG)
