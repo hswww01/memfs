@@ -214,6 +214,8 @@ Plain uncompressed full pages were also redesigned so a logical 4 KiB page consu
 
 To keep the 16 slab lanes from increasing allocator high-water across repeated identical workloads, a size-class pool now exposes an atomic available-shard bitmap. Allocation stays on the thread's home shard while it has capacity; before growing a new slab it probes only lanes advertised as having free objects and reuses that capacity across shards. At most one shard lock is held at a time. An 8-round fragmentation/reuse benchmark now keeps slab backing stable, final scavenging returns to baseline, allocator MT benchmarks report zero errors, and a 10-second soak reports zero committed/private drift.
 
+Area-cache retention is size-aware rather than uniformly keeping two idle regions per lane. Small area blocks retain the two-slot lane cache, while VM regions larger than 64 KiB retain at most one cached block per lane. In the 64 KiB allocation benchmark this reduced 16-thread retained cached backing from about 1,392,640 bytes to a three-run median of 696,320 bytes (zeroed) / 765,952 bytes (uninitialized). Uninitialized 16-thread throughput stayed effectively flat at about 38.4M ops/s versus a 38.7M baseline, while zeroed throughput remained within a few percent. Debug/Release tests, a 10-second soak, and real mounted integration all pass.
+
 ## Repeatable deployment verification
 
 `scripts\verify-deployment.ps1` separates safe development-machine checks from the destructive clean-machine fallback path.
@@ -254,13 +256,13 @@ The harness verifies private service creation, MemfsC-owned driver filename/path
 
 Debug:
 
-- size: 3,315,200 bytes
-- SHA-256: `9AD497AD07FD44859D641643405477EB68306D5FC9ACE670C31DF8A6853FFD9D`
+- size: 3,315,712 bytes
+- SHA-256: `B5A66BF622CB80B3E3449185738CF7DEB67BAAD3F94FA983CD4032A7053D1A5F`
 
 Release:
 
 - size: 1,319,424 bytes
-- SHA-256: `D9CFF0432EE5F5CB7BDC9B30F600B1D59B677E513A30C995D55731ECDE959B85`
+- SHA-256: `9A2239E4DA8A63944B385B2BA7382F7188A057038590CC4F3D2615276DD09F52`
 
 These hashes are verification artifacts for this local build, not permanent release
 identifiers.
