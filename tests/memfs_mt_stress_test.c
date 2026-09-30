@@ -37,13 +37,12 @@ typedef struct StressThread {
     LONG64 errors;
 } StressThread;
 
-static LONG64 now_ns(void) {
-    LARGE_INTEGER frequency;
+static LONG64 qpc_ticks(void) {
     LARGE_INTEGER counter;
 
-    QueryPerformanceFrequency(&frequency);
-    QueryPerformanceCounter(&counter);
-    return counter.QuadPart * 1000000000LL / frequency.QuadPart;
+    if (!QueryPerformanceCounter(&counter))
+        return 0;
+    return counter.QuadPart;
 }
 
 static bool stop_requested(void) {
@@ -232,6 +231,7 @@ static int run_stress(int thread_count, const char* label) {
     bool fatal_timeout = false;
     LONG64 wall_start;
     LONG64 wall_end;
+    LARGE_INTEGER frequency;
     LONG64 cycles = 0;
     LONG64 creates = 0;
     LONG64 writes = 0;
@@ -276,7 +276,14 @@ static int run_stress(int thread_count, const char* label) {
         }
     }
 
-    wall_start = now_ns();
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0) {
+        printf("[%s] QueryPerformanceFrequency failed\n", label);
+        errors += cleanup_directories(threads, thread_count);
+        memfs_destroy(fs);
+        return 1;
+    }
+
+    wall_start = qpc_ticks();
     for (int i = 0; i < thread_count; i++) {
         handles[i] = CreateThread(
             NULL, 0, stress_worker, &threads[i], 0, NULL);
@@ -319,7 +326,7 @@ static int run_stress(int thread_count, const char* label) {
         }
     }
 
-    wall_end = now_ns();
+    wall_end = qpc_ticks();
 
     for (int i = 0; i < started; i++) {
         if (handles[i] != NULL)
@@ -376,7 +383,7 @@ static int run_stress(int thread_count, const char* label) {
     errors += cleanup_directories(threads, thread_count);
 
     total_ops = creates + writes + reads + truncates + renames + unlinks;
-    seconds = (double)(wall_end - wall_start) / 1e9;
+    seconds = (double)(wall_end - wall_start) / (double)frequency.QuadPart;
     total_ops_per_second = seconds > 0.0 ? (double)total_ops / seconds : 0.0;
     per_thread_ops_per_second =
         thread_count > 0 ? total_ops_per_second / thread_count : 0.0;

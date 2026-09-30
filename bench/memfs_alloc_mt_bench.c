@@ -13,6 +13,7 @@
 typedef struct AllocBenchThread {
     MemfsAllocator* allocator;
     HANDLE start_event;
+    volatile LONG* stop_flag;
     size_t size;
     uint32_t iterations;
     bool uninitialized;
@@ -27,7 +28,10 @@ static DWORD WINAPI alloc_bench_worker(LPVOID parameter) {
 
     WaitForSingleObject(thread->start_event, INFINITE);
 
-    for (i = 0; i < thread->iterations; ++i) {
+    for (i = 0;
+         i < thread->iterations &&
+         InterlockedCompareExchange(thread->stop_flag, 0, 0) == 0;
+         ++i) {
         uint32_t slot = i % ALLOC_BENCH_SLOTS;
         void* next = thread->uninitialized
             ? memfs_allocator_alloc_uninit(thread->allocator, thread->size)
@@ -77,6 +81,7 @@ static int run_case(size_t size, int thread_count, uint32_t iterations, bool uni
     double seconds;
     double ops_per_second;
     int started = 0;
+    volatile LONG stop_flag = 0;
     int result = 1;
     int i;
 
@@ -99,6 +104,7 @@ static int run_case(size_t size, int thread_count, uint32_t iterations, bool uni
     for (i = 0; i < thread_count; ++i) {
         contexts[i].allocator = &allocator;
         contexts[i].start_event = start_event;
+        contexts[i].stop_flag = &stop_flag;
         contexts[i].size = size;
         contexts[i].iterations = iterations;
         contexts[i].uninitialized = uninitialized;
@@ -184,14 +190,25 @@ static int run_case(size_t size, int thread_count, uint32_t iterations, bool uni
     result = 0;
 
 cleanup:
+    InterlockedExchange(&stop_flag, 1);
     if (start_event != NULL)
         SetEvent(start_event);
 
-    for (i = 0; i < started; ++i) {
-        if (threads[i] != NULL) {
-            WaitForSingleObject(threads[i], 5000);
-            CloseHandle(threads[i]);
+    if (started > 0) {
+        DWORD wait = WaitForMultipleObjects(
+            (DWORD)started, threads, TRUE, 5000);
+        if (wait != WAIT_OBJECT_0) {
+            fprintf(stderr,
+                    "allocator benchmark workers failed to stop safely; "
+                    "terminating process before shared-state teardown\n");
+            fflush(stderr);
+            ExitProcess(2);
         }
+    }
+
+    for (i = 0; i < started; ++i) {
+        if (threads[i] != NULL)
+            CloseHandle(threads[i]);
     }
 
     if (start_event != NULL)
