@@ -138,6 +138,18 @@ $project = $project.Replace(
     $project,
     [Text.UTF8Encoding]::new($false))
 
+if ($Platform -eq "ARM64") {
+    $arm64Patcher = Join-Path $PSScriptRoot "patch-winfsp-arm64.py"
+    if (-not (Test-Path -LiteralPath $arm64Patcher -PathType Leaf)) {
+        throw "ARM64 patch helper not found: $arm64Patcher"
+    }
+
+    & python $arm64Patcher $Worktree $dstProject
+    if ($LASTEXITCODE -ne 0) {
+        throw "ARM64 WinFsp compatibility patch failed."
+    }
+}
+
 $msbuild = (Get-Command msbuild.exe -ErrorAction SilentlyContinue).Source
 if (-not $msbuild) {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -152,11 +164,33 @@ if (-not $msbuild -or -not (Test-Path $msbuild)) {
     throw "MSBuild not found."
 }
 
-foreach ($configuration in $Configurations) {
-    & $msbuild $dstProject /m /p:Configuration=$configuration /p:Platform=$Platform /v:minimal
-    if ($LASTEXITCODE -ne 0) {
-        throw "WinFsp static build failed: $configuration|$Platform"
+$oldCl = $env:CL
+try {
+    if ($Platform -eq "ARM64") {
+        $env:CL = ((@($oldCl, "-Wno-incompatible-function-pointer-types") |
+            Where-Object { $_ }) -join " ").Trim()
     }
+
+    foreach ($configuration in $Configurations) {
+        $arguments = @(
+            $dstProject,
+            "/m",
+            "/p:Configuration=$configuration",
+            "/p:Platform=$Platform",
+            "/v:minimal"
+        )
+        if ($Platform -eq "ARM64") {
+            $arguments += "/p:PlatformToolset=ClangCL"
+        }
+
+        & $msbuild @arguments
+        if ($LASTEXITCODE -ne 0) {
+            throw "WinFsp static build failed: $configuration|$Platform"
+        }
+    }
+}
+finally {
+    $env:CL = $oldCl
 }
 
 $arch = if ($Platform -eq "ARM64") { "a64" } else { "x64" }
