@@ -161,8 +161,9 @@ function Invoke-MountedSmoke {
     $integration = Join-Path $repoRoot "tests\integration.ps1"
     $mount = Get-FreeDrive $Drive
     & $integration -Exe $Exe -Drive $mount -Size $Size
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Context integration failed with exit code $LASTEXITCODE"
+    $integrationSucceeded = $?
+    if (-not $integrationSucceeded) {
+        throw "$Context integration PowerShell script failed"
     }
     Add-Result $Context "PASS" "mounted filesystem smoke passed on $mount"
 }
