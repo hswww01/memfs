@@ -16,6 +16,8 @@
 #define BENCH_NAME_HOT_COUNT 50000U
 #define BENCH_NAME_HOT_ROUNDS 10U
 #define BENCH_NAME_HOT_CHARS 40U
+#define BENCH_SEQUENTIAL_READ_GROUPS 128U
+#define BENCH_SEQUENTIAL_READ_ROUNDS 4U
 #define BENCH_1MB_SIZE (1ULL * 1024ULL * 1024ULL)
 #define BENCH_4KB_SIZE 4096U
 #define BENCH_1B_SIZE 1U
@@ -29,6 +31,7 @@ typedef enum BenchMode {
 	BENCH_MODE_COMPRESSION_PAGE,
 	BENCH_MODE_SPARSE_GROUPS,
 	BENCH_MODE_NAME_HOT,
+	BENCH_MODE_SEQUENTIAL_READ,
 	BENCH_MODE_PRESSURE_POLICY
 } BenchMode;
 
@@ -1611,6 +1614,102 @@ cleanup:
 	return rc;
 }
 
+static int bench_sequential_sparse_read(const BenchConfig* config, LARGE_INTEGER frequency) {
+	Memfs* fs = NULL;
+	MemfsNode* node = NULL;
+	uint8_t page[BENCH_4KB_SIZE];
+	uint8_t* buffer = NULL;
+	const uint64_t logical_size =
+		(uint64_t)BENCH_SEQUENTIAL_READ_GROUPS * MEMFS_PAGE_GROUP_BYTES;
+	const uint64_t page_lookups =
+		(logical_size / MEMFS_PAGE_SIZE) * BENCH_SEQUENTIAL_READ_ROUNDS;
+	LARGE_INTEGER start;
+	LARGE_INTEGER end;
+	uint32_t written = 0;
+	uint32_t read = 0;
+	uint32_t group;
+	uint32_t round;
+	double seconds;
+	double mib_per_second;
+	int rc = 1;
+
+	if (logical_size > UINT32_MAX)
+		return 1;
+
+	if (create_fs(config, &fs) != MEMFS_OK || fs == NULL)
+		return 1;
+
+	if (memfs_node_create(fs, fs->root, L"sequential-read.bin", false,
+						  FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) != MEMFS_OK ||
+		node == NULL)
+		goto cleanup;
+
+	memset(page, 0, sizeof(page));
+	for (group = 0; group < BENCH_SEQUENTIAL_READ_GROUPS; group++) {
+		uint64_t offset = (uint64_t)group * MEMFS_PAGE_GROUP_BYTES;
+		page[0] = (uint8_t)(group + 1U);
+		page[1] = (uint8_t)(group ^ 0x5aU);
+		if (memfs_node_write(node, page, offset, sizeof(page), false, false,
+							 &written) != MEMFS_OK ||
+			written != sizeof(page))
+			goto cleanup;
+	}
+
+	if (memfs_node_set_file_size(node, logical_size) != MEMFS_OK)
+		goto cleanup;
+
+	buffer = malloc((size_t)logical_size);
+	if (buffer == NULL)
+		goto cleanup;
+
+	QueryPerformanceCounter(&start);
+	for (round = 0; round < BENCH_SEQUENTIAL_READ_ROUNDS; round++) {
+		read = 0;
+		if (memfs_node_read(node, buffer, 0, (uint32_t)logical_size, &read) != MEMFS_OK ||
+			read != (uint32_t)logical_size)
+			goto cleanup;
+	}
+	QueryPerformanceCounter(&end);
+
+	for (group = 0; group < BENCH_SEQUENTIAL_READ_GROUPS; group++) {
+		uint64_t offset = (uint64_t)group * MEMFS_PAGE_GROUP_BYTES;
+		if (buffer[offset] != (uint8_t)(group + 1U) ||
+			buffer[offset + 1U] != (uint8_t)(group ^ 0x5aU))
+			goto cleanup;
+		if (buffer[offset + BENCH_4KB_SIZE] != 0)
+			goto cleanup;
+	}
+
+	seconds = seconds_between(start, end, frequency);
+	mib_per_second = seconds > 0.0
+		? ((double)logical_size * BENCH_SEQUENTIAL_READ_ROUNDS /
+		   (1024.0 * 1024.0)) / seconds
+		: 0.0;
+
+	printf("\n[sequential sparse paged read]\n");
+	printf("groups:           %u\n", BENCH_SEQUENTIAL_READ_GROUPS);
+	printf("logical size:     %llu B\n", (unsigned long long)logical_size);
+	printf("resident bytes:   %llu B\n",
+		   (unsigned long long)memfs_node_resident_bytes(node));
+	printf("rounds:           %u\n", BENCH_SEQUENTIAL_READ_ROUNDS);
+	printf("seconds:          %.6f\n", seconds);
+	printf("MiB/s:            %.1f\n", mib_per_second);
+	printf("ns/page lookup:   %.1f\n",
+		   seconds > 0.0 ? seconds * 1000000000.0 / (double)page_lookups : 0.0);
+	rc = 0;
+
+cleanup:
+	if (buffer != NULL)
+		free(buffer);
+	if (node != NULL) {
+		(void)memfs_node_unlink(node);
+		memfs_node_close(node);
+	}
+	if (fs != NULL)
+		memfs_destroy(fs);
+	return rc;
+}
+
 static int bench_name_hot_path(const BenchConfig* config, LARGE_INTEGER frequency) {
 	typedef wchar_t NameSlot[BENCH_NAME_HOT_CHARS];
 	Memfs* fs = NULL;
@@ -1734,6 +1833,8 @@ static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* co
 			*mode = BENCH_MODE_SPARSE_GROUPS;
 		} else if (strcmp(argv[i], "--name-hot") == 0) {
 			*mode = BENCH_MODE_NAME_HOT;
+		} else if (strcmp(argv[i], "--sequential-read") == 0) {
+			*mode = BENCH_MODE_SEQUENTIAL_READ;
 		} else if (strcmp(argv[i], "--pressure-policy") == 0) {
 			*mode = BENCH_MODE_PRESSURE_POLICY;
 		} else if (strcmp(argv[i], "--compare") == 0) {
@@ -1756,6 +1857,7 @@ static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* co
 			printf("  --compression-page   run 200k repeated compressible 4KB page rewrites\n");
 			printf("  --sparse-groups      write one 4KB page into each of 4096 distinct page groups\n");
 			printf("  --name-hot           benchmark 50k ASCII names and 500k case-insensitive lookups\n");
+			printf("  --sequential-read    benchmark 128MiB sparse sequential read across 128 PageGroups\n");
 			printf("  --pressure-policy    run deterministic auto-capacity pressure/scavenge benchmark (Debug)\n");
 			printf("  --compression-level N set compression level for compression mode\n");
 			printf("  --csv                append CSV comparison data after --compare table\n");
@@ -1833,6 +1935,8 @@ int main(int argc, char** argv) {
 		rc = bench_sparse_single_page_groups(&plain, frequency);
 	} else if (mode == BENCH_MODE_NAME_HOT) {
 		rc = bench_name_hot_path(&plain, frequency);
+	} else if (mode == BENCH_MODE_SEQUENTIAL_READ) {
+		rc = bench_sequential_sparse_read(&plain, frequency);
 	} else if (mode == BENCH_MODE_PRESSURE_POLICY) {
 		rc = bench_pressure_policy(frequency);
 	}
