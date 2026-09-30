@@ -2715,6 +2715,17 @@ static void test_allocator_unified_pool_layout(void) {
 		};
 		size_t i;
 
+		{
+			size_t node_class = 0;
+			size_t node_slab = 0;
+
+			CHECK(sizeof(MemfsNode) == 128U);
+			CHECK(memfs_allocator_test_class_layout(
+					  sizeof(MemfsNode), &node_class, &node_slab));
+			CHECK(node_class == 128U);
+			CHECK(node_slab == 4U * 1024U);
+		}
+
 		for (i = 0; i < _countof(cases); i++) {
 			size_t class_bytes = 0;
 			size_t slab_bytes = 0;
@@ -3172,6 +3183,52 @@ static bool test_orphan_contains(const Memfs* fs, const MemfsNode* target) {
 
 	return false;
 }
+
+static void test_derived_index_number(void) {
+	Memfs* fs = NULL;
+	MemfsNode* a = NULL;
+	MemfsNode* b = NULL;
+	uint64_t root_id;
+	uint64_t a_id;
+	uint64_t b_id;
+
+	printf("== derived stable index number ==\n");
+	CHECK(memfs_create(8ULL * 1024ULL * 1024ULL, L"FILEID", &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	if (fs == NULL)
+		return;
+
+	CHECK(memfs_node_create(fs, fs->root, L"a.bin", false,
+						   FILE_ATTRIBUTE_NORMAL, NULL, 0, &a) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, fs->root, L"b.bin", false,
+						   FILE_ATTRIBUTE_NORMAL, NULL, 0, &b) == MEMFS_OK);
+	CHECK(a != NULL && b != NULL);
+	if (a != NULL && b != NULL) {
+		root_id = memfs_node_index_number(fs->root);
+		a_id = memfs_node_index_number(a);
+		b_id = memfs_node_index_number(b);
+
+		CHECK(root_id != a_id);
+		CHECK(root_id != b_id);
+		CHECK(a_id != b_id);
+		CHECK(memfs_node_index_number(a) == a_id);
+
+		CHECK(memfs_node_rename(a, fs->root, L"renamed-a.bin", false) == MEMFS_OK);
+		CHECK(memfs_node_index_number(a) == a_id);
+
+		memfs_node_open(a);
+		CHECK(memfs_node_unlink(a) == MEMFS_OK);
+		CHECK(memfs_node_index_number(a) == a_id);
+		memfs_node_close(a);
+		memfs_node_close(a);
+
+		CHECK(memfs_node_unlink(b) == MEMFS_OK);
+		memfs_node_close(b);
+	}
+
+	memfs_destroy(fs);
+}
+
 
 static void test_winfsp_open_rename_delete_close_order(void) {
 	Memfs* fs = NULL;
@@ -3825,7 +3882,6 @@ static void test_failure_injection_transaction_rollback(void) {
 	uint8_t input[MEMFS_PAGE_SIZE];
 	uint8_t output[MEMFS_PAGE_SIZE];
 	uint32_t transferred = 0;
-	uint64_t next_index;
 	uint32_t child_count;
 	uint64_t used;
 	uint64_t resident;
@@ -3846,8 +3902,7 @@ static void test_failure_injection_transaction_rollback(void) {
 	if (fs == NULL)
 		goto cleanup;
 
-	/* Name failure must not publish a node or consume an index/accounting. */
-	next_index = fs->next_index;
+	/* Name failure must not publish a node or disturb accounting. */
 	child_count = fs->root->dir->child_count;
 	used = (uint64_t)fs->used_bytes;
 	resident = (uint64_t)fs->resident_bytes;
@@ -3857,7 +3912,6 @@ static void test_failure_injection_transaction_rollback(void) {
 		  MEMFS_ERR_NO_MEMORY);
 	CHECK(failed == NULL);
 	CHECK(memfs_dir_lookup(fs->root, L"name-fail.bin") == NULL);
-	CHECK(fs->next_index == next_index);
 	CHECK(fs->root->dir->child_count == child_count);
 	CHECK((uint64_t)fs->used_bytes == used);
 	CHECK((uint64_t)fs->resident_bytes == resident);
@@ -3871,7 +3925,6 @@ static void test_failure_injection_transaction_rollback(void) {
 		  MEMFS_ERR_NO_MEMORY);
 	CHECK(failed == NULL);
 	CHECK(memfs_dir_lookup(fs->root, L"dir-fail") == NULL);
-	CHECK(fs->next_index == next_index);
 	memfs_allocator_get_stats(&fs->allocator, &after);
 	CHECK(failure_stats_equal(&baseline, &after));
 
@@ -3881,14 +3934,13 @@ static void test_failure_injection_transaction_rollback(void) {
 	if (alternate == NULL)
 		goto cleanup;
 
-	/* Security failure used to consume next_index before all resources committed. */
+	/* Security failure must not publish a partially initialized node. */
 	failed = (MemfsNode*)(uintptr_t)1;
 	memfs_allocator_test_fail_after(MEMFS_ALLOC_FAIL_SECURITY, 0, 1);
 	CHECK(memfs_node_create(fs, fs->root, L"security-fail.bin", false, FILE_ATTRIBUTE_NORMAL, alternate, 0, &failed) ==
 		  MEMFS_ERR_NO_MEMORY);
 	CHECK(failed == NULL);
 	CHECK(memfs_dir_lookup(fs->root, L"security-fail.bin") == NULL);
-	CHECK(fs->next_index == next_index);
 	memfs_allocator_get_stats(&fs->allocator, &after);
 	CHECK(failure_stats_equal(&baseline, &after));
 
@@ -4053,6 +4105,7 @@ int main(void) {
 	test_storage_group_churn_stress();
 	test_storage_state_invariants();
 	test_open_delete_lifetime();
+	test_derived_index_number();
 	test_rename_delete_lifetime();
 	test_winfsp_open_rename_delete_close_order();
 	test_winfsp_open_rename_replace_delete_close_order();

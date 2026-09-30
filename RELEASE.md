@@ -208,6 +208,8 @@ completely overwritten before first read. Typed node/dir/page-group allocations 
 the normal zeroed APIs retain their zero-initialization contract. Reused slab and area
 blocks are covered by tests to ensure zeroed callers never observe stale data.
 
+Per-node metadata was subsequently reduced from 136 to 128 bytes without packing or removing the cached directory-name hash. This moves every `MemfsNode` from the allocator's 192-byte class into the 128-byte class, saving 64 slab bytes per live file/directory node. The former stored 64-bit `index_number` was replaced by a per-filesystem-seeded stable opaque ID derived from the node address; file IDs stay stable for the node lifetime and encryption AAD uses the same derived identity. Debug/Release tests, a 10-second soak, and real mounted plain/compression/encryption/combined integration all pass.
+
 ## Repeatable deployment verification
 
 `scripts\verify-deployment.ps1` separates safe development-machine checks from the destructive clean-machine fallback path.
@@ -248,13 +250,13 @@ The harness verifies private service creation, MemfsC-owned driver filename/path
 
 Debug:
 
-- size: 3,312,640 bytes
-- SHA-256: `E42D85B43C5FA9C88FB81DA549E5B88BBB27DCDBF0E9B5D53119A2B67C10B433`
+- size: 3,313,152 bytes
+- SHA-256: `B67929681871F6DEFC62ADACCE3AF37B53124604D58B413D30C8601F6E987EB3`
 
 Release:
 
 - size: 1,318,912 bytes
-- SHA-256: `9C4B23AFED0F6F4038B2DAFE1B46BE88B7B16DCD0F24C8F847BFD10350113BE0`
+- SHA-256: `D0C1883A28205A3016394AC1E60A13B677AAABAF85D0713A779B098A1177D3E7`
 
 These hashes are verification artifacts for this local build, not permanent release
 identifiers.

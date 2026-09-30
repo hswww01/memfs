@@ -147,6 +147,7 @@ uint64_t memfs_node_get_creation_time(const MemfsNode* node);
 uint64_t memfs_node_get_last_access_time(const MemfsNode* node);
 uint64_t memfs_node_get_last_write_time(const MemfsNode* node);
 uint64_t memfs_node_get_change_time(const MemfsNode* node);
+uint64_t memfs_node_index_number(const MemfsNode* node);
 void memfs_node_set_creation_time(MemfsNode* node, uint64_t value);
 void memfs_node_set_last_access_time(MemfsNode* node, uint64_t value);
 void memfs_node_set_last_write_time(MemfsNode* node, uint64_t value);
@@ -181,7 +182,6 @@ struct MemfsNode {
 	uint64_t allocation_size;
 
 	MemfsSecurity* security;
-	uint64_t index_number;
 	uint64_t creation_time;
 	uint64_t last_access_time;
 	uint64_t last_write_time;
@@ -197,6 +197,11 @@ struct MemfsNode {
 	uint8_t reserved_flags : 5;
 	int8_t compression_score;
 };
+
+#if defined(_WIN64)
+_Static_assert(sizeof(MemfsNode) == 128,
+	"MemfsNode must stay in the allocator 128-byte size class");
+#endif
 
 #define MEMFS_NODE_IS_DIRECTORY(node) ((node) != NULL && 0 != ((node)->attributes & FILE_ATTRIBUTE_DIRECTORY))
 
@@ -216,7 +221,6 @@ struct Memfs {
 	volatile LONG64 used_bytes;
 	volatile LONG64 resident_bytes;
 	volatile LONG64 pressure_last_scavenge_tick;
-	uint64_t next_index;
 	uint64_t treap_seed;
 
 	bool compression_enabled;

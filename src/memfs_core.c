@@ -35,6 +35,26 @@ uint64_t memfs_node_get_change_time(const MemfsNode* node) {
 	return node ? node->change_time : 0;
 }
 
+static uint64_t memfs_mix64(uint64_t x) {
+	x += 0x9e3779b97f4a7c15ULL;
+	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+	x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+	return x ^ (x >> 31);
+}
+
+uint64_t memfs_node_index_number(const MemfsNode* node) {
+	if (node == NULL || node->fs == NULL)
+		return 0;
+
+	/*
+	 * Node addresses remain stable for the lifetime of an open file object.
+	 * SplitMix64 is a permutation over 64 bits, so distinct live node
+	 * addresses map to distinct opaque IDs for the same filesystem seed.
+	 * Freed-node ID reuse is acceptable for this volatile filesystem.
+	 */
+	return memfs_mix64((uint64_t)(uintptr_t)node ^ node->fs->treap_seed);
+}
+
 void memfs_node_set_creation_time(MemfsNode* node, uint64_t value) {
 	if (node)
 		node->creation_time = value;
@@ -449,7 +469,7 @@ static MemfsResult memfs_page_encode(MemfsNode* node, uint64_t storage_index, co
 		memfs_build_nonce(node->fs, sequence, nonce);
 
 		memset(&aad, 0, sizeof(aad));
-		aad.node_index = node->index_number;
+		aad.node_index = memfs_node_index_number(node);
 		aad.storage_index = storage_index;
 		aad.nonce_sequence = sequence;
 		aad.plain_size = plain_size;
@@ -519,7 +539,7 @@ static MemfsResult memfs_page_decode(MemfsNode* node, uint64_t storage_index, co
 		memfs_build_nonce(node->fs, sequence, nonce);
 
 		memset(&aad, 0, sizeof(aad));
-		aad.node_index = node->index_number;
+		aad.node_index = memfs_node_index_number(node);
 		aad.storage_index = storage_index;
 		aad.nonce_sequence = sequence;
 		aad.plain_size = page->plain_size;
@@ -2003,12 +2023,11 @@ static void memfs_dir_hash_after_remove(MemfsDir* dir) {
 }
 
 static uint32_t memfs_treap_priority(const MemfsNode* node) {
-	uint64_t x = node->index_number ^ node->fs->treap_seed;
+	uint64_t x = (uint64_t)(uintptr_t)node ^
+				 node->fs->treap_seed ^
+				 0xd1b54a32d192ed03ULL;
 
-	x += 0x9e3779b97f4a7c15ULL;
-	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-	x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-	x ^= x >> 31;
+	x = memfs_mix64(x);
 	return (uint32_t)(x ^ (x >> 32));
 }
 
@@ -2198,8 +2217,6 @@ static MemfsResult memfs_node_alloc(Memfs* fs, MemfsNode* parent, const wchar_t*
 		memfs_object_free_node(fs, node);
 		return result;
 	}
-
-	node->index_number = fs->next_index++;
 
 	node->attributes = attributes;
 	node->creation_time = memfs_now();
@@ -2400,7 +2417,6 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 	fs->capacity = options->capacity;
 	fs->capacity_auto = options->capacity_auto;
 	fs->pressure_last_scavenge_tick = 0;
-	fs->next_index = 1;
 	randombytes_buf(&fs->treap_seed, sizeof(fs->treap_seed));
 	if (fs->treap_seed == 0)
 		fs->treap_seed = 0x9e3779b97f4a7c15ULL;

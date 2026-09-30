@@ -62,7 +62,7 @@ static void memfs_fill_file_info(MemfsNode* node, FSP_FSCTL_FILE_INFO* file_info
 	file_info->LastAccessTime = memfs_node_get_last_access_time(node);
 	file_info->LastWriteTime = memfs_node_get_last_write_time(node);
 	file_info->ChangeTime = memfs_node_get_change_time(node);
-	file_info->IndexNumber = node->index_number;
+	file_info->IndexNumber = memfs_node_index_number(node);
 }
 
 static void memfs_fill_volume_info(Memfs* fs, FSP_FSCTL_VOLUME_INFO* volume_info) {
