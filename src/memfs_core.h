@@ -142,6 +142,21 @@ struct MemfsPageGroupEntry {
 	MemfsPageGroup* group;
 };
 
+#if defined(_WIN64)
+_Static_assert(sizeof(MemfsDir) == 24,
+	"MemfsDir must stay in the allocator 24-byte size class");
+_Static_assert(sizeof(MemfsDirHash) == 24,
+	"MemfsDirHash must stay in the allocator 24-byte size class");
+_Static_assert(offsetof(MemfsSecurity, data) == 16,
+	"MemfsSecurity header must stay 16 bytes");
+_Static_assert(offsetof(MemfsPage, data) == 8,
+	"MemfsPage encoded header must stay 8 bytes");
+_Static_assert(sizeof(MemfsPageGroup) == 48,
+	"MemfsPageGroup must stay in the allocator 48-byte size class");
+_Static_assert(sizeof(MemfsPageGroupEntry) == 16,
+	"MemfsPageGroupEntry must stay in the allocator 16-byte size class");
+#endif
+
 MemfsSecurity* memfs_node_get_security(MemfsNode* node);
 uint64_t memfs_node_get_creation_time(const MemfsNode* node);
 uint64_t memfs_node_get_last_access_time(const MemfsNode* node);

@@ -15,6 +15,11 @@ struct MemfsStorageMeta {
 	uint32_t capacity;
 };
 
+#if defined(_WIN64)
+_Static_assert(sizeof(MemfsStorageMeta) == 16,
+	"MemfsStorageMeta must stay in the allocator 16-byte size class");
+#endif
+
 MemfsSecurity* memfs_node_get_security(MemfsNode* node) {
 	return node ? node->security : NULL;
 }

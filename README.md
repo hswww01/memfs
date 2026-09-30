@@ -198,7 +198,7 @@ Directory/file metadata is packed aggressively:
 
 - MemfsNode is 128 bytes on x64 and is compile-time pinned to the allocator's 128-byte class; the previous 136-byte layout rounded up to a 192-byte slab slot, so every live file/directory node now consumes 64 fewer slab bytes (33.3% less node-slot memory).
 - directory state, tiny-file storage and paged-file storage are mutually exclusive and share one pointer-width union;
-- a newly created node, its optional MemfsDir, and its initial name are one allocation;
+- node, optional directory state and name storage are deliberately separate size-class allocations: the 128-byte node already exactly fills its class, so co-allocating a name would push the common object into the 192-byte class and increase physical backing;
 - inherited ACLs are reference-counted and shared;
 - nodes removed from the namespace reuse treap links for the orphan/open-handle list.
 - the WinFsp `IndexNumber` is derived from the stable node address through a per-filesystem seeded 64-bit permutation instead of storing another 8-byte field; it remains stable across rename/unlink while the node is alive.
