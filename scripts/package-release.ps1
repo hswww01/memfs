@@ -100,16 +100,16 @@ try {
     $stagingProvenance = Join-Path $stagingDir "BUILD_PROVENANCE.json"
     $provenanceScript = Join-Path $PSScriptRoot "build-provenance.ps1"
 
-    $provenanceArgs = @(
-        "-Mode", "Write",
-        "-SourceDir", $repoRoot,
-        "-BuildDir", $BuildDir,
-        "-ExePath", $exe,
-        "-OutputPath", $stagingProvenance,
-        "-RequireClean"
-    )
+    $provenanceArgs = @{
+        Mode = "Write"
+        SourceDir = $repoRoot
+        BuildDir = $BuildDir
+        ExePath = $exe
+        OutputPath = $stagingProvenance
+        RequireClean = $true
+    }
     & $provenanceScript @provenanceArgs
-    $provenanceArgs[1] = "Verify"
+    $provenanceArgs.Mode = "Verify"
     & $provenanceScript @provenanceArgs
 
 
