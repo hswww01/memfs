@@ -15,6 +15,7 @@ typedef struct AllocBenchThread {
     HANDLE start_event;
     size_t size;
     uint32_t iterations;
+    bool uninitialized;
     uint64_t operations;
     uint64_t errors;
     void* slots[ALLOC_BENCH_SLOTS];
@@ -28,7 +29,9 @@ static DWORD WINAPI alloc_bench_worker(LPVOID parameter) {
 
     for (i = 0; i < thread->iterations; ++i) {
         uint32_t slot = i % ALLOC_BENCH_SLOTS;
-        void* next = memfs_allocator_alloc(thread->allocator, thread->size);
+        void* next = thread->uninitialized
+            ? memfs_allocator_alloc_uninit(thread->allocator, thread->size)
+            : memfs_allocator_alloc(thread->allocator, thread->size);
 
         if (next == NULL) {
             thread->errors++;
@@ -58,7 +61,7 @@ static DWORD WINAPI alloc_bench_worker(LPVOID parameter) {
     return 0;
 }
 
-static int run_case(size_t size, int thread_count, uint32_t iterations) {
+static int run_case(size_t size, int thread_count, uint32_t iterations, bool uninitialized) {
     MemfsAllocator allocator;
     MemfsAllocatorStats baseline;
     MemfsAllocatorStats stats;
@@ -98,6 +101,7 @@ static int run_case(size_t size, int thread_count, uint32_t iterations) {
         contexts[i].start_event = start_event;
         contexts[i].size = size;
         contexts[i].iterations = iterations;
+        contexts[i].uninitialized = uninitialized;
         threads[i] = CreateThread(
             NULL, 0, alloc_bench_worker, &contexts[i], 0, NULL);
         if (threads[i] == NULL)
@@ -130,10 +134,11 @@ static int run_case(size_t size, int thread_count, uint32_t iterations) {
     memfs_allocator_get_stats(&allocator, &stats);
 
     printf(
-        "size=%-6llu threads=%-2d iterations/thread=%-7u "
+        "mode=%-6s size=%-6llu threads=%-2d iterations/thread=%-7u "
         "ops=%-10llu seconds=%8.4f ops/s=%12.0f "
         "errors=%llu post_slabs=%u post_areas=%u post_cached=%u "
         "post_cached_bytes=%llu post_reserved=%llu",
+        uninitialized ? "uninit" : "zero",
         (unsigned long long)size,
         thread_count,
         iterations,
@@ -209,19 +214,24 @@ int main(void) {
     };
     size_t w;
     size_t t;
+    int mode;
 
     printf("=== memfs allocator shared-pool contention benchmark ===\n");
     printf("one logical size-class pool is shared by all worker threads\n");
 
-    for (w = 0; w < sizeof(workloads) / sizeof(workloads[0]); ++w) {
-        printf("\n[allocation size %llu]\n",
-               (unsigned long long)workloads[w].size);
-        for (t = 0; t < sizeof(thread_counts) / sizeof(thread_counts[0]); ++t) {
-            if (run_case(
-                    workloads[w].size,
-                    thread_counts[t],
-                    workloads[w].iterations) != 0) {
-                return 1;
+    for (mode = 0; mode < 2; ++mode) {
+        printf("\n[%s allocations]\n", mode ? "uninitialized" : "zeroed");
+        for (w = 0; w < sizeof(workloads) / sizeof(workloads[0]); ++w) {
+            printf("\n[allocation size %llu]\n",
+                   (unsigned long long)workloads[w].size);
+            for (t = 0; t < sizeof(thread_counts) / sizeof(thread_counts[0]); ++t) {
+                if (run_case(
+                        workloads[w].size,
+                        thread_counts[t],
+                        workloads[w].iterations,
+                        mode != 0) != 0) {
+                    return 1;
+                }
             }
         }
     }

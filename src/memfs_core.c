@@ -419,7 +419,7 @@ static MemfsResult memfs_page_encode(MemfsNode* node, uint64_t storage_index, co
 	if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_PAGE))
 		return MEMFS_ERR_NO_MEMORY;
 
-	page = memfs_allocator_alloc(&node->fs->allocator, sizeof(*page) + stored_size);
+	page = memfs_allocator_alloc_uninit(&node->fs->allocator, sizeof(*page) + stored_size);
 	if (page == NULL)
 		return MEMFS_ERR_NO_MEMORY;
 
@@ -1700,7 +1700,7 @@ static MemfsResult memfs_security_create(MemfsAllocator* allocator, PSECURITY_DE
 	if (memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_SECURITY))
 		return MEMFS_ERR_NO_MEMORY;
 
-	shared = memfs_allocator_alloc(allocator, sizeof(*shared) + size);
+	shared = memfs_allocator_alloc_uninit(allocator, sizeof(*shared) + size);
 	if (shared == NULL)
 		return MEMFS_ERR_NO_MEMORY;
 
@@ -2675,7 +2675,7 @@ MemfsResult memfs_lookup_parent(Memfs* fs, const wchar_t* path, MemfsNode** out_
 		parent = fs->root;
 	} else {
 		parent_len = (size_t)(sep - path);
-		parent_path = memfs_allocator_alloc(&fs->allocator, (parent_len + 1) * sizeof(wchar_t));
+		parent_path = memfs_allocator_alloc_uninit(&fs->allocator, (parent_len + 1) * sizeof(wchar_t));
 		if (parent_path == NULL)
 			return MEMFS_ERR_NO_MEMORY;
 

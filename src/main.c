@@ -15,6 +15,7 @@
 typedef struct MemfsRunConfig {
     const wchar_t* mount_point;
     const wchar_t* volume_label;
+    const wchar_t* stop_event_name;
     uint64_t capacity;
     bool capacity_auto;
     uint32_t thread_count;
@@ -119,6 +120,7 @@ static void print_usage(const wchar_t* exe) {
              L"  --size <bytes|auto>     Capacity; supports K/M/G suffix. Default: auto.\n"
              L"  --label <name>          Volume label. Default: MEMFS.\n"
              L"  --threads <n>           WinFsp dispatcher threads. 0 = automatic.\n"
+             L"  --stop-event <name>     Optional named event for graceful console shutdown/automation.\n"
              L"  --compress              Enable per-page Zstd compression (level 1).\n"
              L"  --compression-level <n> Enable compression with level 1..22.\n"
              L"  --encrypt               Enable XChaCha20-Poly1305 with random session key.\n"
@@ -258,6 +260,8 @@ static int parse_config(int argc, wchar_t** argv, MemfsRunConfig* config) {
                 fwprintf(stderr, L"Invalid --threads value.\n");
                 return 2;
             }
+        } else if (_wcsicmp(argv[i], L"--stop-event") == 0 && i + 1 < argc) {
+            config->stop_event_name = argv[++i];
         } else if (_wcsicmp(argv[i], L"--compress") == 0) {
             config->compression_enabled = true;
         } else if (_wcsicmp(argv[i], L"--compression-level") == 0 && i + 1 < argc) {
@@ -304,6 +308,11 @@ static int parse_config(int argc, wchar_t** argv, MemfsRunConfig* config) {
             fwprintf(stderr, L"Unknown argument: %s\n", argv[i]);
             return 2;
         }
+    }
+
+    if (config->service_mode && config->stop_event_name != NULL) {
+        fwprintf(stderr, L"--stop-event is only valid in console mode.\n");
+        return 2;
     }
 
     if (!config->uninstall_private_driver && config->mount_point == NULL) {
@@ -590,7 +599,7 @@ int wmain(int argc, wchar_t** argv) {
         return 0;
     }
 
-    g_stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    g_stop_event = CreateEventW(NULL, TRUE, FALSE, g_config.stop_event_name);
     if (g_stop_event == NULL) {
         fwprintf(stderr, L"CreateEvent failed: %lu\n", GetLastError());
         SecureZeroMemory(g_config.encryption_key, sizeof(g_config.encryption_key));

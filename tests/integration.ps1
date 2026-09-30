@@ -10,12 +10,37 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$stopEventName = "Local\MemfsIntegration-" + [Guid]::NewGuid().ToString("N")
+$nativeType = [System.Management.Automation.PSTypeName]'MemfsTest.NativeMethods'
+if ($null -eq $nativeType.Type) {
+    Add-Type -TypeDefinition @"
+using System.Text;
+using System.Runtime.InteropServices;
+namespace MemfsTest {
+    public static class NativeMethods {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint QueryDosDevice(
+            string lpDeviceName,
+            StringBuilder lpTargetPath,
+            int ucchMax);
+    }
+}
+"@
+}
+
+function Test-DosDeviceExists {
+    param([string]$Device)
+    $name = $Device.TrimEnd('\')
+    $buffer = [Text.StringBuilder]::new(4096)
+    return [MemfsTest.NativeMethods]::QueryDosDevice(
+        $name, $buffer, $buffer.Capacity) -ne 0
+}
 
 if (-not (Test-Path $Exe)) {
     throw "memfs executable not found: $Exe"
 }
 
-if (Test-Path "$Drive\") {
+if (Test-DosDeviceExists $Drive) {
     throw "drive is already in use: $Drive"
 }
 
@@ -29,7 +54,8 @@ Remove-Item $stdout, $stderr -Force -ErrorAction SilentlyContinue
 $arguments = @(
     "--mount", $Drive,
     "--size", $Size,
-    "--label", "MEMTEST"
+    "--label", "MEMTEST",
+    "--stop-event", $stopEventName
 ) + $ExtraArgs
 
 $process = Start-Process -FilePath $exePath -ArgumentList $arguments -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
@@ -99,13 +125,39 @@ try {
     Write-Host "integration PASS"
 }
 finally {
-    if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+    $forced = $false
+    if (-not $process.HasExited) {
+        try {
+            $stopEvent = [System.Threading.EventWaitHandle]::OpenExisting($stopEventName)
+            try {
+                [void]$stopEvent.Set()
+            }
+            finally {
+                $stopEvent.Dispose()
+            }
+        }
+        catch {
+            Write-Warning "cannot open graceful stop event; falling back to forced termination: $_"
+            $forced = $true
+        }
+
+        if (-not $forced -and -not $process.WaitForExit(10000)) {
+            Write-Warning "memfs did not exit within 10 seconds after graceful stop request"
+            $forced = $true
+        }
+
+        if ($forced -and -not $process.HasExited) {
+            Stop-Process -Id $process.Id -Force
+        }
+    }
+
     Wait-Process -Id $process.Id -ErrorAction SilentlyContinue
-    for ($i = 0; $i -lt 30; $i++) {
+
+    for ($i = 0; $i -lt 100; $i++) {
         if (-not (Test-Path "$Drive\")) { break }
         Start-Sleep -Milliseconds 100
     }
     if (Test-Path "$Drive\") {
-        Write-Warning "mount point still exists after process exit: $Drive"
+        throw "mount point still exists after process exit: $Drive"
     }
 }

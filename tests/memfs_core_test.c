@@ -2614,6 +2614,8 @@ static void test_allocator_unified_pool_layout(void) {
 	void* node;
 	void* name;
 	void* generic;
+	void* group;
+	size_t zero_index;
 	void* area;
 
 	printf("== allocator unified pool layout ==\n");
@@ -2638,6 +2640,23 @@ static void test_allocator_unified_pool_layout(void) {
 	CHECK(after_generic.slab_count == after_node.slab_count);
 	CHECK(after_generic.dedicated_count == 0U);
 
+	/*
+	 * name allocations deliberately use the uninitialized fast path. Reuse the
+	 * just-freed name slot through a typed allocation and prove the typed API
+	 * still restores its zero-initialization contract.
+	 */
+	if (name != NULL) {
+		memset(name, 0xA5, 96U);
+		memfs_allocator_free_name(&allocator, name, 96U);
+		name = NULL;
+	}
+	group = memfs_allocator_alloc_page_group(&allocator);
+	CHECK(group != NULL);
+	if (group != NULL) {
+		for (zero_index = 0; zero_index < 96U; ++zero_index)
+			CHECK(((const uint8_t*)group)[zero_index] == 0U);
+	}
+
 	area = memfs_allocator_alloc(&allocator, MEMFS_ALLOC_AREA_THRESHOLD + 1U);
 	CHECK(area != NULL);
 	memfs_allocator_get_stats(&allocator, &after_area);
@@ -2647,7 +2666,10 @@ static void test_allocator_unified_pool_layout(void) {
 
 	memfs_allocator_free(&allocator, area, MEMFS_ALLOC_AREA_THRESHOLD + 1U);
 	memfs_allocator_free(&allocator, generic, 96U);
-	memfs_allocator_free_name(&allocator, name, 96U);
+	if (group != NULL)
+		memfs_allocator_free_page_group(&allocator, group);
+	if (name != NULL)
+		memfs_allocator_free_name(&allocator, name, 96U);
 	memfs_allocator_free_node(&allocator, node);
 
 	memfs_allocator_get_stats(&allocator, &after);
@@ -2670,14 +2692,25 @@ static void test_allocator_unified_pool_layout(void) {
 			size_t expected_slab;
 		} cases[] = {
 			{1U, 8U, 4U * 1024U},
-			{96U, 96U, 4U * 1024U},
+			{8U, 8U, 4U * 1024U},
+			{9U, 16U, 4U * 1024U},
+			{17U, 24U, 4U * 1024U},
+			{25U, 32U, 4U * 1024U},
+			{33U, 48U, 4U * 1024U},
+			{49U, 64U, 4U * 1024U},
+			{65U, 96U, 4U * 1024U},
+			{97U, 128U, 4U * 1024U},
 			{129U, 192U, 8U * 1024U},
-			{256U, 256U, 8U * 1024U},
+			{193U, 256U, 8U * 1024U},
 			{257U, 384U, 16U * 1024U},
-			{512U, 512U, 16U * 1024U},
+			{385U, 512U, 16U * 1024U},
 			{513U, 768U, 32U * 1024U},
-			{1024U, 1024U, 32U * 1024U},
+			{769U, 1024U, 32U * 1024U},
 			{1025U, 1536U, 64U * 1024U},
+			{1537U, 2048U, 64U * 1024U},
+			{2049U, 3072U, 64U * 1024U},
+			{3073U, 4096U, 64U * 1024U},
+			{4097U, 8192U, 64U * 1024U},
 			{8192U, 8192U, 64U * 1024U},
 		};
 		size_t i;

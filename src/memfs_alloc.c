@@ -17,7 +17,7 @@
 #define MEMFS_MIN_SLAB_BYTES (4U * 1024U)
 #define MEMFS_MAX_SLAB_BYTES (64U * 1024U)
 #define MEMFS_ALLOC_ALIGNMENT 16U
-#define MEMFS_POOL_SHARD_COUNT 8U
+#define MEMFS_POOL_SHARD_COUNT 16U
 
 _Static_assert((MEMFS_POOL_SHARD_COUNT & (MEMFS_POOL_SHARD_COUNT - 1U)) == 0,
                "pool shard count must be a power of two");
@@ -337,7 +337,7 @@ static MemfsSlab* slab_from_object(MemfsAllocatorState* state, void* ptr) {
     return (MemfsSlab*)(address & ~(granularity - 1U));
 }
 
-static void* pool_alloc(MemfsPool* pool, size_t requested_bytes) {
+static void* pool_alloc(MemfsPool* pool, size_t requested_bytes, bool zero_memory) {
     MemfsPoolShard* shard;
     MemfsSlab* slab;
     MemfsFreeObject* object;
@@ -368,7 +368,8 @@ static void* pool_alloc(MemfsPool* pool, size_t requested_bytes) {
 
     ReleaseSRWLockExclusive(&shard->lock);
 
-    memset(object, 0, pool->object_size);
+    if (zero_memory)
+        memset(object, 0, requested_bytes);
     return object;
 }
 
@@ -584,7 +585,7 @@ static MemfsAreaShard* area_current_shard(MemfsAllocatorState* state) {
     return &state->area_shards[pool_shard_index()];
 }
 
-static void* area_alloc(MemfsAllocatorState* state, size_t bytes) {
+static void* area_alloc(MemfsAllocatorState* state, size_t bytes, bool zero_memory) {
     MemfsAreaShard* shard;
     MemfsAreaBlock* block;
     MemfsAreaBlock* best = NULL;
@@ -635,6 +636,8 @@ static void* area_alloc(MemfsAllocatorState* state, size_t bytes) {
         shard->active_count++;
         shard->live_bytes += bytes;
         ReleaseSRWLockExclusive(&shard->lock);
+        if (zero_memory)
+            memset((uint8_t*)best + header_size, 0, bytes);
         return (uint8_t*)best + header_size;
     }
     ReleaseSRWLockExclusive(&shard->lock);
@@ -658,6 +661,8 @@ static void* area_alloc(MemfsAllocatorState* state, size_t bytes) {
     shard->committed_bytes += block->region_bytes;
     ReleaseSRWLockExclusive(&shard->lock);
 
+    if (zero_memory)
+        memset((uint8_t*)block + header_size, 0, bytes);
     return (uint8_t*)block + header_size;
 }
 
@@ -883,7 +888,10 @@ static void state_destroy(MemfsAllocatorState* state) {
     memfs_vm_release(state);
 }
 
-static void* allocator_alloc_internal(MemfsAllocator* allocator, size_t bytes) {
+static void* allocator_alloc_internal(
+    MemfsAllocator* allocator,
+    size_t bytes,
+    bool zero_memory) {
     int index;
 
     if (allocator == NULL || allocator->state == NULL || bytes == 0)
@@ -891,9 +899,9 @@ static void* allocator_alloc_internal(MemfsAllocator* allocator, size_t bytes) {
 
     index = class_index(bytes);
     if (index >= 0)
-        return pool_alloc(&allocator->state->pools[index], bytes);
+        return pool_alloc(&allocator->state->pools[index], bytes, zero_memory);
 
-    return area_alloc(allocator->state, bytes);
+    return area_alloc(allocator->state, bytes, zero_memory);
 }
 
 static void allocator_free_internal(MemfsAllocator* allocator, void* ptr, size_t bytes) {
@@ -941,7 +949,7 @@ void memfs_allocator_destroy(MemfsAllocator* allocator) {
 void* memfs_allocator_alloc_node(MemfsAllocator* allocator) {
     if (allocator == NULL || memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_NODE))
         return NULL;
-    return allocator_alloc_internal(allocator, allocator->node_size);
+    return allocator_alloc_internal(allocator, allocator->node_size, true);
 }
 
 void memfs_allocator_free_node(MemfsAllocator* allocator, void* ptr) {
@@ -952,7 +960,7 @@ void memfs_allocator_free_node(MemfsAllocator* allocator, void* ptr) {
 void* memfs_allocator_alloc_dir(MemfsAllocator* allocator) {
     if (allocator == NULL || memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_DIR))
         return NULL;
-    return allocator_alloc_internal(allocator, allocator->dir_size);
+    return allocator_alloc_internal(allocator, allocator->dir_size, true);
 }
 
 void memfs_allocator_free_dir(MemfsAllocator* allocator, void* ptr) {
@@ -963,7 +971,7 @@ void memfs_allocator_free_dir(MemfsAllocator* allocator, void* ptr) {
 void* memfs_allocator_alloc_page_group(MemfsAllocator* allocator) {
     if (allocator == NULL || memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_GROUP))
         return NULL;
-    return allocator_alloc_internal(allocator, allocator->page_group_size);
+    return allocator_alloc_internal(allocator, allocator->page_group_size, true);
 }
 
 void memfs_allocator_free_page_group(MemfsAllocator* allocator, void* ptr) {
@@ -975,7 +983,7 @@ void* memfs_allocator_alloc_name(MemfsAllocator* allocator, size_t bytes) {
     if (allocator == NULL || bytes == 0 ||
         memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_NAME))
         return NULL;
-    return allocator_alloc_internal(allocator, bytes);
+    return allocator_alloc_internal(allocator, bytes, false);
 }
 
 void memfs_allocator_free_name(MemfsAllocator* allocator, void* ptr, size_t bytes) {
@@ -986,14 +994,21 @@ void* memfs_allocator_alloc(MemfsAllocator* allocator, size_t bytes) {
     if (allocator == NULL || bytes == 0 ||
         memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_GENERIC))
         return NULL;
-    return allocator_alloc_internal(allocator, bytes);
+    return allocator_alloc_internal(allocator, bytes, true);
+}
+
+void* memfs_allocator_alloc_uninit(MemfsAllocator* allocator, size_t bytes) {
+    if (allocator == NULL || bytes == 0 ||
+        memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_GENERIC))
+        return NULL;
+    return allocator_alloc_internal(allocator, bytes, false);
 }
 
 void* memfs_allocator_alloc_zero(MemfsAllocator* allocator, size_t bytes) {
-    void* ptr = memfs_allocator_alloc(allocator, bytes);
-    if (ptr)
-        memset(ptr, 0, bytes);
-    return ptr;
+    if (allocator == NULL || bytes == 0 ||
+        memfs_allocator_test_should_fail(MEMFS_ALLOC_FAIL_GENERIC))
+        return NULL;
+    return allocator_alloc_internal(allocator, bytes, true);
 }
 
 void memfs_allocator_free(MemfsAllocator* allocator, void* ptr, size_t bytes) {
@@ -1109,7 +1124,7 @@ static bool control_allocator_ready(void) {
 void* memfs_allocator_alloc_control(size_t bytes) {
     if (bytes == 0 || !control_allocator_ready())
         return NULL;
-    return allocator_alloc_internal(&g_control_allocator, bytes);
+    return allocator_alloc_internal(&g_control_allocator, bytes, true);
 }
 
 void memfs_allocator_free_control(void* ptr, size_t bytes) {

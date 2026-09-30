@@ -118,6 +118,12 @@ void* memfs_allocator_alloc_name(MemfsAllocator* allocator, size_t bytes);
 void memfs_allocator_free_name(MemfsAllocator* allocator, void* ptr, size_t bytes);
 
 void* memfs_allocator_alloc(MemfsAllocator* allocator, size_t bytes);
+/*
+ * Fast path for storage that the caller will completely overwrite before any
+ * read. Unlike memfs_allocator_alloc()/alloc_zero(), contents are unspecified
+ * and may contain bytes from a previously freed object.
+ */
+void* memfs_allocator_alloc_uninit(MemfsAllocator* allocator, size_t bytes);
 void* memfs_allocator_alloc_zero(MemfsAllocator* allocator, size_t bytes);
 void* memfs_allocator_realloc(MemfsAllocator* allocator,
                               void* ptr,

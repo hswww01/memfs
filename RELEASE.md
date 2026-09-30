@@ -194,19 +194,19 @@ Allocator policy is:
 - core/storage code does not call VirtualAlloc directly;
 - VM primitives are isolated behind `memfs_vm`.
 
-The current size-class pool contains internal concurrency lanes. These are not separate
-node/name/generic pools; they partition slab ownership to avoid a single hot lock.
+The current size-class pool contains 16 internal concurrency lanes. These are not
+separate node/name/generic pools; they partition slab ownership to avoid a single hot
+lock, and empty slabs are still returned immediately to the VM backend.
 
-A/B measurements on this machine showed why the lanes remain for now. For 64-byte
-alloc/free at 16 threads:
+A three-run A/B benchmark against the previous 8-lane layout showed that at 16 threads
+64-byte alloc/free throughput improved by about 114% and 4 KiB throughput by about
+209%, with effectively flat single-thread performance. The cost is approximately
+12 KiB of additional allocator-state metadata per filesystem.
 
-- current internal lanes: about 18.8M ops/s
-- literal one-lock physical pool: about 3.1M ops/s
-- one-pool global SList experiment: about 4.9M ops/s
-
-The single-pool experiments were reverted rather than accepting a 4-7x concurrency
-regression. Future allocator work should target magazines/remote-free or a comparable
-scheme that preserves the one-size-class abstraction without paying that lock cost.
+The allocator also has an explicit uninitialized fast path for buffers that are
+completely overwritten before first read. Typed node/dir/page-group allocations and
+the normal zeroed APIs retain their zero-initialization contract. Reused slab and area
+blocks are covered by tests to ensure zeroed callers never observe stale data.
 
 ## Repeatable deployment verification
 
@@ -248,13 +248,13 @@ The harness verifies private service creation, MemfsC-owned driver filename/path
 
 Debug:
 
-- size: 3,312,128 bytes
-- SHA-256: `5A3D865CC15BB991ED74D2CB3E9AF8C2A58A4807029A36F2A917F71E15BBB88D`
+- size: 3,312,640 bytes
+- SHA-256: `E42D85B43C5FA9C88FB81DA549E5B88BBB27DCDBF0E9B5D53119A2B67C10B433`
 
 Release:
 
-- size: 1,321,472 bytes
-- SHA-256: `500E7CA771B121FB83DC39D008DDF0972B01020B2DFC6AE037819FE8ADEF22E5`
+- size: 1,318,912 bytes
+- SHA-256: `9C4B23AFED0F6F4038B2DAFE1B46BE88B7B16DCD0F24C8F847BFD10350113BE0`
 
 These hashes are verification artifacts for this local build, not permanent release
 identifiers.

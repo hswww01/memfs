@@ -14,6 +14,31 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 $privateDriverService = "WinFsp+MemfsC"
 $memfsService = "MemfsC"
 
+$nativeType = [System.Management.Automation.PSTypeName]'MemfsTest.NativeMethods'
+if ($null -eq $nativeType.Type) {
+    Add-Type -TypeDefinition @"
+using System.Text;
+using System.Runtime.InteropServices;
+namespace MemfsTest {
+    public static class NativeMethods {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint QueryDosDevice(
+            string lpDeviceName,
+            StringBuilder lpTargetPath,
+            int ucchMax);
+    }
+}
+"@
+}
+
+function Test-DosDeviceExists {
+    param([string]$Device)
+    $name = $Device.TrimEnd('\')
+    $buffer = [Text.StringBuilder]::new(4096)
+    return [MemfsTest.NativeMethods]::QueryDosDevice(
+        $name, $buffer, $buffer.Capacity) -ne 0
+}
+
 if (-not $Exe) {
     $Exe = Join-Path $repoRoot "build\x64-release\memfs.exe"
 }
@@ -84,7 +109,7 @@ function Get-FreeDrive {
         if ($Preferred -notmatch '^[A-Za-z]:$') {
             throw "-Drive must be a drive letter such as R:"
         }
-        if (-not (Test-Path "$Preferred\")) {
+        if (-not (Test-DosDeviceExists $Preferred)) {
             return $Preferred.ToUpperInvariant()
         }
         throw "Requested drive is already in use: $Preferred"
@@ -92,7 +117,7 @@ function Get-FreeDrive {
 
     foreach ($letter in @("R","W","V","U","T","S","Q","P","O","N","M")) {
         $candidate = "$letter" + ":"
-        if (-not (Test-Path "$candidate\")) {
+        if (-not (Test-DosDeviceExists $candidate)) {
             return $candidate
         }
     }
