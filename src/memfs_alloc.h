@@ -15,7 +15,13 @@ typedef struct MemfsAllocatorState MemfsAllocatorState;
 
 enum { MEMFS_ALLOC_CLASS_COUNT = 19 };
 enum { MEMFS_ALLOC_AREA_THRESHOLD = 8192 };
-enum { MEMFS_ALLOC_ALIGNMENT = 16 };
+/*
+ * Minimum alignment guaranteed for every non-NULL allocation returned to a
+ * caller. Size classes intentionally include 8- and 24-byte slots, so the
+ * public contract is 8 bytes; internal slab/area payload starts may use a
+ * stronger alignment without changing this guarantee.
+ */
+enum { MEMFS_ALLOC_MIN_ALIGNMENT = 8 };
 
 typedef enum MemfsAllocFailPoint {
     MEMFS_ALLOC_FAIL_NONE = 0,
@@ -71,6 +77,12 @@ typedef struct MemfsAllocator {
     volatile LONG64 scavenge_count;
 } MemfsAllocator;
 
+/*
+ * Allocator statistics are a lock-safe aggregate, not a globally atomic
+ * instant. Shards are sampled one at a time, so values can describe slightly
+ * different instants while allocation/free activity is concurrent. Quiescent
+ * callers can use the result as an exact baseline.
+ */
 typedef struct MemfsAllocatorStats {
     uint64_t reserved_bytes;
     uint64_t committed_bytes;
@@ -98,6 +110,7 @@ typedef struct MemfsAllocatorStats {
 bool memfs_allocator_test_class_layout(size_t bytes,
                                        size_t* class_bytes,
                                        size_t* slab_bytes);
+size_t memfs_allocator_test_class_size(uint32_t class_index);
 void* memfs_allocator_test_alloc_from_shard(MemfsAllocator* allocator,
                                             size_t bytes,
                                             uint32_t shard_index);
@@ -136,6 +149,10 @@ void* memfs_allocator_realloc(MemfsAllocator* allocator,
                               size_t new_bytes);
 void memfs_allocator_free(MemfsAllocator* allocator, void* ptr, size_t bytes);
 
+/*
+ * See MemfsAllocatorStats above: concurrent results are approximate aggregates;
+ * call while quiescent when exact cross-field relationships are required.
+ */
 void memfs_allocator_get_stats(MemfsAllocator* allocator, MemfsAllocatorStats* stats);
 uint64_t memfs_allocator_scavenge(MemfsAllocator* allocator);
 

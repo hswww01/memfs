@@ -80,6 +80,12 @@ typedef struct MemfsOptions {
 #define MEMFS_AUTO_HARD_MARGIN_BYTES (256ULL * 1024ULL * 1024ULL)
 #define MEMFS_AUTO_SOFT_MARGIN_BYTES (512ULL * 1024ULL * 1024ULL)
 
+/*
+ * Runtime statistics are a lock-safe aggregate, not a globally atomic instant.
+ * Individual allocator shards and scalar counters are sampled sequentially.
+ * Under concurrent I/O/allocation, cross-field relationships are therefore
+ * approximate; collect while quiescent when an exact baseline is required.
+ */
 typedef struct MemfsRuntimeStats {
 	uint64_t logical_used_bytes;
 	uint64_t resident_bytes;
@@ -273,6 +279,7 @@ uint64_t memfs_node_resident_bytes(const MemfsNode* node);
 // not resident payload; use it for capacity policy that needs real backing.
 uint64_t memfs_committed_bytes(Memfs* fs);
 uint64_t memfs_physical_bytes(Memfs* fs);
+// Concurrent snapshot semantics are documented on MemfsRuntimeStats above.
 void memfs_get_runtime_stats(Memfs* fs, MemfsRuntimeStats* stats);
 
 #if !defined(NDEBUG)

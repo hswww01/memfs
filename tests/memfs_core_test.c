@@ -3114,6 +3114,67 @@ static void test_allocator_name_pool_boundaries(void) {
 }
 
 
+#if !defined(NDEBUG)
+static void test_allocator_alignment_contract(void) {
+	enum { ALLOCS_PER_CLASS = 4 };
+	MemfsAllocator allocator;
+	void* blocks[ALLOCS_PER_CLASS] = {0};
+	void* area = NULL;
+	uint32_t class_index;
+	uint32_t i;
+	size_t class_size;
+
+	printf("== allocator alignment contract ==\n");
+	memset(&allocator, 0, sizeof(allocator));
+
+	CHECK(MEMFS_ALLOC_MIN_ALIGNMENT == 8U);
+	CHECK((MEMFS_ALLOC_MIN_ALIGNMENT &
+		   (MEMFS_ALLOC_MIN_ALIGNMENT - 1U)) == 0U);
+	CHECK(memfs_allocator_init(&allocator, 128U, 128U, 1024U));
+	if (allocator.state == NULL)
+		return;
+
+	for (class_index = 0;
+		 class_index < MEMFS_ALLOC_CLASS_COUNT;
+		 ++class_index) {
+		class_size = memfs_allocator_test_class_size(class_index);
+		CHECK(class_size != 0U);
+		CHECK((class_size % MEMFS_ALLOC_MIN_ALIGNMENT) == 0U);
+
+		for (i = 0; i < ALLOCS_PER_CLASS; ++i) {
+			blocks[i] = memfs_allocator_alloc(&allocator, class_size);
+			CHECK(blocks[i] != NULL);
+			if (blocks[i] != NULL) {
+				CHECK(((uintptr_t)blocks[i] &
+					   (MEMFS_ALLOC_MIN_ALIGNMENT - 1U)) == 0U);
+			}
+		}
+
+		for (i = 0; i < ALLOCS_PER_CLASS; ++i) {
+			if (blocks[i] != NULL) {
+				memfs_allocator_free(&allocator, blocks[i], class_size);
+				blocks[i] = NULL;
+			}
+		}
+	}
+
+	CHECK(memfs_allocator_test_class_size(MEMFS_ALLOC_CLASS_COUNT) == 0U);
+
+	area = memfs_allocator_alloc(
+		&allocator, (size_t)MEMFS_ALLOC_AREA_THRESHOLD + 1U);
+	CHECK(area != NULL);
+	if (area != NULL) {
+		CHECK(((uintptr_t)area &
+			   (MEMFS_ALLOC_MIN_ALIGNMENT - 1U)) == 0U);
+		memfs_allocator_free(
+			&allocator, area, (size_t)MEMFS_ALLOC_AREA_THRESHOLD + 1U);
+	}
+
+	memfs_allocator_destroy(&allocator);
+}
+#endif
+
+
 static void test_allocator_generic_size_classes(void) {
 	MemfsAllocator allocator;
 	MemfsAllocatorStats before;
@@ -4239,7 +4300,7 @@ static void test_raw_page_compact_representation(void) {
 								   &allocation_address));
 		CHECK(is_raw);
 		CHECK(heap_bytes == MEMFS_PAGE_SIZE);
-		CHECK((allocation_address & (MEMFS_ALLOC_ALIGNMENT - 1U)) == 0);
+		CHECK((allocation_address & (MEMFS_ALLOC_MIN_ALIGNMENT - 1U)) == 0);
 	}
 
 	/* Existing raw pages stay on the in-place overwrite fast path. */
@@ -4572,6 +4633,7 @@ int main(void) {
 	test_allocator_bootstrap_control();
 #if !defined(NDEBUG)
 	test_allocator_failure_injection_primitives();
+	test_allocator_alignment_contract();
 	test_raw_page_compact_representation();
 	test_failure_injection_transaction_rollback();
 #endif

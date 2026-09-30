@@ -245,11 +245,13 @@ The allocator v2 backend is size-class based rather than object-type based. Node
 
 The process-wide control allocation used for `Memfs` itself goes through the same size-class/slab/area machinery; only allocator-state bootstrap reaches the VM backend directly. Small allocations use adaptive slab backing (4 KiB / 8 KiB / 16 KiB / 32 KiB / 64 KiB according to object size); allocations above the small-object threshold use area allocations. `reserved_bytes` is address-space reservation only; `committed_bytes` is the real OS-backed committed memory, and `physical_bytes` is an alias for `committed_bytes`, not a separate source. `live_bytes` is the caller-visible payload/object bytes currently allocated.
 
+The allocator's public pointer-alignment contract is **at least 8 bytes** for every non-NULL returned allocation. This is intentional: the small-object table includes 8-byte and 24-byte classes to avoid wasting space, so promising 16-byte alignment for every slot would be false unless those classes were padded. Internally the first slab payload and area payload header are aligned more strongly (currently 16 bytes), but callers must rely only on the 8-byte minimum unless a specific API documents more.
+
 Zero-initialized typed allocations (`node`, `dir`, `page_group`) keep their existing safety contract. A separate `memfs_allocator_alloc_uninit()` fast path is used only where the caller immediately overwrites the complete requested payload (encoded page blobs, copied security descriptors, temporary path buffers and copied names). This avoids redundant memset traffic without exposing stale bytes to code that expects zero-filled objects. The allocator contention benchmark reports both `zero` and `uninit` modes.
 
 `capacity_auto=true` makes memfs derive its writable allowance from current system memory and allocator backing instead of using a fixed user capacity. `memfs_auto_allowance_bytes()` reports the current allowance, while `used_bytes`, `resident_bytes`, `committed_bytes` and `physical_bytes` remain separate measurements: logical quota, resident payload, and allocator physical backing. The benchmark reports these separately so high-water checks do not confuse allocator backing with logical file usage.
 
-Runtime diagnostics are opt-in and do not start a sampling thread. `memfs_get_runtime_stats()` returns a point-in-time `MemfsRuntimeStats` snapshot containing logical used/free bytes, resident bytes, allocator live/reserved/committed/physical bytes, slab/area/cache counts, scavenger totals, and the current auto-capacity allowance plus its 256 MiB hard and 512 MiB soft pressure margins.
+Runtime diagnostics are opt-in and do not start a sampling thread. `memfs_get_runtime_stats()` returns a **lock-safe approximate aggregate** containing logical used/free bytes, resident bytes, allocator live/reserved/committed/physical bytes, slab/area/cache counts, scavenger totals, and the current auto-capacity allowance plus its 256 MiB hard and 512 MiB soft pressure margins. Allocator shards and scalar counters are sampled sequentially, so under concurrent I/O/allocation the fields can represent slightly different instants; collect stats while the filesystem is quiescent when an exact baseline or exact cross-field equality is required.
 
 For interactive diagnostics:
 
@@ -258,7 +260,7 @@ For interactive diagnostics:
 .\build\x64-release\memfs.exe --mount R: --size auto --stats-json
 ```
 
-`--stats` prints a stable `key=value` snapshot after mount and immediately before shutdown. `--stats-json` suppresses the normal mount banner and emits one JSON object per snapshot with `type=memfs_stats` and `phase=mounted|stopping`, making redirected stdout suitable for machine parsing. The API is also available to service/control-plane code without enabling any background sampler.
+`--stats` prints a stable **format** of `key=value` fields after mount and immediately before shutdown. `--stats-json` suppresses the normal mount banner and emits one JSON object per sample with `type=memfs_stats` and `phase=mounted|stopping`, making redirected stdout suitable for machine parsing. The values follow the same approximate-concurrent semantics described above; the stopping sample is normally quiescent and therefore suitable as an exact cleanup baseline. The API is also available to service/control-plane code without enabling any background sampler.
 
 ### Sparse paged files
 

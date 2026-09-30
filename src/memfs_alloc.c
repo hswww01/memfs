@@ -18,6 +18,8 @@
 #define MEMFS_MIN_SLAB_BYTES (4U * 1024U)
 #define MEMFS_MAX_SLAB_BYTES (64U * 1024U)
 #define MEMFS_POOL_SHARD_COUNT 16U
+/* Stronger internal payload-base alignment; not a public return guarantee. */
+#define MEMFS_ALLOC_INTERNAL_ALIGNMENT 16U
 
 _Static_assert((MEMFS_POOL_SHARD_COUNT & (MEMFS_POOL_SHARD_COUNT - 1U)) == 0,
                "pool shard count must be a power of two");
@@ -212,6 +214,12 @@ bool memfs_allocator_test_class_layout(size_t bytes,
         *slab_bytes = slab_bytes_for_object(g_class_sizes[index]);
     return true;
 }
+
+size_t memfs_allocator_test_class_size(uint32_t class_index_value) {
+    if (class_index_value >= MEMFS_ALLOC_CLASS_COUNT)
+        return 0;
+    return g_class_sizes[class_index_value];
+}
 #endif
 
 static uint32_t pool_shard_index(void) {
@@ -304,7 +312,7 @@ static void all_remove(MemfsPoolShard* shard, MemfsSlab* slab) {
 }
 
 static MemfsSlab* slab_create(MemfsPool* pool, MemfsPoolShard* shard) {
-    const size_t data_offset = align_up(sizeof(MemfsSlab), MEMFS_ALLOC_ALIGNMENT);
+    const size_t data_offset = align_up(sizeof(MemfsSlab), MEMFS_ALLOC_INTERNAL_ALIGNMENT);
     MemfsSlab* slab;
     uint8_t* data;
     uint32_t capacity;
@@ -678,7 +686,7 @@ static void pool_add_stats(MemfsPool* pool, MemfsAllocatorStats* stats) {
 }
 
 static size_t area_header_size(void) {
-    return align_up(sizeof(MemfsAreaBlock), MEMFS_ALLOC_ALIGNMENT);
+    return align_up(sizeof(MemfsAreaBlock), MEMFS_ALLOC_INTERNAL_ALIGNMENT);
 }
 
 static void area_list_insert(MemfsAreaBlock** head, MemfsAreaBlock* block) {

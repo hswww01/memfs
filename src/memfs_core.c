@@ -291,8 +291,8 @@ static void memfs_security_release(MemfsSecurity* security);
 
 #define MEMFS_PAGE_RAW_TAG ((uintptr_t)1U)
 #define MEMFS_PAGE_RAW_TAG_MASK ((uintptr_t)1U)
-_Static_assert((MEMFS_ALLOC_ALIGNMENT & MEMFS_PAGE_RAW_TAG_MASK) == 0,
-			   "raw-page pointer tag requires allocator alignment to keep bit 0 clear");
+_Static_assert((MEMFS_ALLOC_MIN_ALIGNMENT & MEMFS_PAGE_RAW_TAG_MASK) == 0,
+			   "raw-page pointer tag requires allocator minimum alignment to keep bit 0 clear");
 
 static bool memfs_page_is_raw(const MemfsPage* page) {
 	return page != NULL &&
