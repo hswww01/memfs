@@ -4011,10 +4011,17 @@ static void test_path_name_boundaries(void) {
 	for (i = 0; i < MEMFS_MAX_NAME + 1U; i++)
 		too_long[i] = L'B';
 	too_long[MEMFS_MAX_NAME + 1U] = L'\0';
-	CHECK(memfs_node_create(fs, fs->root, too_long, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) == MEMFS_OK);
-	CHECK(node != NULL);
-	CHECK(memfs_node_unlink(node) == MEMFS_OK);
-	memfs_node_close(node);
+	node = NULL;
+	CHECK(memfs_node_create(fs, fs->root, too_long, false,
+							FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) == MEMFS_ERR_INVALID);
+	CHECK(node == NULL);
+	CHECK(memfs_dir_lookup(fs->root, too_long) == NULL);
+	CHECK(memfs_node_create(fs, fs->root, L"bad\\name", false,
+							FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) == MEMFS_ERR_INVALID);
+	CHECK(memfs_node_create(fs, fs->root, L"bad/name", false,
+							FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) == MEMFS_ERR_INVALID);
+	CHECK(memfs_node_rename(file, dir, too_long, false) == MEMFS_ERR_INVALID);
+	CHECK(memfs_dir_lookup(dir, L"file.txt") == file);
 	path[0] = L'\\';
 	memcpy(path + 1, too_long, (MEMFS_MAX_NAME + 1U) * sizeof(wchar_t));
 	path[MEMFS_MAX_NAME + 2U] = L'\0';
@@ -4059,6 +4066,47 @@ static void test_path_name_boundaries(void) {
 	CHECK(memfs_node_unlink(dir) == MEMFS_OK);
 	memfs_node_close(dir);
 	memfs_destroy(fs);
+}
+
+static void test_cross_filesystem_namespace_rejected(void) {
+	Memfs* left = NULL;
+	Memfs* right = NULL;
+	MemfsNode* file = NULL;
+	MemfsNode* created = NULL;
+
+	printf("== cross-filesystem namespace rejected ==\n");
+
+	CHECK(memfs_create(8 * 1024 * 1024ULL, L"LEFT", &left) == MEMFS_OK);
+	CHECK(memfs_create(8 * 1024 * 1024ULL, L"RIGHT", &right) == MEMFS_OK);
+	CHECK(left != NULL);
+	CHECK(right != NULL);
+	if (left == NULL || right == NULL)
+		goto cleanup;
+
+	CHECK(memfs_node_create(left, left->root, L"owned.txt", false,
+							FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(file != NULL);
+	if (file == NULL)
+		goto cleanup;
+
+	CHECK(memfs_node_create(left, right->root, L"wrong.txt", false,
+							FILE_ATTRIBUTE_NORMAL, NULL, 0, &created) == MEMFS_ERR_INVALID);
+	CHECK(created == NULL);
+	CHECK(memfs_dir_lookup(right->root, L"wrong.txt") == NULL);
+
+	CHECK(memfs_node_rename(file, right->root, L"moved.txt", false) == MEMFS_ERR_INVALID);
+	CHECK(memfs_dir_lookup(left->root, L"owned.txt") == file);
+	CHECK(memfs_dir_lookup(right->root, L"moved.txt") == NULL);
+
+	CHECK(memfs_node_unlink(file) == MEMFS_OK);
+	memfs_node_close(file);
+	file = NULL;
+
+cleanup:
+	if (left != NULL)
+		memfs_destroy(left);
+	if (right != NULL)
+		memfs_destroy(right);
 }
 
 static void test_constrained_io_eof_bounds(void) {
@@ -4583,6 +4631,7 @@ int main(void) {
 	test_winfsp_open_delete_recreate_close_order();
 	test_constrained_io_eof_bounds();
 	test_path_name_boundaries();
+	test_cross_filesystem_namespace_rejected();
 
 
 	printf("\nchecks=%d failures=%d => %s\n", g_checks, g_failures, g_failures ? "FAIL" : "PASS");

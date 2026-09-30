@@ -3025,6 +3025,27 @@ MemfsResult memfs_lookup_parent(Memfs* fs, const wchar_t* path, MemfsNode** out_
 	return MEMFS_OK;
 }
 
+static bool memfs_component_name_valid(const wchar_t* name) {
+	size_t length = 0;
+
+	if (name == NULL || *name == L'\0')
+		return false;
+
+	while (name[length] != L'\0') {
+		if (length >= MEMFS_MAX_NAME)
+			return false;
+		if (name[length] == L'\\' || name[length] == L'/')
+			return false;
+		length++;
+	}
+
+	if ((length == 1U && name[0] == L'.') ||
+		(length == 2U && name[0] == L'.' && name[1] == L'.'))
+		return false;
+
+	return true;
+}
+
 MemfsResult memfs_node_create(Memfs* fs, MemfsNode* parent, const wchar_t* name, bool directory, uint32_t attributes,
 							  PSECURITY_DESCRIPTOR security, uint64_t allocation_size, MemfsNode** out_node) {
 	MemfsNode* node;
@@ -3033,7 +3054,8 @@ MemfsResult memfs_node_create(Memfs* fs, MemfsNode* parent, const wchar_t* name,
 	if (out_node != NULL)
 		*out_node = NULL;
 
-	if (fs == NULL || !MEMFS_NODE_IS_DIRECTORY(parent) || name == NULL || *name == L'\0' || out_node == NULL) {
+	if (fs == NULL || !MEMFS_NODE_IS_DIRECTORY(parent) || out_node == NULL ||
+		parent->fs != fs || parent->deleted || !memfs_component_name_valid(name)) {
 		return MEMFS_ERR_INVALID;
 	}
 
@@ -3119,7 +3141,9 @@ MemfsResult memfs_node_rename(MemfsNode* node, MemfsNode* new_parent, const wcha
 	MemfsNode* old_parent;
 	wchar_t* new_name_copy;
 
-	if (node == NULL || !MEMFS_NODE_IS_DIRECTORY(new_parent) || new_name == NULL || *new_name == L'\0') {
+	if (node == NULL || node->fs == NULL || !MEMFS_NODE_IS_DIRECTORY(new_parent) ||
+		new_parent->fs != node->fs || node->deleted || new_parent->deleted ||
+		!memfs_component_name_valid(new_name)) {
 		return MEMFS_ERR_INVALID;
 	}
 	if (node == node->fs->root)

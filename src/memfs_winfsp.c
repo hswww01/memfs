@@ -498,25 +498,30 @@ static NTSTATUS fs_GetDirInfoByName(FSP_FILE_SYSTEM* file_system, PVOID file_con
 	MemfsWinFsp* instance = memfs_instance(file_system);
 	MemfsNode* dir = file_context;
 	MemfsNode* node;
+	const wchar_t* output_name;
 	size_t name_chars;
 	size_t name_bytes;
 
 	if (!memfs_node_is_directory(dir))
 		return STATUS_NOT_A_DIRECTORY;
 
-	if (wcscmp(file_name, L".") == 0)
+	if (wcscmp(file_name, L".") == 0) {
 		node = dir;
-	else if (wcscmp(file_name, L"..") == 0)
+		output_name = file_name;
+	} else if (wcscmp(file_name, L"..") == 0) {
 		node = dir->parent ? dir->parent : dir;
-	else
+		output_name = file_name;
+	} else {
 		node = memfs_dir_lookup(dir, file_name);
+		output_name = node ? node->name : NULL;
+	}
 
 	if (node == NULL)
 		return STATUS_OBJECT_NAME_NOT_FOUND;
 
 	(void)instance;
 
-	name_chars = wcslen(file_name);
+	name_chars = wcslen(output_name);
 	if (name_chars > MEMFS_MAX_NAME)
 		return STATUS_OBJECT_NAME_INVALID;
 
@@ -526,7 +531,7 @@ static NTSTATUS fs_GetDirInfoByName(FSP_FILE_SYSTEM* file_system, PVOID file_con
 	memfs_fill_file_info(node, &dir_info->FileInfo);
 
 	if (name_bytes)
-		memcpy(dir_info->FileNameBuf, file_name, name_bytes);
+		memcpy(dir_info->FileNameBuf, output_name, name_bytes);
 
 	return STATUS_SUCCESS;
 }
