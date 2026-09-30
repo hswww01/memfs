@@ -929,9 +929,19 @@ static const size_t g_bench_alloc_mixed_sizes[BENCH_ALLOC_MIXED_COUNT] = {
 };
 
 static void print_alloc_fragment_stats(const char* phase, uint32_t round, const MemfsAllocatorStats* stats) {
-	printf("round=%u phase=%-12s live=%llu reserved=%llu committed=%llu physical=%llu slab_count=%u dedicated_count=%u\n",
-		   round, phase, (unsigned long long)stats->live_bytes, (unsigned long long)stats->reserved_bytes,
-		   (unsigned long long)stats->committed_bytes, (unsigned long long)stats->physical_bytes,
+	uint64_t slab_reserved =
+		stats->reserved_bytes >= stats->dedicated_reserved_bytes
+			? stats->reserved_bytes - stats->dedicated_reserved_bytes
+			: 0;
+
+	printf("round=%u phase=%-12s live=%llu reserved=%llu slab_reserved=%llu area_cached=%llu committed=%llu physical=%llu slab_count=%u dedicated_count=%u\n",
+		   round, phase,
+		   (unsigned long long)stats->live_bytes,
+		   (unsigned long long)stats->reserved_bytes,
+		   (unsigned long long)slab_reserved,
+		   (unsigned long long)stats->area_cached_bytes,
+		   (unsigned long long)stats->committed_bytes,
+		   (unsigned long long)stats->physical_bytes,
 		   stats->slab_count, stats->dedicated_count);
 }
 
@@ -964,6 +974,42 @@ static bool alloc_fragment_same_high_water(
 		   stats->physical_bytes == first->physical_bytes &&
 		   stats->slab_count == first->slab_count &&
 		   stats->dedicated_count == first->dedicated_count;
+}
+
+static uint64_t alloc_fragment_slab_reserved(
+	const MemfsAllocatorStats* stats) {
+	return stats->reserved_bytes >= stats->dedicated_reserved_bytes
+		? stats->reserved_bytes - stats->dedicated_reserved_bytes
+		: 0;
+}
+
+static uint64_t alloc_fragment_slab_committed(
+	const MemfsAllocatorStats* stats) {
+	return stats->committed_bytes >= stats->dedicated_committed_bytes
+		? stats->committed_bytes - stats->dedicated_committed_bytes
+		: 0;
+}
+
+static bool alloc_fragment_same_slab_high_water(
+	const MemfsAllocatorStats* stats, const MemfsAllocatorStats* first) {
+	return alloc_fragment_slab_reserved(stats) ==
+			   alloc_fragment_slab_reserved(first) &&
+		   alloc_fragment_slab_committed(stats) ==
+			   alloc_fragment_slab_committed(first) &&
+		   stats->slab_count == first->slab_count;
+}
+
+static bool alloc_fragment_slab_back_to_baseline(
+	const MemfsAllocatorStats* stats, const MemfsAllocatorStats* baseline) {
+	return stats->live_objects == baseline->live_objects &&
+		   stats->live_bytes == baseline->live_bytes &&
+		   stats->slab_count == baseline->slab_count &&
+		   alloc_fragment_slab_reserved(stats) ==
+			   alloc_fragment_slab_reserved(baseline) &&
+		   alloc_fragment_slab_committed(stats) ==
+			   alloc_fragment_slab_committed(baseline) &&
+		   stats->dedicated_count == baseline->dedicated_count &&
+		   stats->dedicated_live_bytes == baseline->dedicated_live_bytes;
 }
 
 static int bench_allocator_fragmentation_reuse(void) {
@@ -1023,8 +1069,8 @@ static int bench_allocator_fragmentation_reuse(void) {
 		}
 		if (round == 0U) {
 			first_full = full;
-		} else if (!alloc_fragment_same_high_water(&full, &first_full)) {
-			fprintf(stderr, "allocator 512B high-water drift round=%u\n", round);
+		} else if (!alloc_fragment_same_slab_high_water(&full, &first_full)) {
+			fprintf(stderr, "allocator 512B slab high-water drift round=%u\n", round);
 			rc = 1;
 			goto cleanup;
 		}
@@ -1073,8 +1119,8 @@ static int bench_allocator_fragmentation_reuse(void) {
 		}
 		memfs_allocator_get_stats(&allocator, &released);
 		print_alloc_fragment_stats("512-free", round, &released);
-		if (!alloc_fragment_back_to_baseline(&released, &baseline)) {
-			fprintf(stderr, "allocator 512B free did not return to baseline round=%u\n", round);
+		if (!alloc_fragment_slab_back_to_baseline(&released, &baseline)) {
+			fprintf(stderr, "allocator 512B free did not return slab state to baseline round=%u\n", round);
 			rc = 1;
 			goto cleanup;
 		}

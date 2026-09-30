@@ -50,6 +50,7 @@ struct MemfsPool {
     MemfsAllocatorState* state;
     size_t object_size;
     size_t slab_bytes;
+    volatile LONG available_shard_mask;
     MemfsPoolShard shards[MEMFS_POOL_SHARD_COUNT];
 };
 
@@ -228,19 +229,40 @@ static uint32_t pool_shard_index(void) {
     return value & (MEMFS_POOL_SHARD_COUNT - 1U);
 }
 
-static MemfsPoolShard* pool_current_shard(MemfsPool* pool) {
-    return &pool->shards[pool_shard_index()];
-}
-
 static void available_insert(MemfsPoolShard* shard, MemfsSlab* slab) {
+    bool was_empty;
+    uint32_t shard_index;
+
+    if (shard == NULL || slab == NULL || slab->owner == NULL)
+        return;
+
+    was_empty = shard->available == NULL;
     slab->available_prev = NULL;
     slab->available_next = shard->available;
     if (shard->available)
         shard->available->available_prev = slab;
     shard->available = slab;
+
+    if (was_empty) {
+        shard_index = (uint32_t)(shard - slab->owner->shards);
+        InterlockedOr(&slab->owner->available_shard_mask,
+                      (LONG)(1U << shard_index));
+    }
 }
 
 static void available_remove(MemfsPoolShard* shard, MemfsSlab* slab) {
+    bool linked;
+    uint32_t shard_index;
+
+    if (shard == NULL || slab == NULL || slab->owner == NULL)
+        return;
+
+    linked = slab->available_prev != NULL ||
+             slab->available_next != NULL ||
+             shard->available == slab;
+    if (!linked)
+        return;
+
     if (slab->available_prev)
         slab->available_prev->available_next = slab->available_next;
     else if (shard->available == slab)
@@ -251,6 +273,12 @@ static void available_remove(MemfsPoolShard* shard, MemfsSlab* slab) {
 
     slab->available_prev = NULL;
     slab->available_next = NULL;
+
+    if (shard->available == NULL) {
+        shard_index = (uint32_t)(shard - slab->owner->shards);
+        InterlockedAnd(&slab->owner->available_shard_mask,
+                       (LONG)~(1U << shard_index));
+    }
 }
 
 static void all_insert(MemfsPoolShard* shard, MemfsSlab* slab) {
@@ -336,24 +364,25 @@ static MemfsSlab* slab_from_object(MemfsAllocatorState* state, void* ptr) {
     return (MemfsSlab*)(address & ~(granularity - 1U));
 }
 
-static void* pool_alloc(MemfsPool* pool, size_t requested_bytes, bool zero_memory) {
-    MemfsPoolShard* shard;
+static MemfsFreeObject* pool_take_available_locked(
+    MemfsPool* pool,
+    MemfsPoolShard* shard,
+    size_t requested_bytes) {
     MemfsSlab* slab;
     MemfsFreeObject* object;
 
-    if (pool == NULL || requested_bytes == 0 || requested_bytes > pool->object_size)
+    if (pool == NULL || shard == NULL)
         return NULL;
 
-    shard = pool_current_shard(pool);
-    AcquireSRWLockExclusive(&shard->lock);
-
     slab = shard->available;
-    if (slab == NULL) {
-        slab = slab_create(pool, shard);
-        if (slab == NULL) {
-            ReleaseSRWLockExclusive(&shard->lock);
-            return NULL;
-        }
+    if (slab == NULL)
+        return NULL;
+    if (slab->magic != MEMFS_SLAB_MAGIC ||
+        slab->owner != pool ||
+        slab->shard != shard ||
+        slab->free_list == NULL ||
+        slab->free_count == 0) {
+        return NULL;
     }
 
     object = slab->free_list;
@@ -365,11 +394,100 @@ static void* pool_alloc(MemfsPool* pool, size_t requested_bytes, bool zero_memor
     if (slab->free_count == 0)
         available_remove(shard, slab);
 
+    return object;
+}
+
+static void* pool_alloc_from_home(MemfsPool* pool,
+                                  size_t requested_bytes,
+                                  bool zero_memory,
+                                  uint32_t home_index) {
+    uint32_t offset;
+    LONG available_mask;
+    MemfsPoolShard* shard;
+    MemfsSlab* slab;
+    MemfsFreeObject* object = NULL;
+
+    if (pool == NULL || requested_bytes == 0 ||
+        requested_bytes > pool->object_size ||
+        home_index >= MEMFS_POOL_SHARD_COUNT) {
+        return NULL;
+    }
+
+    shard = &pool->shards[home_index];
+
+    /*
+     * Fast path: stay on the current thread's shard while it has capacity.
+     * This preserves the low-contention lane behavior for the normal case.
+     */
+    AcquireSRWLockExclusive(&shard->lock);
+    object = pool_take_available_locked(pool, shard, requested_bytes);
     ReleaseSRWLockExclusive(&shard->lock);
+
+    /*
+     * Slow path: before committing another slab, reuse free capacity already
+     * present in another lane of the same logical size-class pool. We hold at
+     * most one shard lock at a time, so this cannot introduce lock cycles.
+     * A VM allocation is far more expensive than these bounded 15 probes.
+     */
+    if (object == NULL) {
+        available_mask = InterlockedCompareExchange(
+            &pool->available_shard_mask, 0, 0);
+        available_mask &= (LONG)~(1U << home_index);
+
+        if (available_mask != 0) {
+            for (offset = 1U; offset < MEMFS_POOL_SHARD_COUNT; ++offset) {
+                uint32_t index =
+                    (home_index + offset) & (MEMFS_POOL_SHARD_COUNT - 1U);
+                LONG bit = (LONG)(1U << index);
+                MemfsPoolShard* donor;
+
+                if ((available_mask & bit) == 0)
+                    continue;
+
+                donor = &pool->shards[index];
+                AcquireSRWLockExclusive(&donor->lock);
+                object = pool_take_available_locked(
+                    pool, donor, requested_bytes);
+                ReleaseSRWLockExclusive(&donor->lock);
+
+                if (object != NULL)
+                    break;
+            }
+        }
+    }
+
+    /*
+     * No reusable object exists anywhere. Recheck the home shard after the
+     * scan because a concurrent free may have arrived, then grow only there.
+     */
+    if (object == NULL) {
+        shard = &pool->shards[home_index];
+        AcquireSRWLockExclusive(&shard->lock);
+
+        object = pool_take_available_locked(pool, shard, requested_bytes);
+        if (object == NULL) {
+            slab = slab_create(pool, shard);
+            if (slab != NULL)
+                object = pool_take_available_locked(
+                    pool, shard, requested_bytes);
+        }
+
+        ReleaseSRWLockExclusive(&shard->lock);
+    }
+
+    if (object == NULL)
+        return NULL;
 
     if (zero_memory)
         memset(object, 0, requested_bytes);
     return object;
+}
+
+static void* pool_alloc(MemfsPool* pool,
+                        size_t requested_bytes,
+                        bool zero_memory) {
+    return pool_alloc_from_home(
+        pool, requested_bytes, zero_memory, pool_shard_index());
 }
 
 static void pool_adjust_live_bytes(
@@ -534,6 +652,7 @@ static void pool_destroy(MemfsPool* pool) {
 
         ReleaseSRWLockExclusive(&shard->lock);
     }
+    InterlockedExchange(&pool->available_shard_mask, 0);
 }
 
 static void pool_add_stats(MemfsPool* pool, MemfsAllocatorStats* stats) {
@@ -1051,6 +1170,30 @@ void* memfs_allocator_realloc(MemfsAllocator* allocator,
     memfs_allocator_free(allocator, ptr, old_bytes);
     return next;
 }
+
+#if !defined(NDEBUG)
+void* memfs_allocator_test_alloc_from_shard(MemfsAllocator* allocator,
+                                            size_t bytes,
+                                            uint32_t shard_index) {
+    int index;
+
+    if (allocator == NULL || allocator->state == NULL ||
+        shard_index >= MEMFS_POOL_SHARD_COUNT) {
+        return NULL;
+    }
+
+    index = class_index(bytes);
+    if (index < 0)
+        return NULL;
+
+    return pool_alloc_from_home(
+        &allocator->state->pools[index], bytes, false, shard_index);
+}
+
+uint32_t memfs_allocator_test_shard_count(void) {
+    return MEMFS_POOL_SHARD_COUNT;
+}
+#endif
 
 void memfs_allocator_get_stats(MemfsAllocator* allocator, MemfsAllocatorStats* stats) {
     MemfsAllocatorState* state;

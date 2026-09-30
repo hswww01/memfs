@@ -3019,6 +3019,99 @@ static DWORD WINAPI allocator_generic_thread(void* parameter) {
 	return 0;
 }
 
+#if !defined(NDEBUG)
+static void test_allocator_cross_shard_reuse(void) {
+	enum { OBJECTS = 96, REFILL = OBJECTS / 2 };
+	MemfsAllocator allocator;
+	MemfsAllocatorStats baseline;
+	MemfsAllocatorStats full;
+	MemfsAllocatorStats partial;
+	MemfsAllocatorStats refilled;
+	MemfsAllocatorStats after;
+	void* blocks[OBJECTS] = {0};
+	void* refill[REFILL] = {0};
+	uint32_t i;
+
+	printf("== allocator cross-shard reuse ==\n");
+	memset(&allocator, 0, sizeof(allocator));
+	CHECK(memfs_allocator_test_shard_count() >= 2U);
+	CHECK(memfs_allocator_init(&allocator, 64U, 64U, 64U));
+	if (allocator.state == NULL)
+		return;
+
+	memfs_allocator_get_stats(&allocator, &baseline);
+
+	/* Fill several 512B slabs from shard 0. */
+	for (i = 0; i < OBJECTS; ++i) {
+		blocks[i] = memfs_allocator_test_alloc_from_shard(
+			&allocator, 512U, 0U);
+		CHECK(blocks[i] != NULL);
+		if (blocks[i] == NULL)
+			goto cleanup;
+		memset(blocks[i], (int)(0x20U + (i & 0x3fU)), 16U);
+	}
+
+	memfs_allocator_get_stats(&allocator, &full);
+	CHECK(full.slab_count >= 3U);
+
+	/*
+	 * Leave every slab partially free. No slab should become completely idle,
+	 * so this is exactly the capacity that used to be stranded in shard 0.
+	 */
+	for (i = 0; i < OBJECTS; i += 2U) {
+		memfs_allocator_free(&allocator, blocks[i], 512U);
+		blocks[i] = NULL;
+	}
+	memfs_allocator_get_stats(&allocator, &partial);
+	CHECK(partial.slab_count == full.slab_count);
+	CHECK(partial.reserved_bytes == full.reserved_bytes);
+	CHECK(partial.committed_bytes == full.committed_bytes);
+
+	/*
+	 * Force a different home shard. The allocator must consume shard 0's free
+	 * objects before committing any additional slab.
+	 */
+	for (i = 0; i < REFILL; ++i) {
+		refill[i] = memfs_allocator_test_alloc_from_shard(
+			&allocator, 512U, 1U);
+		CHECK(refill[i] != NULL);
+		if (refill[i] == NULL)
+			goto cleanup;
+		memset(refill[i], (int)(0x80U + (i & 0x3fU)), 16U);
+	}
+
+	memfs_allocator_get_stats(&allocator, &refilled);
+	CHECK(refilled.slab_count == full.slab_count);
+	CHECK(refilled.reserved_bytes == full.reserved_bytes);
+	CHECK(refilled.committed_bytes == full.committed_bytes);
+	CHECK(refilled.live_objects == full.live_objects);
+	CHECK(refilled.live_bytes == full.live_bytes);
+
+cleanup:
+	for (i = 0; i < OBJECTS; ++i) {
+		if (blocks[i] != NULL) {
+			memfs_allocator_free(&allocator, blocks[i], 512U);
+			blocks[i] = NULL;
+		}
+	}
+	for (i = 0; i < REFILL; ++i) {
+		if (refill[i] != NULL) {
+			memfs_allocator_free(&allocator, refill[i], 512U);
+			refill[i] = NULL;
+		}
+	}
+
+	(void)memfs_allocator_scavenge(&allocator);
+	memfs_allocator_get_stats(&allocator, &after);
+	CHECK(after.live_objects == baseline.live_objects);
+	CHECK(after.live_bytes == baseline.live_bytes);
+	CHECK(after.slab_count == baseline.slab_count);
+	CHECK(after.reserved_bytes == baseline.reserved_bytes);
+	CHECK(after.committed_bytes == baseline.committed_bytes);
+	memfs_allocator_destroy(&allocator);
+}
+#endif
+
 static void test_allocator_generic_concurrency(void) {
 	enum { THREADS = 4 };
 	MemfsAllocator allocator;
@@ -4222,6 +4315,9 @@ int main(void) {
 	test_allocator_area_cache_reuse();
 	test_allocator_name_pool_boundaries();
 	test_allocator_generic_size_classes();
+#if !defined(NDEBUG)
+	test_allocator_cross_shard_reuse();
+#endif
 	test_allocator_generic_concurrency();
 	test_allocator_stress();
 	test_storage_group_churn_stress();

@@ -98,6 +98,10 @@ typedef struct MemfsAllocatorStats {
 bool memfs_allocator_test_class_layout(size_t bytes,
                                        size_t* class_bytes,
                                        size_t* slab_bytes);
+void* memfs_allocator_test_alloc_from_shard(MemfsAllocator* allocator,
+                                            size_t bytes,
+                                            uint32_t shard_index);
+uint32_t memfs_allocator_test_shard_count(void);
 #endif
 
 bool memfs_allocator_init(MemfsAllocator* allocator,
