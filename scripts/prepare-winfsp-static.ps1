@@ -7,6 +7,26 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Normalize-Path {
+    param([string]$Path)
+    return [IO.Path]::GetFullPath($Path).TrimEnd('\')
+}
+
+$WinFspRepo = Normalize-Path $WinFspRepo
+$Worktree = Normalize-Path $Worktree
+$repoPrefix = $WinFspRepo + '\'
+$worktreePrefix = $Worktree + '\'
+$worktreeRoot = [IO.Path]::GetPathRoot($Worktree).TrimEnd('\')
+
+if ($Worktree -eq $worktreeRoot) {
+    throw "Worktree must not be a drive root: $Worktree"
+}
+if ($Worktree.Equals($WinFspRepo, [StringComparison]::OrdinalIgnoreCase) -or
+    $Worktree.StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+    $WinFspRepo.StartsWith($worktreePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Worktree must not overlap WinFspRepo: repo=$WinFspRepo worktree=$Worktree"
+}
+
 function Find-WinFspDriver {
     $name = "winfsp-x64.sys"
     $candidates = @()
@@ -65,10 +85,37 @@ if ($LASTEXITCODE -ne 0 -or $objectType.Trim() -ne "commit") {
     throw "Driver commit $ref is not present in $WinFspRepo."
 }
 
-if (Test-Path $Worktree) {
-    & git -C $WinFspRepo worktree remove --force $Worktree 2>$null
-    if (Test-Path $Worktree) {
-        Remove-Item -Recurse -Force $Worktree
+if (Test-Path -LiteralPath $Worktree) {
+    $item = Get-Item -LiteralPath $Worktree -Force
+    if (-not $item.PSIsContainer) {
+        throw "Worktree path exists but is not a directory: $Worktree"
+    }
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Worktree path must not be a reparse point: $Worktree"
+    }
+
+    $registered = $false
+    $lines = & git -C $WinFspRepo worktree list --porcelain
+    if ($LASTEXITCODE -ne 0) {
+        throw "Cannot enumerate registered Git worktrees for $WinFspRepo"
+    }
+    foreach ($line in $lines) {
+        if ($line.StartsWith("worktree ")) {
+            $registeredPath = Normalize-Path $line.Substring(9)
+            if ($registeredPath.Equals($Worktree, [StringComparison]::OrdinalIgnoreCase)) {
+                $registered = $true
+                break
+            }
+        }
+    }
+
+    if (-not $registered) {
+        throw "Refusing to remove unregistered directory at Worktree path: $Worktree"
+    }
+
+    & git -C $WinFspRepo worktree remove --force $Worktree
+    if ($LASTEXITCODE -ne 0 -or (Test-Path -LiteralPath $Worktree)) {
+        throw "Git could not safely remove registered worktree: $Worktree"
     }
 }
 & git -C $WinFspRepo worktree prune

@@ -7,6 +7,38 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
+$repoRoot = [IO.Path]::GetFullPath($repoRoot)
+$distRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot "dist"))
+$OutputDir = [IO.Path]::GetFullPath($OutputDir)
+
+function Assert-SafeReleaseOutput {
+    param([string]$Path)
+
+    $rootPrefix = $distRoot.TrimEnd('\') + '\'
+    if ($Path -eq $distRoot -or
+        -not $Path.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "OutputDir must be a child of the managed release root: $distRoot"
+    }
+
+    if (Test-Path -LiteralPath $distRoot) {
+        $rootItem = Get-Item -LiteralPath $distRoot -Force
+        if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Managed release root must not be a reparse point: $distRoot"
+        }
+    }
+
+    if (Test-Path -LiteralPath $Path) {
+        $item = Get-Item -LiteralPath $Path -Force
+        if (-not $item.PSIsContainer) {
+            throw "OutputDir exists but is not a directory: $Path"
+        }
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "OutputDir must not be a reparse point: $Path"
+        }
+    }
+}
+
+Assert-SafeReleaseOutput -Path $OutputDir
 $exe = Join-Path $BuildDir "memfs.exe"
 $notice = Join-Path $repoRoot "THIRD_PARTY_NOTICES.md"
 $winfspLicense = Join-Path $WinFspSourceRoot "License.txt"
@@ -19,29 +51,61 @@ foreach ($required in @($exe, $notice, $winfspLicense, $sodiumLicense, $zstdLice
     }
 }
 
-if (Test-Path -LiteralPath $OutputDir) {
-    Remove-Item -LiteralPath $OutputDir -Recurse -Force
-}
-$licenses = Join-Path $OutputDir "licenses"
-New-Item -ItemType Directory -Path $licenses -Force | Out-Null
+New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
 
-Copy-Item -LiteralPath $exe -Destination (Join-Path $OutputDir "memfs.exe")
-Copy-Item -LiteralPath $notice -Destination (Join-Path $OutputDir "THIRD_PARTY_NOTICES.md")
-Copy-Item -LiteralPath $winfspLicense -Destination (Join-Path $licenses "WinFsp-License.txt")
-Copy-Item -LiteralPath $sodiumLicense -Destination (Join-Path $licenses "libsodium.txt")
-Copy-Item -LiteralPath $zstdLicense -Destination (Join-Path $licenses "zstd.txt")
+$token = [Guid]::NewGuid().ToString("N")
+$stagingDir = Join-Path $distRoot (".memfs-stage-" + $token)
+$backupDir = Join-Path $distRoot (".memfs-backup-" + $token)
+$stagingLicenses = Join-Path $stagingDir "licenses"
+$published = $false
+
+try {
+    New-Item -ItemType Directory -Path $stagingLicenses -Force | Out-Null
+
+    Copy-Item -LiteralPath $exe -Destination (Join-Path $stagingDir "memfs.exe")
+    Copy-Item -LiteralPath $notice -Destination (Join-Path $stagingDir "THIRD_PARTY_NOTICES.md")
+    Copy-Item -LiteralPath $winfspLicense -Destination (Join-Path $stagingLicenses "WinFsp-License.txt")
+    Copy-Item -LiteralPath $sodiumLicense -Destination (Join-Path $stagingLicenses "libsodium.txt")
+    Copy-Item -LiteralPath $zstdLicense -Destination (Join-Path $stagingLicenses "zstd.txt")
+
+    $stagingManifest = Join-Path $stagingDir "SHA256SUMS.txt"
+    $files = Get-ChildItem -LiteralPath $stagingDir -File -Recurse |
+        Where-Object { $_.FullName -ne $stagingManifest } |
+        Sort-Object FullName
+
+    $lines = foreach ($file in $files) {
+        $relative = $file.FullName.Substring($stagingDir.Length).TrimStart('\').Replace('\','/')
+        $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        "$hash  $relative"
+    }
+    [IO.File]::WriteAllLines($stagingManifest, $lines, [Text.UTF8Encoding]::new($false))
+
+    if (Test-Path -LiteralPath $OutputDir) {
+        Move-Item -LiteralPath $OutputDir -Destination $backupDir
+    }
+
+    try {
+        Move-Item -LiteralPath $stagingDir -Destination $OutputDir
+        $published = $true
+    }
+    catch {
+        if (Test-Path -LiteralPath $backupDir -PathType Container) {
+            Move-Item -LiteralPath $backupDir -Destination $OutputDir
+        }
+        throw
+    }
+
+    if (Test-Path -LiteralPath $backupDir -PathType Container) {
+        Remove-Item -LiteralPath $backupDir -Recurse -Force
+    }
+}
+finally {
+    if (-not $published -and (Test-Path -LiteralPath $stagingDir)) {
+        Remove-Item -LiteralPath $stagingDir -Recurse -Force
+    }
+}
 
 $manifestPath = Join-Path $OutputDir "SHA256SUMS.txt"
-$files = Get-ChildItem -LiteralPath $OutputDir -File -Recurse |
-    Where-Object { $_.FullName -ne $manifestPath } |
-    Sort-Object FullName
-
-$lines = foreach ($file in $files) {
-    $relative = $file.FullName.Substring($OutputDir.Length).TrimStart('\').Replace('\','/')
-    $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-    "$hash  $relative"
-}
-[IO.File]::WriteAllLines($manifestPath, $lines, [Text.UTF8Encoding]::new($false))
 
 Write-Output "Packaged release: $OutputDir"
 Write-Output ""
