@@ -1,137 +1,219 @@
 # Release verification
 
-Verified on 2026-09-29 on Windows x64.
+Verified on 2026-09-30 on Windows x64.
 
 ## Build inputs
 
 - memfs repository: `D:\work\memfs`
-- WinFsp source: `D:\src\winfsp`
-- WinFsp static-library commit: `620d042e build: add static WinFsp user-mode library`
-- embedded driver source:
+- WinFsp Git repository: `D:\src\winfsp`
+- signed embedded driver:
   `C:\Program Files (x86)\WinFsp\SxS\sxs.20251221T124141Z\bin\winfsp-x64.sys`
+- driver FileVersion: `2.1.25156.ddca7bd`
+- matching WinFsp source commit: `ddca7bd` (tag `v2.1`)
 - embedded driver SHA-256:
   `03553FFFACD362F4A9A08C00B4F236A82354A183BC6028494FB32055386E13C9`
+- generated matching static worktree: `D:\src\winfsp-memfs-static`
 
-The supplied CMake presets use the static CRT triplet and static WinFsp user-mode library:
+Run this before a clean build:
+
+```powershell
+.\scripts\prepare-winfsp-static.ps1
+```
+
+The script reads the installed signed driver's FileVersion, extracts its Git revision,
+creates a detached worktree at that exact commit, applies the minimal static-user-mode
+support, and builds both Debug and Release `winfsp-static-x64.lib` archives.
+
+This avoids mixing a newer user-mode runtime with an older signed kernel driver.
+
+## Static WinFsp version contract
+
+The build now enforces the WinFsp version in three places:
+
+1. CMake reads `MyCanonicalVersion` from the selected WinFsp source tree.
+2. CMake reads the embedded SYS FileVersion and rejects a different major/minor.
+3. `memfs_winfsp_version_test` calls `FspVersion()` from the linked static archive and
+   verifies the encoded version at runtime.
+
+A deliberate negative configure test using WinFsp v2.2 static source with the v2.1
+signed driver fails with:
+
+```text
+WinFsp version mismatch: static runtime expects 2.2,
+but embedded driver ... is 2.1.25156.ddca7bd
+```
+
+The supplied presets use:
 
 - `VCPKG_TARGET_TRIPLET=x64-windows-static`
 - `MEMFS_STATIC_WINFSP=ON`
-- `WINFSP_SOURCE_ROOT=D:/src/winfsp`
+- `WINFSP_SOURCE_ROOT=D:/src/winfsp-memfs-static`
+
+When a source root is supplied, CMake forcibly selects that tree's
+configuration-matched static archive. This prevents an old CMake cache from silently
+linking a different WinFsp static library.
 
 ## Build and test matrix
 
 ```powershell
+cmake --preset x64-debug
 cmake --build --preset x64-debug
 ctest --preset x64-debug --output-on-failure
 
+cmake --preset x64-release
 cmake --build --preset x64-release
 ctest --preset x64-release --output-on-failure
 ```
 
-Both Debug and Release pass 8/8 tests:
+Both Debug and Release pass 11/11 tests:
 
 1. `memfs_mt_stress_test`
 2. `memfs_core_test`
-3. `memfs_no_crt_heap_guard`
-4. `memfs_no_crt_heap_guard_good_fixture`
-5. `memfs_no_crt_heap_guard_bad_fixture`
-6. `memfs_driver_test`
-7. `memfs_cli_help`
-8. `memfs_embedded_winfsp_resources`
+3. `memfs_soak_smoke`
+4. `memfs_no_crt_heap_guard`
+5. `memfs_no_crt_heap_guard_good_fixture`
+6. `memfs_no_crt_heap_guard_bad_fixture`
+7. `memfs_driver_test`
+8. `memfs_static_winfsp_no_dll_import`
+9. `memfs_static_winfsp_version`
+10. `memfs_cli_help`
+11. `memfs_embedded_winfsp_resources`
 
 ## Real mounted-drive integration
 
-The Release executable passed the real WinFsp mount integration test in all four runtime modes:
+The Release executable passed the real WinFsp integration test in all four modes:
 
 - plain: PASS
 - `--compress`: PASS
 - `--encrypt`: PASS
 - `--compress --encrypt`: PASS
 
-Each run mounted R:, exercised normal Windows file APIs (including namespace and sparse-file behavior through the integration script), and unmounted cleanly.
+Each run mounted R:, exercised normal Windows file APIs, binary I/O, sparse-file
+zero-fill, rename/move/enumeration/delete, and unmounted cleanly.
 
 ## Static WinFsp verification
 
-Static libraries:
+Matching v2.1 static libraries:
 
-- `D:\src\winfsp\build\VStudio\build\Debug\winfsp-static-x64.lib`
-- `D:\src\winfsp\build\VStudio\build\Release\winfsp-static-x64.lib`
+- Debug:
+  `D:\src\winfsp-memfs-static\build\VStudio\build\Debug\winfsp-static-x64.lib`
+  SHA-256:
+  `3DEF208459510144CCD7CD09A420F62C9E451A8485148803DB61D61AAF680714`
+- Release:
+  `D:\src\winfsp-memfs-static\build\VStudio\build\Release\winfsp-static-x64.lib`
+  SHA-256:
+  `F1CDC481AF01FE2087158A94B9050C39D19253A6CB0D78535866F5FDE54D4130`
 
-`dumpbin /dependents` on both Debug and Release `memfs.exe` shows no dependency on `winfsp-x64.dll`.
+`memfs_static_winfsp_no_dll_import` verifies that the final EXE has no WinFsp DLL
+import or delay-import dependency.
 
-Release dependencies are Windows system DLLs only:
-
-- ADVAPI32.dll
-- KERNEL32.dll
-- NETAPI32.dll
-- USER32.dll
-- VERSION.dll
-- ole32.dll
-- SHELL32.dll
-- WLDAP32.dll
-- RPCRT4.dll
-
-The Release EXE therefore does not require an external WinFsp user-mode DLL.
+The Release EXE therefore does not require `winfsp-x64.dll` at runtime.
 
 ## Embedded driver behavior
 
-The configured official SxS driver is currently registered as:
+The installed compatible official SxS driver is:
 
 ```text
 SERVICE_NAME: WinFsp+20251221T124141Z
 TYPE: FILE_SYSTEM_DRIVER
 STATE: RUNNING
+FileVersion: 2.1.25156.ddca7bd
 Path: C:\Program Files (x86)\WinFsp\SxS\sxs.20251221T124141Z\bin\winfsp-x64.sys
 ```
 
-memfs first attempts normal `FspFileSystemCreate`. When a compatible official SxS driver is available, it is reused.
+memfs first attempts normal `FspFileSystemCreate`. If a compatible driver is already
+available, it reuses it and does not install a parallel fallback service.
 
-Only when the driver is missing or unloadable does memfs extract the embedded signed SYS resource, register/start the fallback filesystem-driver service, and retry the WinFsp create path.
+Only when the driver is missing/unloadable does memfs extract the embedded signed SYS,
+register/start its private fallback filesystem-driver service, and retry
+`FspFileSystemCreate`.
 
-The driver fallback code compares an existing extracted driver byte-for-byte before replacing it.
+The extraction path compares an existing file byte-for-byte before replacing it.
 
 ## Windows Service verification
 
-Release `memfs.exe` was verified through the real Service Control Manager using LocalSystem:
+The final Release `memfs.exe` was verified through the real Service Control Manager as
+LocalSystem.
+
+Successful lifecycle:
 
 ```text
 sc create
 sc start
-sc query/queryex
-filesystem mount at R:
-file create/write/read/delete
+STATE: RUNNING
+mount R:
+create/write/read/delete
 sc stop
-mount disappears
+STATE: STOPPED
 sc delete
 ```
 
-Observed running state:
+A real file round-trip returned:
 
 ```text
-TYPE: WIN32_OWN_PROCESS
-STATE: RUNNING
-SERVICE_START_NAME: LocalSystem
-STOPPABLE
-ACCEPTS_SHUTDOWN
+READBACK=service-release-ok
 ```
 
-On `sc stop`, the service reached `STOP_PENDING`, then `STOPPED`, and the R: mount disappeared.
+The helper is also verified end-to-end:
 
-Use `scripts\memfs-service.ps1` or the direct `sc.exe` commands documented in README.md.
+```powershell
+.\scripts\memfs-service.ps1 install -Exe .\build\x64-release\memfs.exe -Mount R: -Size 64M -StartType demand
+.\scripts\memfs-service.ps1 start
+.\scripts\memfs-service.ps1 stop
+.\scripts\memfs-service.ps1 delete
+```
+
+`stop` and `delete` now handle an already-absent service cleanly.
+
+Service startup failures preserve the underlying WinFsp NTSTATUS in
+`SERVICE_EXIT_CODE`. For example, deliberately trying to mount an already-existing
+normal directory produced:
+
+```text
+WIN32_EXIT_CODE    : 1066  (0x42a)
+SERVICE_EXIT_CODE  : 3221225525  (0xc0000035)
+```
+
+rather than losing the root cause behind a generic 1066.
+
+## Allocator design verification
+
+Allocator policy is:
+
+- business APIs converge by allocation size, not object type;
+- small allocations use adaptive slab backing: 4K / 8K / 16K / 32K / 64K;
+- allocations above the small-object threshold use area allocations;
+- core/storage code does not call VirtualAlloc directly;
+- VM primitives are isolated behind `memfs_vm`.
+
+The current size-class pool contains internal concurrency lanes. These are not separate
+node/name/generic pools; they partition slab ownership to avoid a single hot lock.
+
+A/B measurements on this machine showed why the lanes remain for now. For 64-byte
+alloc/free at 16 threads:
+
+- current internal lanes: about 18.8M ops/s
+- literal one-lock physical pool: about 3.1M ops/s
+- one-pool global SList experiment: about 4.9M ops/s
+
+The single-pool experiments were reverted rather than accepting a 4-7x concurrency
+regression. Future allocator work should target magazines/remote-free or a comparable
+scheme that preserves the one-size-class abstraction without paying that lock cost.
 
 ## Current binaries
 
 Debug:
 
-- size: 3,130,880 bytes
-- SHA-256: `A43A5E05A0ADC340FDC1B2780A1000AE0E19B82642544D511F98653867DADABA`
+- size: 3,135,488 bytes
+- SHA-256: `84E718E0D2D62BC4FBBFEE74ED9B581B86419EB31E26CF0EB85A553C07A38D35`
 
 Release:
 
-- size: 1,129,984 bytes
-- SHA-256: `737D12FEB416D9DFDBA525DAE9FC3C24E15489EF89870DD101B62A533C002E21`
+- size: 1,145,856 bytes
+- SHA-256: `29050EEDB7A3DDBBE7102616398A0C3D98F704CF0CE9D77DC6C0EB257404C13B`
 
-These hashes are verification artifacts for the local build above, not long-term release identifiers.
+These hashes are verification artifacts for this local build, not permanent release
+identifiers.
 
 ## Remaining productization items
 
@@ -140,7 +222,7 @@ Before broad external distribution, separately validate:
 - code-signing policy for the final EXE;
 - WinFsp redistribution/license notices;
 - Windows 10 and Windows 11 clean-machine installation;
-- x64 and ARM64 packages independently;
-- upgrade/uninstall behavior when an older official WinFsp installation exists;
+- ARM64 build/package and matching signed ARM64 driver;
+- upgrade/uninstall behavior when an older or newer official WinFsp installation exists;
 - service recovery after reboot and abnormal termination;
-- clean-machine driver fallback with no WinFsp installation present.
+- clean-machine embedded-driver fallback with no WinFsp installation present.

@@ -32,8 +32,12 @@ static HANDLE g_stop_event;
 static SERVICE_STATUS_HANDLE g_service_status_handle;
 static SERVICE_STATUS g_service_status;
 static MemfsRunConfig g_config;
+static volatile LONG g_service_stop_requested;
 
-static void service_report(DWORD state, DWORD win32_exit, DWORD wait_hint) {
+static void service_report_ex(DWORD state,
+                              DWORD win32_exit,
+                              DWORD service_specific_exit,
+                              DWORD wait_hint) {
     static DWORD checkpoint = 1;
 
     if (g_service_status_handle == NULL)
@@ -43,6 +47,8 @@ static void service_report(DWORD state, DWORD win32_exit, DWORD wait_hint) {
     g_service_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     g_service_status.dwCurrentState = state;
     g_service_status.dwWin32ExitCode = win32_exit;
+    g_service_status.dwServiceSpecificExitCode =
+        win32_exit == ERROR_SERVICE_SPECIFIC_ERROR ? service_specific_exit : 0;
     g_service_status.dwWaitHint = wait_hint;
 
     if (state == SERVICE_START_PENDING)
@@ -60,6 +66,10 @@ static void service_report(DWORD state, DWORD win32_exit, DWORD wait_hint) {
     SetServiceStatus(g_service_status_handle, &g_service_status);
 }
 
+static void service_report(DWORD state, DWORD win32_exit, DWORD wait_hint) {
+    service_report_ex(state, win32_exit, 0, wait_hint);
+}
+
 static DWORD WINAPI service_handler(DWORD control,
                                     DWORD event_type,
                                     void* event_data,
@@ -72,6 +82,7 @@ static DWORD WINAPI service_handler(DWORD control,
     case SERVICE_CONTROL_STOP:
     case SERVICE_CONTROL_SHUTDOWN:
         service_report(SERVICE_STOP_PENDING, NO_ERROR, 15000);
+        InterlockedExchange(&g_service_stop_requested, 1);
         if (g_stop_event)
             SetEvent(g_stop_event);
         return NO_ERROR;
@@ -390,11 +401,17 @@ static void print_runtime_stats(Memfs* fs, const char* phase, bool json) {
     (void)WriteFile(output, line, (DWORD)length, &written, NULL);
 }
 
-static int run_filesystem(const MemfsRunConfig* config, HANDLE stop_event, bool console_mode) {
+static int run_filesystem(const MemfsRunConfig* config,
+                          HANDLE stop_event,
+                          bool console_mode,
+                          DWORD* detail_error) {
     MemfsOptions options;
     MemfsWinFsp* instance = NULL;
     NTSTATUS status;
     int exit_code = 1;
+
+    if (detail_error)
+        *detail_error = ERROR_SUCCESS;
 
     memset(&options, 0, sizeof(options));
     options.capacity = config->capacity;
@@ -411,6 +428,8 @@ static int run_filesystem(const MemfsRunConfig* config, HANDLE stop_event, bool 
 
     status = memfs_winfsp_create(&options, &instance);
     if (!NT_SUCCESS(status)) {
+        if (detail_error)
+            *detail_error = (DWORD)status;
         if (console_mode)
             fwprintf(stderr, L"memfs_winfsp_create failed: 0x%08X\n", (unsigned)status);
         return 3;
@@ -421,18 +440,27 @@ static int run_filesystem(const MemfsRunConfig* config, HANDLE stop_event, bool 
 
     status = memfs_winfsp_mount(instance, config->mount_point);
     if (!NT_SUCCESS(status)) {
+        if (detail_error)
+            *detail_error = (DWORD)status;
         if (console_mode)
             fwprintf(stderr, L"Cannot mount %s: 0x%08X\n",
                      config->mount_point, (unsigned)status);
+        exit_code = 4;
         goto exit;
     }
 
     status = memfs_winfsp_start(instance, config->thread_count);
     if (!NT_SUCCESS(status)) {
+        if (detail_error)
+            *detail_error = (DWORD)status;
         if (console_mode)
             fwprintf(stderr, L"Cannot start WinFsp dispatcher: 0x%08X\n", (unsigned)status);
+        exit_code = 5;
         goto exit;
     }
+
+    if (!console_mode)
+        service_report(SERVICE_RUNNING, NO_ERROR, 0);
 
     if (console_mode) {
         if (!config->stats_json) {
@@ -465,6 +493,7 @@ exit:
 
 static VOID WINAPI service_main(DWORD argc, LPWSTR* argv) {
     int result;
+    DWORD detail_error = ERROR_SUCCESS;
 
     (void)argc;
     (void)argv;
@@ -481,17 +510,28 @@ static VOID WINAPI service_main(DWORD argc, LPWSTR* argv) {
         service_report(SERVICE_STOPPED, GetLastError(), 0);
         return;
     }
+    /*
+     * The SCM may deliver STOP immediately after handler registration and
+     * before this event exists. Persist that request in the handler and replay
+     * it here so startup cannot lose a stop/shutdown control.
+     */
+    if (InterlockedCompareExchange(&g_service_stop_requested, 0, 0) != 0)
+        SetEvent(g_stop_event);
 
-    service_report(SERVICE_RUNNING, NO_ERROR, 0);
-    result = run_filesystem(&g_config, g_stop_event, false);
+    result = run_filesystem(&g_config, g_stop_event, false, &detail_error);
 
     CloseHandle(g_stop_event);
     g_stop_event = NULL;
 
-    if (result == 0)
+    if (result == 0) {
         service_report(SERVICE_STOPPED, NO_ERROR, 0);
-    else
-        service_report(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, 0);
+    } else {
+        service_report_ex(
+            SERVICE_STOPPED,
+            ERROR_SERVICE_SPECIFIC_ERROR,
+            detail_error != ERROR_SUCCESS ? detail_error : (DWORD)result,
+            0);
+    }
 }
 
 int wmain(int argc, wchar_t** argv) {
@@ -538,7 +578,7 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     SetConsoleCtrlHandler(console_handler, TRUE);
-    parse_result = run_filesystem(&g_config, g_stop_event, true);
+    parse_result = run_filesystem(&g_config, g_stop_event, true, NULL);
     SetConsoleCtrlHandler(console_handler, FALSE);
 
     CloseHandle(g_stop_event);

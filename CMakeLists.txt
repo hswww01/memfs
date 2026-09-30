@@ -24,6 +24,8 @@ option(MEMFS_STATIC_WINFSP "Statically link the WinFsp user-mode runtime" ON)
 set(WINFSP_SOURCE_ROOT "" CACHE PATH "WinFsp source tree containing inc/ and build/VStudio/")
 set(WINFSP_STATIC_LIBRARY "" CACHE FILEPATH "Prebuilt static WinFsp user-mode library")
 set(WINFSP_DRIVER_SOURCE "" CACHE FILEPATH "WinFsp driver binary to embed into memfs.exe")
+set(WINFSP_EXPECTED_VERSION "" CACHE STRING
+	"Expected WinFsp major.minor for static runtime and embedded driver")
 
 if(WINFSP_ROOT)
 	set(_winfsp_inc_hints "${WINFSP_ROOT}/inc")
@@ -74,7 +76,7 @@ else()
 endif()
 
 if(MEMFS_STATIC_WINFSP)
-	if(NOT WINFSP_STATIC_LIBRARY AND WINFSP_SOURCE_ROOT)
+	if(WINFSP_SOURCE_ROOT)
 		if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 			set(_winfsp_static_config Debug)
 		else()
@@ -120,6 +122,89 @@ else()
 		NAMES ${_winfsp_sys_name}
 		HINTS ${_winfsp_bin_hints}
 		REQUIRED)
+endif()
+if(MEMFS_STATIC_WINFSP)
+	set(_winfsp_source_version "")
+	if(WINFSP_SOURCE_ROOT AND
+	   EXISTS "${WINFSP_SOURCE_ROOT}/build/VStudio/build.version.props")
+		file(STRINGS
+			"${WINFSP_SOURCE_ROOT}/build/VStudio/build.version.props"
+			_winfsp_version_line
+			REGEX "<MyCanonicalVersion>[0-9]+\\.[0-9]+</MyCanonicalVersion>"
+			LIMIT_COUNT 1)
+		if(_winfsp_version_line)
+			string(REGEX REPLACE
+				".*<MyCanonicalVersion>([0-9]+\\.[0-9]+)</MyCanonicalVersion>.*"
+				"\\1"
+				_winfsp_source_version
+				"${_winfsp_version_line}")
+		endif()
+	endif()
+
+	set(_winfsp_expected_version "")
+	if(WINFSP_EXPECTED_VERSION)
+		if(_winfsp_source_version AND
+		   NOT WINFSP_EXPECTED_VERSION STREQUAL _winfsp_source_version)
+			message(FATAL_ERROR
+				"WINFSP_EXPECTED_VERSION=${WINFSP_EXPECTED_VERSION} does not match "
+				"WINFSP_SOURCE_ROOT canonical version ${_winfsp_source_version}")
+		endif()
+		set(_winfsp_expected_version "${WINFSP_EXPECTED_VERSION}")
+	elseif(_winfsp_source_version)
+		set(_winfsp_expected_version "${_winfsp_source_version}")
+	endif()
+
+	if(NOT _winfsp_expected_version)
+		message(FATAL_ERROR
+			"Static WinFsp builds must specify WINFSP_EXPECTED_VERSION or a "
+			"WINFSP_SOURCE_ROOT with build/VStudio/build.version.props")
+	endif()
+
+	execute_process(
+		COMMAND powershell.exe -NoLogo -NoProfile -NonInteractive -Command
+			"(Get-Item -LiteralPath '${WINFSP_DRIVER}').VersionInfo.FileVersion"
+		RESULT_VARIABLE _winfsp_driver_version_result
+		OUTPUT_VARIABLE _winfsp_driver_file_version
+		ERROR_VARIABLE _winfsp_driver_version_error
+		OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+	if(NOT _winfsp_driver_version_result EQUAL 0)
+		message(FATAL_ERROR
+			"Cannot read embedded WinFsp driver version: "
+			"${_winfsp_driver_version_error}")
+	endif()
+
+	string(REGEX MATCH "^([0-9]+)\\.([0-9]+)"
+		_winfsp_driver_version_match "${_winfsp_driver_file_version}")
+	if(NOT _winfsp_driver_version_match)
+		message(FATAL_ERROR
+			"Cannot parse WinFsp driver FileVersion '${_winfsp_driver_file_version}'")
+	endif()
+	set(_winfsp_driver_version "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}")
+
+	if(NOT _winfsp_driver_version STREQUAL _winfsp_expected_version)
+		message(FATAL_ERROR
+			"WinFsp version mismatch: static runtime expects "
+			"${_winfsp_expected_version}, but embedded driver "
+			"${WINFSP_DRIVER} is ${_winfsp_driver_file_version}")
+	endif()
+
+	string(REGEX MATCH "^([0-9]+)\\.([0-9]+)$"
+		_winfsp_expected_match "${_winfsp_expected_version}")
+	if(NOT _winfsp_expected_match)
+		message(FATAL_ERROR
+			"WINFSP_EXPECTED_VERSION must be major.minor, got "
+			"'${_winfsp_expected_version}'")
+	endif()
+	set(_winfsp_expected_major "${CMAKE_MATCH_1}")
+	set(_winfsp_expected_minor "${CMAKE_MATCH_2}")
+	math(EXPR WINFSP_EXPECTED_VERSION_HEX
+		"(${_winfsp_expected_major} << 16) | ${_winfsp_expected_minor}"
+		OUTPUT_FORMAT HEXADECIMAL)
+
+	message(STATUS
+		"WinFsp static/runtime version ${_winfsp_expected_version}; "
+		"driver ${_winfsp_driver_file_version}")
 endif()
 
 if(MEMFS_STATIC_WINFSP)
@@ -255,6 +340,26 @@ add_executable(memfs_driver_test
 if(MEMFS_STATIC_WINFSP)
 	add_executable(memfs_static_import_test
 		tests/memfs_static_import_test.c)
+
+	add_executable(memfs_winfsp_version_test
+		tests/memfs_winfsp_version_test.c)
+	target_include_directories(memfs_winfsp_version_test
+		SYSTEM PRIVATE
+			${WINFSP_INCLUDE_DIR})
+	target_compile_definitions(memfs_winfsp_version_test
+		PRIVATE
+			WINFSP_STATIC
+			MEMFS_EXPECTED_WINFSP_VERSION=${WINFSP_EXPECTED_VERSION_HEX})
+	target_link_libraries(memfs_winfsp_version_test
+		PRIVATE
+			${WINFSP_LIBRARY}
+			credui
+			netapi32
+			rpcrt4
+			secur32
+			shlwapi
+			version
+			wldap32)
 endif()
 
 target_include_directories(memfs_driver_test
@@ -358,6 +463,8 @@ add_test(NAME memfs_driver_test COMMAND memfs_driver_test)
 if(MEMFS_STATIC_WINFSP)
 	add_test(NAME memfs_static_winfsp_no_dll_import
 		COMMAND memfs_static_import_test $<TARGET_FILE:memfs>)
+	add_test(NAME memfs_static_winfsp_version
+		COMMAND memfs_winfsp_version_test)
 endif()
 
 add_test(NAME memfs_cli_help COMMAND memfs --help)

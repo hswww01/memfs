@@ -36,6 +36,10 @@ function Wait-ServiceState {
         if ($text -match "STATE\s+:\s+\d+\s+$Wanted") {
             return
         }
+        if ($Wanted -eq "RUNNING" -and
+            $text -match "STATE\s+:\s+1\s+STOPPED") {
+            throw "Service $ServiceName stopped during startup:`n$text"
+        }
         Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Service $ServiceName did not reach state $Wanted."
@@ -56,8 +60,12 @@ switch ($Action) {
         }
 
         & sc.exe query $ServiceName *> $null
-        if ($LASTEXITCODE -eq 0) {
+        $queryExit = $LASTEXITCODE
+        if ($queryExit -eq 0) {
             throw "Service $ServiceName already exists. Delete or reconfigure it first."
+        }
+        if ($queryExit -ne 1060) {
+            throw "sc query failed with exit code $queryExit"
         }
 
         $binPath = '"' + $Exe + '" --service --mount ' + $Mount +
@@ -81,6 +89,15 @@ switch ($Action) {
     }
     "stop" {
         Assert-Admin
+        & sc.exe query $ServiceName *> $null
+        if ($LASTEXITCODE -eq 1060) {
+            Write-Output "$ServiceName is not installed."
+            break
+        }
+        if ($LASTEXITCODE -ne 0) {
+            throw "sc query failed with exit code $LASTEXITCODE"
+        }
+
         & sc.exe stop $ServiceName
         if ($LASTEXITCODE -notin 0, 1062) {
             throw "sc stop failed with exit code $LASTEXITCODE"
@@ -90,6 +107,15 @@ switch ($Action) {
     }
     "delete" {
         Assert-Admin
+        & sc.exe query $ServiceName *> $null
+        if ($LASTEXITCODE -eq 1060) {
+            Write-Output "$ServiceName is already absent."
+            break
+        }
+        if ($LASTEXITCODE -ne 0) {
+            throw "sc query failed with exit code $LASTEXITCODE"
+        }
+
         & sc.exe stop $ServiceName *> $null
         Invoke-Sc delete $ServiceName
         Write-Output "Deleted $ServiceName"

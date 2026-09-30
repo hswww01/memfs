@@ -22,20 +22,22 @@ All file-system contents are volatile. Unmounting or terminating the process los
 ## Prerequisites
 
 - Windows 10/11 x64.
-- WinFsp source tree at `D:\\src\\winfsp` for the default static user-mode build.
+- WinFsp Git source tree at `D:\\src\\winfsp`; `scripts\\prepare-winfsp-static.ps1` derives the exact source commit from the installed signed driver and prepares `D:\\src\\winfsp-memfs-static`.
 - Visual Studio C/C++ build tools.
 - LLVM/clang-cl.
 - CMake + Ninja.
 - vcpkg at `D:\vcpkg` for the supplied presets.
 
-The vcpkg manifest installs `zstd` and `libsodium`. The supplied presets statically link the WinFsp user-mode runtime built from `D:\\src\\winfsp`, so `memfs.exe` does not require `winfsp-x64.dll` at runtime. The WinFsp kernel driver is embedded as an EXE resource from the configured SxS driver path; if no compatible WinFsp driver is already available, memfs can install and start the embedded driver when run elevated.
+The vcpkg manifest installs `zstd` and `libsodium`. Before the first build, run `scripts\\prepare-winfsp-static.ps1`. It reads the installed signed WinFsp driver's FileVersion, resolves the matching Git commit, creates `D:\\src\\winfsp-memfs-static`, applies the minimal static-user-mode support, and builds Debug/Release static libraries from that exact source version. The supplied presets then link that matching static runtime, so `memfs.exe` does not require `winfsp-x64.dll` at runtime.
 
-When `MEMFS_STATIC_WINFSP=ON`, CTest also parses the built PE import and delay-import tables and fails if any `winfsp*.dll` dependency reappears.
+The WinFsp kernel driver is embedded as an EXE resource from the installed SxS driver. CMake compares the static source canonical major/minor version with the driver's FileVersion and fails configuration on a mismatch. CTest also calls `FspVersion()` from the linked static library and parses the built PE import/delay-import tables, so a stale cached static library or reintroduced `winfsp*.dll` dependency fails the build verification. If no compatible WinFsp driver is available at runtime, an elevated memfs process can install/start the embedded signed fallback driver and retry `FspFileSystemCreate`.
 
 ## Build
 
 ```powershell
 cd D:\work\memfs
+
+.\scripts\prepare-winfsp-static.ps1
 
 cmake --preset x64-debug
 cmake --build --preset x64-debug
@@ -134,6 +136,8 @@ A helper that still uses `sc.exe` for all service control is included:
 
 The service runs as LocalSystem by default. The first driver installation requires administrator rights. If a compatible official WinFsp SxS driver is already installed, memfs reuses it and does not create a parallel driver service. If the driver is missing or unloadable, memfs extracts the embedded signed WinFsp SYS resource, registers it through SCM, starts it, and retries `FspFileSystemCreate`.
 
+If Service initialization fails, `sc.exe query MemfsC` preserves the underlying WinFsp/NTSTATUS value in `SERVICE_EXIT_CODE` instead of exposing only the generic Windows service error 1066.
+
 ## Directory design
 
 MemfsDir allocates no hash table for small directories. Every child is stored in an intrusive treap, which is the authoritative ordered index and provides expected O(log n) insertion/deletion/lookup plus naturally sorted enumeration.
@@ -187,7 +191,9 @@ With encryption enabled a 1-byte file uses 33 bytes of tracked encoded storage: 
 resident_bytes tracks encoded data blobs/pages and intentionally excludes host allocator bookkeeping and namespace metadata.
 ### Allocator v2 and auto capacity
 
-The allocator v2 backend is size-class based rather than object-type based. Node, directory, page-group, name and generic allocation APIs all converge on the same rounded-size class, so there is only one physical pool for a given class. The process-wide control allocation used for `Memfs` itself goes through the same size-class/slab/area machinery; only allocator-state bootstrap reaches the VM backend directly. Small allocations use adaptive slab backing (4 KiB / 8 KiB / 16 KiB / 32 KiB / 64 KiB according to object size); allocations above the small-object threshold use area allocations. `reserved_bytes` is address-space reservation only; `committed_bytes` is the real OS-backed committed memory, and `physical_bytes` is an alias for `committed_bytes`, not a separate source. `live_bytes` is the caller-visible payload/object bytes currently allocated.
+The allocator v2 backend is size-class based rather than object-type based. Node, directory, page-group, name and generic allocation APIs all converge on the same rounded-size class, so there is one **logical size-class pool** rather than separate node/name/generic pools. Internally, the current implementation uses eight concurrency lanes inside each class; each lane owns a subset of slabs/area cache entries to avoid a single hot SRW lock. These lanes are an allocator synchronization detail, not business-type pools. Empty slabs are returned to the VM backend, so lanes are not intended to reserve permanent per-thread arenas. A local A/B test is kept as a design constraint: at 64-byte allocations and 16 threads the current lanes sustained about 18.8M alloc/free ops/s, while a literal one-lock pool fell to about 3.1M ops/s and a one-pool global SList experiment reached about 4.9M ops/s. We therefore keep the lanes until a magazine/remote-free design can match their concurrency without increasing fragmentation.
+
+The process-wide control allocation used for `Memfs` itself goes through the same size-class/slab/area machinery; only allocator-state bootstrap reaches the VM backend directly. Small allocations use adaptive slab backing (4 KiB / 8 KiB / 16 KiB / 32 KiB / 64 KiB according to object size); allocations above the small-object threshold use area allocations. `reserved_bytes` is address-space reservation only; `committed_bytes` is the real OS-backed committed memory, and `physical_bytes` is an alias for `committed_bytes`, not a separate source. `live_bytes` is the caller-visible payload/object bytes currently allocated.
 
 `capacity_auto=true` makes memfs derive its writable allowance from current system memory and allocator backing instead of using a fixed user capacity. `memfs_auto_allowance_bytes()` reports the current allowance, while `used_bytes`, `resident_bytes`, `committed_bytes` and `physical_bytes` remain separate measurements: logical quota, resident payload, and allocator physical backing. The benchmark reports these separately so high-water checks do not confuse allocator backing with logical file usage.
 
@@ -309,7 +315,8 @@ tests/
   memfs_core_test.c unit/stress/concurrency/codec tests
   integration.ps1   real mounted-drive integration test
 scripts/
-  memfs-service.ps1 install/start/query/stop/delete wrapper around sc.exe
+  prepare-winfsp-static.ps1 derive/build a static WinFsp runtime matching the signed driver
+  memfs-service.ps1         install/start/query/stop/delete wrapper around sc.exe
 ```
 
 ## Planned next steps
