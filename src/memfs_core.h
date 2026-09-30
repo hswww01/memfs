@@ -138,7 +138,10 @@ struct MemfsPage {
 // sparse group 不再固定付 2KB pointer table。
 struct MemfsPageGroup {
 	uint64_t bitmap[MEMFS_PAGE_GROUP_WORDS];
-	MemfsPage** pages;
+	union {
+		MemfsPage** pages;
+		MemfsPage* inline_page;
+	};
 	uint16_t page_count;
 	uint16_t page_capacity;
 };
@@ -178,6 +181,7 @@ uint32_t memfs_node_page_group_count(const MemfsNode* node);
 uint32_t memfs_node_page_group_capacity(const MemfsNode* node);
 uint64_t memfs_node_page_group_index(const MemfsNode* node, uint32_t position);
 MemfsPageGroup* memfs_node_page_group(const MemfsNode* node, uint32_t position);
+MemfsPage* memfs_page_group_page(const MemfsPageGroup* group, uint32_t position);
 int8_t memfs_node_compression_score(const MemfsNode* node);
 
 struct MemfsNode {

@@ -912,6 +912,107 @@ static void test_small_storage(void) {
 	memfs_destroy(fs);
 }
 
+static void test_page_group_inline_single_page_transition(void) {
+	Memfs* fs = NULL;
+	MemfsNode* file = NULL;
+	MemfsPageGroup* group;
+	MemfsPage* first_page;
+	uint8_t first[MEMFS_PAGE_SIZE];
+	uint8_t second[MEMFS_PAGE_SIZE];
+	uint8_t verify[MEMFS_PAGE_SIZE];
+	uint32_t transferred = 0;
+
+	printf("== page group inline single-page transition ==\n");
+	memset(first, 0x31, sizeof(first));
+	memset(second, 0x72, sizeof(second));
+
+	CHECK(memfs_create(16ULL * 1024ULL * 1024ULL, L"INLINEGROUP", &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	if (fs == NULL)
+		return;
+
+	CHECK(memfs_node_create(fs, fs->root, L"inline-group.bin", false,
+							FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(file != NULL);
+	if (file == NULL)
+		goto cleanup;
+
+	CHECK(memfs_node_write(file, first, MEMFS_PAGE_SIZE, sizeof(first), false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(first));
+	CHECK(memfs_node_page_group_count(file) == 1);
+	group = memfs_node_page_group(file, 0);
+	CHECK(group != NULL);
+	if (group == NULL)
+		goto cleanup;
+
+	CHECK(group->page_count == 1);
+	CHECK(group->page_capacity == 1);
+	first_page = memfs_page_group_page(group, 0);
+	CHECK(first_page != NULL);
+
+#if !defined(NDEBUG)
+	/*
+	 * Second full-page write allocates: replacement vector, raw page, then
+	 * the 2-entry pointer array. Failing the third generic allocation must
+	 * leave the original inline representation and file contents untouched.
+	 */
+	memfs_allocator_test_fail_after(MEMFS_ALLOC_FAIL_GENERIC, 2, 1);
+	transferred = 1234;
+	CHECK(memfs_node_write(file, second, 2ULL * MEMFS_PAGE_SIZE, sizeof(second),
+						   false, false, &transferred) == MEMFS_ERR_NO_MEMORY);
+	CHECK(transferred == 0);
+	memfs_allocator_test_clear_failures();
+
+	group = memfs_node_page_group(file, 0);
+	CHECK(group != NULL);
+	if (group != NULL) {
+		CHECK(group->page_count == 1);
+		CHECK(group->page_capacity == 1);
+		CHECK(memfs_page_group_page(group, 0) == first_page);
+	}
+	CHECK(file->file_size == 2ULL * MEMFS_PAGE_SIZE);
+	memset(verify, 0, sizeof(verify));
+	CHECK(memfs_node_read(file, verify, MEMFS_PAGE_SIZE, sizeof(verify), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(verify));
+	CHECK(memcmp(first, verify, sizeof(first)) == 0);
+#endif
+
+	CHECK(memfs_node_write(file, second, 2ULL * MEMFS_PAGE_SIZE, sizeof(second),
+						   false, false, &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(second));
+	group = memfs_node_page_group(file, 0);
+	CHECK(group != NULL);
+	if (group != NULL) {
+		CHECK(group->page_count == 2);
+		CHECK(group->page_capacity == 2);
+		CHECK(memfs_page_group_page(group, 0) == first_page);
+		CHECK(memfs_page_group_page(group, 1) != NULL);
+	}
+
+	CHECK(memfs_node_set_file_size(file, 2ULL * MEMFS_PAGE_SIZE) == MEMFS_OK);
+	group = memfs_node_page_group(file, 0);
+	CHECK(group != NULL);
+	if (group != NULL) {
+		CHECK(group->page_count == 1);
+		CHECK(group->page_capacity == 1);
+		CHECK(memfs_page_group_page(group, 0) == first_page);
+		CHECK(memfs_page_group_page(group, 1) == NULL);
+	}
+
+	memset(verify, 0, sizeof(verify));
+	CHECK(memfs_node_read(file, verify, MEMFS_PAGE_SIZE, sizeof(verify), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(verify));
+	CHECK(memcmp(first, verify, sizeof(first)) == 0);
+
+cleanup:
+	memfs_allocator_test_clear_failures();
+	if (file != NULL) {
+		(void)memfs_node_unlink(file);
+		memfs_node_close(file);
+	}
+	memfs_destroy(fs);
+}
+
 static void test_sparse_pages(void) {
 	Memfs* fs = NULL;
 	MemfsNode* file;
@@ -961,9 +1062,9 @@ static void test_sparse_pages(void) {
 		if (group) {
 			CHECK(group->page_count == 1);
 			CHECK(group->page_capacity == 1);
-			CHECK(group->pages != NULL);
-			if (group->pages)
-				CHECK(group->pages[0] != NULL);
+			CHECK(memfs_page_group_page(group, 0) != NULL);
+			if (memfs_page_group_page(group, 0))
+				CHECK(memfs_page_group_page(group, 0) != NULL);
 		}
 	}
 
@@ -1659,12 +1760,12 @@ static void test_compression(void) {
 	group = memfs_node_page_group(file, 0);
 	CHECK(group != NULL);
 	if (group) {
-		CHECK(group->pages[0] != NULL);
-		CHECK(group->pages[1] != NULL);
-		if (group->pages[0])
-			CHECK(0 != (group->pages[0]->flags & MEMFS_PAGE_COMPRESSED));
-		if (group->pages[1])
-			CHECK(0 != (group->pages[1]->flags & MEMFS_PAGE_COMPRESSED));
+		CHECK(memfs_page_group_page(group, 0) != NULL);
+		CHECK(memfs_page_group_page(group, 1) != NULL);
+		if (memfs_page_group_page(group, 0))
+			CHECK(0 != (memfs_page_group_page(group, 0)->flags & MEMFS_PAGE_COMPRESSED));
+		if (memfs_page_group_page(group, 1))
+			CHECK(0 != (memfs_page_group_page(group, 1)->flags & MEMFS_PAGE_COMPRESSED));
 	}
 
 	CHECK(memfs_node_resident_bytes(file) < 1024);
@@ -1730,7 +1831,7 @@ static void test_adaptive_compression(void) {
 	group = memfs_node_page_group(file, 0);
 	CHECK(group != NULL);
 	if (group && group->page_count == 128) {
-		CHECK(0 != (group->pages[127]->flags & MEMFS_PAGE_COMPRESSED));
+		CHECK(0 != (memfs_page_group_page(group, 127)->flags & MEMFS_PAGE_COMPRESSED));
 	}
 
 	memset(verify, 0, sizeof(verify));
@@ -1783,11 +1884,11 @@ static void test_compression_incompressible_page_fallback(void) {
 	group = memfs_node_page_group(file, 0);
 	if (group) {
 		CHECK(group->page_count == 1);
-		CHECK(group->pages[0] != NULL);
-		if (group->pages[0]) {
-			CHECK(0 == (group->pages[0]->flags & MEMFS_PAGE_COMPRESSED));
-			CHECK(group->pages[0]->plain_size == MEMFS_PAGE_SIZE);
-			CHECK(group->pages[0]->stored_size >= MEMFS_PAGE_SIZE);
+		CHECK(memfs_page_group_page(group, 0) != NULL);
+		if (memfs_page_group_page(group, 0)) {
+			CHECK(0 == (memfs_page_group_page(group, 0)->flags & MEMFS_PAGE_COMPRESSED));
+			CHECK(memfs_page_group_page(group, 0)->plain_size == MEMFS_PAGE_SIZE);
+			CHECK(memfs_page_group_page(group, 0)->stored_size >= MEMFS_PAGE_SIZE);
 		}
 	}
 
@@ -1818,9 +1919,9 @@ static void test_compression_incompressible_page_fallback(void) {
 	group = memfs_node_page_group(file, 0);
 	if (group) {
 		CHECK(group->page_count == 1);
-		CHECK(group->pages[0] != NULL);
-		if (group->pages[0])
-			CHECK(0 == (group->pages[0]->flags & MEMFS_PAGE_COMPRESSED));
+		CHECK(memfs_page_group_page(group, 0) != NULL);
+		if (memfs_page_group_page(group, 0))
+			CHECK(0 == (memfs_page_group_page(group, 0)->flags & MEMFS_PAGE_COMPRESSED));
 	}
 
 	memset(verify, 0, sizeof(verify));
@@ -2017,9 +2118,9 @@ static void test_compression_encryption(void) {
 
 	group = memfs_node_page_group_count(file) ? memfs_node_page_group(file, 0) : NULL;
 	CHECK(group != NULL);
-	if (group && group->pages[0]) {
-		CHECK(0 != (group->pages[0]->flags & MEMFS_PAGE_COMPRESSED));
-		CHECK(0 != (group->pages[0]->flags & MEMFS_PAGE_ENCRYPTED));
+	if (group && memfs_page_group_page(group, 0)) {
+		CHECK(0 != (memfs_page_group_page(group, 0)->flags & MEMFS_PAGE_COMPRESSED));
+		CHECK(0 != (memfs_page_group_page(group, 0)->flags & MEMFS_PAGE_ENCRYPTED));
 	}
 	CHECK(memfs_node_resident_bytes(file) < 2048);
 
@@ -4396,6 +4497,7 @@ int main(void) {
 	test_no_space_rollback();
 	test_directory_order();
 	test_small_storage();
+	test_page_group_inline_single_page_transition();
 	test_sparse_pages();
 	test_sparse_multi_group_truncate_reclaim();
 	test_very_high_sparse_offset();

@@ -11,6 +11,8 @@
 #define BENCH_1MB_FILE_COUNT 100U
 #define BENCH_RANDOM_REWRITE_COUNT 1000U
 #define BENCH_COMPRESSION_PAGE_REWRITE_COUNT 200000U
+#define BENCH_SPARSE_GROUP_COUNT 4096U
+#define BENCH_SPARSE_GROUP_ROUNDS 16U
 #define BENCH_1MB_SIZE (1ULL * 1024ULL * 1024ULL)
 #define BENCH_4KB_SIZE 4096U
 #define BENCH_1B_SIZE 1U
@@ -22,6 +24,7 @@ typedef enum BenchMode {
 	BENCH_MODE_ENCRYPTION,
 	BENCH_MODE_COMBINED,
 	BENCH_MODE_COMPRESSION_PAGE,
+	BENCH_MODE_SPARSE_GROUPS,
 	BENCH_MODE_PRESSURE_POLICY
 } BenchMode;
 
@@ -1535,6 +1538,75 @@ cleanup:
 	return rc;
 }
 
+static int bench_sparse_single_page_groups(const BenchConfig* config, LARGE_INTEGER frequency) {
+	Memfs* fs = NULL;
+	MemfsNode* node = NULL;
+	MemfsAllocatorStats before;
+	MemfsAllocatorStats after;
+	uint8_t page[BENCH_4KB_SIZE];
+	LARGE_INTEGER start;
+	LARGE_INTEGER end;
+	uint32_t written = 0;
+	uint32_t i;
+	double seconds;
+	int rc = 1;
+
+	if (create_fs(config, &fs) != MEMFS_OK || fs == NULL)
+		return 1;
+	if (memfs_node_create(fs, fs->root, L"sparse-groups.bin", false,
+						  FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) != MEMFS_OK || node == NULL)
+		goto cleanup;
+
+	memset(page, 0x5a, sizeof(page));
+	memfs_allocator_get_stats(&fs->allocator, &before);
+
+	QueryPerformanceCounter(&start);
+	for (uint32_t round = 0; round < BENCH_SPARSE_GROUP_ROUNDS; round++) {
+		for (i = 0; i < BENCH_SPARSE_GROUP_COUNT; i++) {
+			uint64_t offset = (uint64_t)i * MEMFS_PAGE_GROUP_BYTES;
+			page[0] = (uint8_t)(i + round);
+			if (memfs_node_write(node, page, offset, sizeof(page), false, false, &written) != MEMFS_OK ||
+				written != sizeof(page))
+				goto cleanup;
+		}
+
+		if (round + 1U != BENCH_SPARSE_GROUP_ROUNDS &&
+			memfs_node_set_file_size(node, 0) != MEMFS_OK)
+			goto cleanup;
+	}
+	QueryPerformanceCounter(&end);
+	seconds = seconds_between(start, end, frequency);
+	memfs_allocator_get_stats(&fs->allocator, &after);
+
+	printf("\n[sparse single-page groups]\n");
+	printf("groups:           %u\n", BENCH_SPARSE_GROUP_COUNT);
+	printf("rounds:           %u\n", BENCH_SPARSE_GROUP_ROUNDS);
+	printf("logical span:     %llu B\n",
+		   (unsigned long long)((uint64_t)(BENCH_SPARSE_GROUP_COUNT - 1U) * MEMFS_PAGE_GROUP_BYTES + BENCH_4KB_SIZE));
+	print_rate("write4k", BENCH_SPARSE_GROUP_COUNT * BENCH_SPARSE_GROUP_ROUNDS, seconds);
+	printf("group_count:      %u\n", memfs_node_page_group_count(node));
+	printf("live_objects_delta: %lld\n",
+		   (long long)(after.live_objects - before.live_objects));
+	printf("live_bytes_delta:   %lld B\n",
+		   (long long)(after.live_bytes - before.live_bytes));
+	printf("reserved_delta:     %lld B\n",
+		   (long long)(after.reserved_bytes - before.reserved_bytes));
+	printf("committed_delta:    %lld B\n",
+		   (long long)(after.committed_bytes - before.committed_bytes));
+	printf("resident_bytes:     %llu B\n",
+		   (unsigned long long)memfs_node_resident_bytes(node));
+	rc = 0;
+
+cleanup:
+	if (node != NULL) {
+		(void)memfs_node_unlink(node);
+		memfs_node_close(node);
+	}
+	if (fs != NULL)
+		memfs_destroy(fs);
+	return rc;
+}
+
 static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* compression, BenchConfig* encryption,
 					  BenchConfig* combined, BenchMode* mode, bool* csv_enabled) {
 	int i;
@@ -1570,6 +1642,8 @@ static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* co
 			*mode = BENCH_MODE_COMBINED;
 		} else if (strcmp(argv[i], "--compression-page") == 0) {
 			*mode = BENCH_MODE_COMPRESSION_PAGE;
+		} else if (strcmp(argv[i], "--sparse-groups") == 0) {
+			*mode = BENCH_MODE_SPARSE_GROUPS;
 		} else if (strcmp(argv[i], "--pressure-policy") == 0) {
 			*mode = BENCH_MODE_PRESSURE_POLICY;
 		} else if (strcmp(argv[i], "--compare") == 0) {
@@ -1590,6 +1664,7 @@ static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* co
 			printf("  --encryption         run encryption mode only\n");
 			printf("  --combined           run compression+encryption combined mode only\n");
 			printf("  --compression-page   run 200k repeated compressible 4KB page rewrites\n");
+			printf("  --sparse-groups      write one 4KB page into each of 4096 distinct page groups\n");
 			printf("  --pressure-policy    run deterministic auto-capacity pressure/scavenge benchmark (Debug)\n");
 			printf("  --compression-level N set compression level for compression mode\n");
 			printf("  --csv                append CSV comparison data after --compare table\n");
@@ -1663,6 +1738,8 @@ int main(int argc, char** argv) {
 		rc = run_suite(&combined, "combined", frequency, combined_results);
 	} else if (mode == BENCH_MODE_COMPRESSION_PAGE) {
 		rc = bench_compression_page_rewrite(&compression, frequency);
+	} else if (mode == BENCH_MODE_SPARSE_GROUPS) {
+		rc = bench_sparse_single_page_groups(&plain, frequency);
 	} else if (mode == BENCH_MODE_PRESSURE_POLICY) {
 		rc = bench_pressure_policy(frequency);
 	}

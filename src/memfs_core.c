@@ -787,11 +787,25 @@ static uint32_t memfs_group_rank(const MemfsPageGroup* group, uint32_t slot) {
 	return rank;
 }
 
+static MemfsPage* memfs_group_page_at_rank(const MemfsPageGroup* group, uint32_t rank) {
+	if (group == NULL || rank >= group->page_count)
+		return NULL;
+
+	if (group->page_capacity == 1U)
+		return rank == 0 ? group->inline_page : NULL;
+
+	return group->pages[rank];
+}
+
+MemfsPage* memfs_page_group_page(const MemfsPageGroup* group, uint32_t position) {
+	return memfs_group_page_at_rank(group, position);
+}
+
 static MemfsPage* memfs_group_get(const MemfsPageGroup* group, uint32_t slot) {
 	if (group == NULL || !memfs_group_has(group, slot))
 		return NULL;
 
-	return group->pages[memfs_group_rank(group, slot)];
+	return memfs_group_page_at_rank(group, memfs_group_rank(group, slot));
 }
 
 static MemfsResult memfs_group_reserve(MemfsNode* node, MemfsPageGroup* group, uint32_t required) {
@@ -803,7 +817,13 @@ static MemfsResult memfs_group_reserve(MemfsNode* node, MemfsPageGroup* group, u
 	if (required > MEMFS_PAGES_PER_GROUP)
 		return MEMFS_ERR_INVALID;
 
-	capacity = group->page_capacity ? group->page_capacity : 1U;
+	if (required == 1U) {
+		group->inline_page = NULL;
+		group->page_capacity = 1U;
+		return MEMFS_OK;
+	}
+
+	capacity = group->page_capacity >= 2U ? group->page_capacity : 2U;
 	while (capacity < required) {
 		if (capacity >= MEMFS_PAGES_PER_GROUP / 2U) {
 			capacity = MEMFS_PAGES_PER_GROUP;
@@ -812,11 +832,25 @@ static MemfsResult memfs_group_reserve(MemfsNode* node, MemfsPageGroup* group, u
 		capacity <<= 1;
 	}
 
-	pages = memfs_allocator_realloc(&node->fs->allocator, group->pages,
-									(size_t)group->page_capacity * sizeof(*pages),
-									(size_t)capacity * sizeof(*pages));
-	if (pages == NULL)
-		return MEMFS_ERR_NO_MEMORY;
+	if (group->page_capacity <= 1U) {
+		MemfsPage* inline_page = group->page_count == 1U ? group->inline_page : NULL;
+
+		pages = memfs_allocator_alloc_uninit(
+			&node->fs->allocator, (size_t)capacity * sizeof(*pages));
+		if (pages == NULL)
+			return MEMFS_ERR_NO_MEMORY;
+
+		if (inline_page != NULL)
+			pages[0] = inline_page;
+	} else {
+		pages = memfs_allocator_realloc(
+			&node->fs->allocator,
+			group->pages,
+			(size_t)group->page_capacity * sizeof(*pages),
+			(size_t)capacity * sizeof(*pages));
+		if (pages == NULL)
+			return MEMFS_ERR_NO_MEMORY;
+	}
 
 	group->pages = pages;
 	group->page_capacity = (uint16_t)capacity;
@@ -828,24 +862,45 @@ static void memfs_group_try_shrink(MemfsNode* node, MemfsPageGroup* group) {
 	uint32_t target;
 
 	if (group->page_count == 0) {
-		if (group->pages)
-			memfs_allocator_free(&node->fs->allocator, group->pages, (size_t)group->page_capacity * sizeof(*group->pages));
-		group->pages = NULL;
+		if (group->page_capacity >= 2U && group->pages != NULL) {
+			memfs_allocator_free(
+				&node->fs->allocator,
+				group->pages,
+				(size_t)group->page_capacity * sizeof(*group->pages));
+		}
+		group->inline_page = NULL;
 		group->page_capacity = 0;
 		return;
 	}
 
-	if (group->page_capacity <= 1U || group->page_count * 2U > group->page_capacity) {
+	if (group->page_count == 1U) {
+		if (group->page_capacity >= 2U) {
+			MemfsPage* inline_page = group->pages[0];
+
+			memfs_allocator_free(
+				&node->fs->allocator,
+				group->pages,
+				(size_t)group->page_capacity * sizeof(*group->pages));
+			group->inline_page = inline_page;
+			group->page_capacity = 1U;
+		}
 		return;
 	}
 
-	target = 1U;
+	if (group->page_capacity <= 2U ||
+		group->page_count * 2U > group->page_capacity) {
+		return;
+	}
+
+	target = 2U;
 	while (target < group->page_count)
 		target <<= 1;
 
-	pages = memfs_allocator_realloc(&node->fs->allocator, group->pages,
-									(size_t)group->page_capacity * sizeof(*group->pages),
-									(size_t)target * sizeof(*group->pages));
+	pages = memfs_allocator_realloc(
+		&node->fs->allocator,
+		group->pages,
+		(size_t)group->page_capacity * sizeof(*group->pages),
+		(size_t)target * sizeof(*group->pages));
 	if (pages) {
 		group->pages = pages;
 		group->page_capacity = (uint16_t)target;
@@ -1145,8 +1200,12 @@ static void memfs_storage_remove_group(MemfsNode* node, uint64_t group_index) {
 		return;
 
 	group = memfs_storage_group_at(node, pos);
-	if (group->pages)
-		memfs_allocator_free(&node->fs->allocator, group->pages, (size_t)group->page_capacity * sizeof(*group->pages));
+	if (group->page_capacity >= 2U && group->pages != NULL) {
+		memfs_allocator_free(
+			&node->fs->allocator,
+			group->pages,
+			(size_t)group->page_capacity * sizeof(*group->pages));
+	}
 	memfs_allocator_free_page_group(&node->fs->allocator, group);
 
 	count = memfs_storage_group_count(node);
@@ -1160,7 +1219,7 @@ static MemfsResult memfs_storage_replace_page(MemfsNode* node, MemfsPageGroup* g
 											  MemfsPage* new_page) {
 	bool had_old = memfs_group_has(group, slot);
 	uint32_t rank = memfs_group_rank(group, slot);
-	MemfsPage* old_page = had_old ? group->pages[rank] : NULL;
+	MemfsPage* old_page = had_old ? memfs_group_page_at_rank(group, rank) : NULL;
 	size_t old_size = memfs_page_heap_size(old_page);
 	size_t new_size = memfs_page_heap_size(new_page);
 	uint32_t word = slot >> 6;
@@ -1175,17 +1234,28 @@ static MemfsResult memfs_storage_replace_page(MemfsNode* node, MemfsPageGroup* g
 		if (result != MEMFS_OK)
 			return result;
 
-		memmove(group->pages + rank + 1U, group->pages + rank,
-				(size_t)(group->page_count - rank) * sizeof(*group->pages));
+		if (group->page_capacity == 1U) {
+			group->inline_page = new_page;
+		} else {
+			memmove(group->pages + rank + 1U, group->pages + rank,
+					(size_t)(group->page_count - rank) * sizeof(*group->pages));
+			group->pages[rank] = new_page;
+		}
 
-		group->pages[rank] = new_page;
 		group->bitmap[word] |= 1ULL << bit;
 		group->page_count++;
 	} else if (had_old && new_page) {
-		group->pages[rank] = new_page;
+		if (group->page_capacity == 1U)
+			group->inline_page = new_page;
+		else
+			group->pages[rank] = new_page;
 	} else {
-		memmove(group->pages + rank, group->pages + rank + 1U,
-				(size_t)(group->page_count - rank - 1U) * sizeof(*group->pages));
+		if (group->page_capacity == 1U) {
+			group->inline_page = NULL;
+		} else {
+			memmove(group->pages + rank, group->pages + rank + 1U,
+					(size_t)(group->page_count - rank - 1U) * sizeof(*group->pages));
+		}
 
 		group->bitmap[word] &= ~(1ULL << bit);
 		group->page_count--;
@@ -1264,14 +1334,18 @@ static void memfs_storage_destroy_pages(MemfsNode* node) {
 		uint32_t i;
 
 		for (i = 0; i < group->page_count; i++) {
-			MemfsPage* page = group->pages[i];
+			MemfsPage* page = memfs_group_page_at_rank(group, i);
 
 			memfs_resident_sub(node, memfs_page_heap_size(page));
 			memfs_page_free(node, page);
 		}
 
-		if (group->pages)
-			memfs_allocator_free(&node->fs->allocator, group->pages, (size_t)group->page_capacity * sizeof(*group->pages));
+		if (group->page_capacity >= 2U && group->pages != NULL) {
+			memfs_allocator_free(
+				&node->fs->allocator,
+				group->pages,
+				(size_t)group->page_capacity * sizeof(*group->pages));
+		}
 		memfs_allocator_free_page_group(&node->fs->allocator, group);
 	}
 
@@ -2584,7 +2658,7 @@ uint64_t memfs_node_resident_bytes(const MemfsNode* node) {
 			continue;
 
 		for (i = 0; i < group->page_count; i++)
-			resident += memfs_page_heap_size(group->pages[i]);
+			resident += memfs_page_heap_size(memfs_group_page_at_rank(group, i));
 	}
 
 	return resident;
