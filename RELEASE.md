@@ -6,12 +6,14 @@ Verified on 2026-09-30 on Windows x64.
 
 - memfs repository: `D:\work\memfs`
 - WinFsp Git repository: `D:\src\winfsp`
-- signed embedded driver:
-  `C:\Program Files (x86)\WinFsp\SxS\sxs.20251221T124141Z\bin\winfsp-x64.sys`
-- driver FileVersion: `2.1.25156.ddca7bd`
+- signed embedded drivers from the same WinFsp SxS release:
+  - x64: `C:\Program Files (x86)\WinFsp\SxS\sxs.20251221T124141Z\bin\winfsp-x64.sys`
+  - ARM64: `C:\Program Files (x86)\WinFsp\SxS\sxs.20251221T124141Z\bin\winfsp-a64.sys`
+- both driver FileVersions: `2.1.25156.ddca7bd`
 - matching WinFsp source commit: `ddca7bd` (tag `v2.1`)
 - embedded driver SHA-256:
-  `03553FFFACD362F4A9A08C00B4F236A82354A183BC6028494FB32055386E13C9`
+  - x64: `03553FFFACD362F4A9A08C00B4F236A82354A183BC6028494FB32055386E13C9`
+  - ARM64: `BF3B1BF90A7C070D456FC43C8552CCF8BE85CDDDEF4F3B19091B4A64AE4E686C`
 - generated matching static worktree: `D:\src\winfsp-memfs-static`
 
 Run this before a clean build:
@@ -80,16 +82,6 @@ Both Debug and Release pass 11/11 tests:
 11. `memfs_embedded_winfsp_resources`
 
 
-ARM64 cross-build is now also reproducible:
-
-```powershell
-.\scripts\build-arm64.ps1 -Configuration Debug -SkipPackage
-.\scripts\build-arm64.ps1 -Configuration Release -RefreshWinFsp
-```
-
-The wrapper imports the Visual Studio `x64_arm64` environment, uses the `arm64-debug` / `arm64-release` clang-cl + Ninja presets, builds the `arm64-windows-static` vcpkg dependencies, and links the driver-matched `winfsp-static-a64.lib`.
-
-All ARM64 executables and test/helper binaries are verified as `IMAGE_FILE_MACHINE_ARM64`, the final EXE has no WinFsp DLL import, and the embedded ARM64 WinFsp SYS resource is present. This x64 development machine cannot execute ARM64 PE files, so ARM64 runtime CTest/mounted-drive verification remains a Windows ARM64 machine/VM gate rather than being reported as locally executed.
 ## Real mounted-drive integration
 
 The Release executable passed the real WinFsp integration test in all four modes:
@@ -109,23 +101,13 @@ Matching v2.1 static libraries:
 - Debug:
   `D:\src\winfsp-memfs-static\build\VStudio\build\Debug\winfsp-static-x64.lib`
   SHA-256:
-  `3DEF208459510144CCD7CD09A420F62C9E451A8485148803DB61D61AAF680714`
+  `4F7B338947B7D64A38F7C6D7905C445100F004430FAD38F9D63C949010A898A7`
 - Release:
   `D:\src\winfsp-memfs-static\build\VStudio\build\Release\winfsp-static-x64.lib`
   SHA-256:
-  `F1CDC481AF01FE2087158A94B9050C39D19253A6CB0D78535866F5FDE54D4130`
+  `7184AC5FACCDD24F266A980C0037AB261D05DC3DAD466741E029805742C8032F`
 
 
-Matching ARM64 v2.1 static libraries built from the same driver-matched commit:
-
-- Debug:
-  `D:\src\winfsp-memfs-static\build\VStudio\build\Debug\winfsp-static-a64.lib`
-  SHA-256:
-  `A31620264AAD2DC8E73FBC77C257598B405C8E4B1E6EFC2C22DA25ADCB70BE3A`
-- Release:
-  `D:\src\winfsp-memfs-static\build\VStudio\build\Release\winfsp-static-a64.lib`
-  SHA-256:
-  `B7D1D3F576D7C6E20490E0A0E08ED0072602253AF0CC932CFA3705728E847997`
 `memfs_static_winfsp_no_dll_import` verifies that the final EXE has no WinFsp DLL
 import or delay-import dependency.
 
@@ -133,22 +115,16 @@ The Release EXE therefore does not require `winfsp-x64.dll` at runtime.
 
 ## Embedded driver behavior
 
-The installed compatible official SxS driver is:
+The x64 user-mode executable embeds both signed kernel drivers from the matching WinFsp SxS release:
 
 ```text
-SERVICE_NAME: WinFsp+20251221T124141Z
-TYPE: FILE_SYSTEM_DRIVER
-STATE: RUNNING
-FileVersion: 2.1.25156.ddca7bd
-Path: C:\Program Files (x86)\WinFsp\SxS\sxs.20251221T124141Z\bin\winfsp-x64.sys
+x64:   winfsp-x64.sys  FileVersion 2.1.25156.ddca7bd
+ARM64: winfsp-a64.sys  FileVersion 2.1.25156.ddca7bd
 ```
 
-memfs first attempts normal `FspFileSystemCreate`. If a compatible driver is already
-available, it reuses it and does not install a parallel fallback service.
+CMake requires both SYS files to be the exact same signed WinFsp release as the statically linked x64 user-mode runtime. The shipping user-mode binary is always x64. On normal AMD64 Windows it selects the x64 SYS; on Windows 11 ARM64 running the x64 EXE under emulation, `IsWow64Process2` reports the native ARM64 machine and memfs selects the ARM64 SYS. No 32-bit user-mode or driver path is supported.
 
-Only when the driver is missing/unloadable does memfs extract the embedded signed SYS,
-register/start its private fallback filesystem-driver service, and retry
-`FspFileSystemCreate`.
+memfs first attempts normal `FspFileSystemCreate`. If a compatible official driver is already available, it reuses it and does not install a parallel fallback service. Only when the driver is missing/unloadable does memfs extract the architecture-matched embedded signed SYS, register/start its private fallback filesystem-driver service, and retry `FspFileSystemCreate`.
 
 The extraction path compares an existing file byte-for-byte before replacing it.
 
@@ -270,38 +246,24 @@ The harness verifies private service creation, MemfsC-owned driver filename/path
 
 ## Current binaries
 
-### x64
-
 Debug:
 
-- size: 3,139,584 bytes
-- SHA-256: `06B1C533285448329678DAC9C0BC21CA8DA1D13485B8B41E6BB8BF45C22F71E9`
+- size: 3,312,128 bytes
+- SHA-256: `5A3D865CC15BB991ED74D2CB3E9AF8C2A58A4807029A36F2A917F71E15BBB88D`
 
 Release:
 
-- size: 1,148,416 bytes
-- SHA-256: `D86B3B36081710E58DB71BC10A36D85CECE99AD38573D4E3D2A9FA11FCCF1C0F`
-
-### ARM64 cross-build
-
-Debug:
-
-- size: 3,037,696 bytes
-- SHA-256: `F4C76E42D4C5BFBE2F6B768434A3EABD9C6007AAC3673F8C5CBD332E208BBD82`
-
-Release:
-
-- size: 1,009,664 bytes
-- SHA-256: `838F89D420A6FF350A0A830105073319E437DECB41CDE1913791FCD81544D6AD`
-
-The ARM64 release package contains the same Release EXE hash.
+- size: 1,321,472 bytes
+- SHA-256: `500E7CA771B121FB83DC39D008DDF0972B01020B2DFC6AE037819FE8ADEF22E5`
 
 These hashes are verification artifacts for this local build, not permanent release
 identifiers.
 
 ## Release packaging
 
-`scripts\package-release.ps1` creates architecture-specific release directories (`dist\memfs-x64` by default, or `dist\memfs-arm64` with `-Architecture arm64`) with:
+`scripts\package-release.ps1` creates the single x64 user-mode release directory `dist\memfs-x64` with:
+
+That same package is the Windows 11 ARM64 package; there is no separate ARM64 user-mode build.
 
 - `memfs.exe`
 - `THIRD_PARTY_NOTICES.md`
@@ -324,7 +286,7 @@ Before broad external distribution, separately validate:
 - code-signing policy for the final EXE;
 - final WinFsp distribution-license decision for static linking (for proprietary distribution, obtain appropriate commercial permission or use distribution terms compatible with the applicable WinFsp/GPLv3 obligations);
 - Windows 10 and Windows 11 clean-machine installation;
-- ARM64 runtime CTest and mounted-drive verification on a real Windows ARM64 machine/VM (cross-build, static inspection and packaging now pass on x64);
+- Windows 11 ARM64 validation of the single x64 `memfs.exe` under x64 emulation, including selection/install of the embedded ARM64 kernel driver;
 - coexistence testing against materially older/newer official WinFsp installations, while preserving the private-service isolation rules already implemented;
 - service recovery across a real OS reboot (abnormal process termination is now covered automatically);
 - clean-machine embedded-driver fallback with no WinFsp installation present, using the now-checked-in `verify-deployment.ps1 -Scenario PrivateFallback -ExercisePrivateFallback` harness.

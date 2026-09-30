@@ -69,12 +69,12 @@ function Get-OfficialWinFspDrivers {
 }
 
 function Get-PrivateDriverFiles {
-    $arch = $env:PROCESSOR_ARCHITECTURE
-    $suffix = if ($arch -eq "ARM64") { "a64" } else { "x64" }
     $driverDir = Join-Path $env:WINDIR "System32\drivers"
     @(
-        Join-Path $driverDir "memfs-winfsp-$suffix.sys"
-        Join-Path $driverDir "memfs-winfsp-$suffix.alt.sys"
+        Join-Path $driverDir "memfs-winfsp-x64.sys"
+        Join-Path $driverDir "memfs-winfsp-x64.alt.sys"
+        Join-Path $driverDir "memfs-winfsp-a64.sys"
+        Join-Path $driverDir "memfs-winfsp-a64.alt.sys"
     )
 }
 

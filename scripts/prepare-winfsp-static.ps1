@@ -1,8 +1,6 @@
 param(
     [string]$WinFspRepo = "D:\src\winfsp",
     [string]$Worktree = "D:\src\winfsp-memfs-static",
-    [ValidateSet("x64", "ARM64")]
-    [string]$Platform = "x64",
     [string]$DriverPath = "",
     [string[]]$Configurations = @("Debug", "Release")
 )
@@ -10,9 +8,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 function Find-WinFspDriver {
-    param([string]$Arch)
-
-    $name = if ($Arch -eq "ARM64") { "winfsp-a64.sys" } else { "winfsp-x64.sys" }
+    $name = "winfsp-x64.sys"
     $candidates = @()
 
     foreach ($base in @(
@@ -48,7 +44,7 @@ if (-not (Test-Path (Join-Path $WinFspRepo ".git"))) {
 }
 
 if (-not $DriverPath) {
-    $DriverPath = Find-WinFspDriver -Arch $Platform
+    $DriverPath = Find-WinFspDriver
 }
 $DriverPath = (Resolve-Path $DriverPath).Path
 
@@ -138,18 +134,6 @@ $project = $project.Replace(
     $project,
     [Text.UTF8Encoding]::new($false))
 
-if ($Platform -eq "ARM64") {
-    $arm64Patcher = Join-Path $PSScriptRoot "patch-winfsp-arm64.py"
-    if (-not (Test-Path -LiteralPath $arm64Patcher -PathType Leaf)) {
-        throw "ARM64 patch helper not found: $arm64Patcher"
-    }
-
-    & python $arm64Patcher $Worktree $dstProject
-    if ($LASTEXITCODE -ne 0) {
-        throw "ARM64 WinFsp compatibility patch failed."
-    }
-}
-
 $msbuild = (Get-Command msbuild.exe -ErrorAction SilentlyContinue).Source
 if (-not $msbuild) {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -164,36 +148,14 @@ if (-not $msbuild -or -not (Test-Path $msbuild)) {
     throw "MSBuild not found."
 }
 
-$oldCl = $env:CL
-try {
-    if ($Platform -eq "ARM64") {
-        $env:CL = ((@($oldCl, "-Wno-incompatible-function-pointer-types") |
-            Where-Object { $_ }) -join " ").Trim()
-    }
-
-    foreach ($configuration in $Configurations) {
-        $arguments = @(
-            $dstProject,
-            "/m",
-            "/p:Configuration=$configuration",
-            "/p:Platform=$Platform",
-            "/v:minimal"
-        )
-        if ($Platform -eq "ARM64") {
-            $arguments += "/p:PlatformToolset=ClangCL"
-        }
-
-        & $msbuild @arguments
-        if ($LASTEXITCODE -ne 0) {
-            throw "WinFsp static build failed: $configuration|$Platform"
-        }
+foreach ($configuration in $Configurations) {
+    & $msbuild $dstProject /m /p:Configuration=$configuration /p:Platform=x64 /v:minimal
+    if ($LASTEXITCODE -ne 0) {
+        throw "WinFsp static build failed: $configuration|x64"
     }
 }
-finally {
-    $env:CL = $oldCl
-}
 
-$arch = if ($Platform -eq "ARM64") { "a64" } else { "x64" }
+$arch = "x64"
 
 Write-Host ""
 Write-Host "Prepared matching WinFsp static runtime:"
@@ -211,5 +173,5 @@ foreach ($configuration in $Configurations) {
 Write-Host ""
 Write-Host "Use with memfs:"
 Write-Host "  WINFSP_SOURCE_ROOT=$Worktree"
-Write-Host "  WINFSP_DRIVER_SOURCE=$DriverPath"
+Write-Host "  WINFSP_DRIVER_X64_SOURCE=$DriverPath"
 Write-Host "  WINFSP_EXPECTED_VERSION=$canonical"

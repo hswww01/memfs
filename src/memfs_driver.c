@@ -8,15 +8,17 @@
 #define MEMFS_WINFSP_DRIVER_SERVICE L"WinFsp+MemfsC"
 #define MEMFS_RUNTIME_DIR_NAME L"MemfsC"
 
-#if defined(_M_ARM64)
-#define MEMFS_WINFSP_DLL_FILE L"winfsp-a64.dll"
-#define MEMFS_WINFSP_SYS_FILE L"memfs-winfsp-a64.sys"
-#define MEMFS_WINFSP_SYS_ALT_FILE L"memfs-winfsp-a64.alt.sys"
-#else
 #define MEMFS_WINFSP_DLL_FILE L"winfsp-x64.dll"
-#define MEMFS_WINFSP_SYS_FILE L"memfs-winfsp-x64.sys"
-#define MEMFS_WINFSP_SYS_ALT_FILE L"memfs-winfsp-x64.alt.sys"
-#endif
+#define MEMFS_WINFSP_SYS_X64_FILE L"memfs-winfsp-x64.sys"
+#define MEMFS_WINFSP_SYS_X64_ALT_FILE L"memfs-winfsp-x64.alt.sys"
+#define MEMFS_WINFSP_SYS_ARM64_FILE L"memfs-winfsp-a64.sys"
+#define MEMFS_WINFSP_SYS_ARM64_ALT_FILE L"memfs-winfsp-a64.alt.sys"
+
+typedef struct MemfsEmbeddedDriverSpec {
+    WORD resource_id;
+    const wchar_t* primary_file;
+    const wchar_t* alternate_file;
+} MemfsEmbeddedDriverSpec;
 
 static INIT_ONCE g_runtime_once = INIT_ONCE_STATIC_INIT;
 static DWORD g_runtime_error = ERROR_SUCCESS;
@@ -259,12 +261,112 @@ static DWORD private_driver_path_for(const wchar_t* file_name,
     return ERROR_SUCCESS;
 }
 
-static DWORD embedded_driver_paths(wchar_t primary[MAX_PATH],
-                                   wchar_t alternate[MAX_PATH]) {
-    DWORD error = private_driver_path_for(MEMFS_WINFSP_SYS_FILE, primary);
+static DWORD driver_spec_for_machine(USHORT native_machine,
+                                     MemfsEmbeddedDriverSpec* spec) {
+    if (spec == NULL)
+        return ERROR_INVALID_PARAMETER;
+
+    switch (native_machine) {
+    case IMAGE_FILE_MACHINE_AMD64:
+        spec->resource_id = IDR_MEMFS_WINFSP_SYS_X64;
+        spec->primary_file = MEMFS_WINFSP_SYS_X64_FILE;
+        spec->alternate_file = MEMFS_WINFSP_SYS_X64_ALT_FILE;
+        return ERROR_SUCCESS;
+    case IMAGE_FILE_MACHINE_ARM64:
+        spec->resource_id = IDR_MEMFS_WINFSP_SYS_ARM64;
+        spec->primary_file = MEMFS_WINFSP_SYS_ARM64_FILE;
+        spec->alternate_file = MEMFS_WINFSP_SYS_ARM64_ALT_FILE;
+        return ERROR_SUCCESS;
+    default:
+        return ERROR_NOT_SUPPORTED;
+    }
+}
+
+static DWORD native_machine_type(USHORT* native_machine) {
+    typedef BOOL (WINAPI *IsWow64Process2Fn)(HANDLE, USHORT*, USHORT*);
+    HMODULE kernel32;
+    IsWow64Process2Fn is_wow64_process2;
+    USHORT process_machine = IMAGE_FILE_MACHINE_UNKNOWN;
+    USHORT host_machine = IMAGE_FILE_MACHINE_UNKNOWN;
+    SYSTEM_INFO info;
+
+    if (native_machine == NULL)
+        return ERROR_INVALID_PARAMETER;
+
+    kernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (kernel32 != NULL) {
+        is_wow64_process2 = (IsWow64Process2Fn)GetProcAddress(
+            kernel32, "IsWow64Process2");
+        if (is_wow64_process2 != NULL) {
+            if (!is_wow64_process2(
+                    GetCurrentProcess(), &process_machine, &host_machine))
+                return GetLastError();
+            if (host_machine != IMAGE_FILE_MACHINE_UNKNOWN) {
+                *native_machine = host_machine;
+                return ERROR_SUCCESS;
+            }
+        }
+    }
+
+    /*
+     * Fallback for older x64 Windows. Windows 11 on Arm exposes
+     * IsWow64Process2, which is required because GetNativeSystemInfo reports
+     * emulated processor details to x64 applications for compatibility.
+     */
+    GetNativeSystemInfo(&info);
+    if (info.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64) {
+        *native_machine = IMAGE_FILE_MACHINE_AMD64;
+        return ERROR_SUCCESS;
+    }
+
+    return ERROR_NOT_SUPPORTED;
+}
+
+static DWORD current_driver_spec(MemfsEmbeddedDriverSpec* spec) {
+    USHORT native_machine;
+    DWORD error = native_machine_type(&native_machine);
     if (error != ERROR_SUCCESS)
         return error;
-    return private_driver_path_for(MEMFS_WINFSP_SYS_ALT_FILE, alternate);
+    return driver_spec_for_machine(native_machine, spec);
+}
+
+#if defined(MEMFS_DRIVER_TESTING)
+DWORD memfs_driver_test_spec_for_machine(
+    USHORT native_machine,
+    WORD* resource_id,
+    const wchar_t** primary_file,
+    const wchar_t** alternate_file) {
+    MemfsEmbeddedDriverSpec spec;
+    DWORD error = driver_spec_for_machine(native_machine, &spec);
+
+    if (error != ERROR_SUCCESS)
+        return error;
+    if (resource_id)
+        *resource_id = spec.resource_id;
+    if (primary_file)
+        *primary_file = spec.primary_file;
+    if (alternate_file)
+        *alternate_file = spec.alternate_file;
+    return ERROR_SUCCESS;
+}
+
+DWORD memfs_driver_test_native_machine(USHORT* native_machine) {
+    return native_machine_type(native_machine);
+}
+#endif
+
+static DWORD embedded_driver_paths(const MemfsEmbeddedDriverSpec* spec,
+                                   wchar_t primary[MAX_PATH],
+                                   wchar_t alternate[MAX_PATH]) {
+    DWORD error;
+
+    if (spec == NULL)
+        return ERROR_INVALID_PARAMETER;
+
+    error = private_driver_path_for(spec->primary_file, primary);
+    if (error != ERROR_SUCCESS)
+        return error;
+    return private_driver_path_for(spec->alternate_file, alternate);
 }
 
 static DWORD resource_matches_file(WORD resource_id,
@@ -369,6 +471,29 @@ static DWORD delete_private_file(const wchar_t* path, BOOL* reboot_required) {
     return error;
 }
 
+static DWORD delete_all_private_driver_files(BOOL* reboot_required) {
+    static const wchar_t* const file_names[] = {
+        MEMFS_WINFSP_SYS_X64_FILE,
+        MEMFS_WINFSP_SYS_X64_ALT_FILE,
+        MEMFS_WINFSP_SYS_ARM64_FILE,
+        MEMFS_WINFSP_SYS_ARM64_ALT_FILE,
+    };
+    wchar_t path[MAX_PATH];
+    DWORD first_error = ERROR_SUCCESS;
+    DWORD error;
+    size_t i;
+
+    for (i = 0; i < _countof(file_names); ++i) {
+        error = private_driver_path_for(file_names[i], path);
+        if (error == ERROR_SUCCESS)
+            error = delete_private_file(path, reboot_required);
+        if (first_error == ERROR_SUCCESS && error != ERROR_SUCCESS)
+            first_error = error;
+    }
+
+    return first_error;
+}
+
 static const wchar_t* select_private_update_path(const wchar_t* running_path,
                                                  const wchar_t* primary_path,
                                                  const wchar_t* alternate_path) {
@@ -389,6 +514,7 @@ const wchar_t* memfs_driver_test_select_update_path(const wchar_t* running_path,
 DWORD memfs_winfsp_install_embedded_driver(void) {
     SC_HANDLE manager = NULL;
     SC_HANDLE service = NULL;
+    MemfsEmbeddedDriverSpec driver_spec;
     wchar_t primary_path[MAX_PATH];
     wchar_t alternate_path[MAX_PATH];
     wchar_t current_path[MAX_PATH];
@@ -399,7 +525,11 @@ DWORD memfs_winfsp_install_embedded_driver(void) {
     DWORD start_error;
     BOOL matches = FALSE;
 
-    error = embedded_driver_paths(primary_path, alternate_path);
+    error = current_driver_spec(&driver_spec);
+    if (error != ERROR_SUCCESS)
+        return error;
+
+    error = embedded_driver_paths(&driver_spec, primary_path, alternate_path);
     if (error != ERROR_SUCCESS)
         return error;
 
@@ -420,7 +550,7 @@ DWORD memfs_winfsp_install_embedded_driver(void) {
             return open_error;
         }
 
-        error = extract_resource(IDR_MEMFS_WINFSP_SYS, primary_path);
+        error = extract_resource(driver_spec.resource_id, primary_path);
         if (error != ERROR_SUCCESS) {
             CloseServiceHandle(manager);
             return error;
@@ -462,7 +592,7 @@ DWORD memfs_winfsp_install_embedded_driver(void) {
             running_path = current_path;
 
             error = resource_matches_file(
-                IDR_MEMFS_WINFSP_SYS, running_path, &matches);
+                driver_spec.resource_id, running_path, &matches);
             if (error != ERROR_SUCCESS)
                 goto exit;
             if (!matches) {
@@ -474,7 +604,7 @@ DWORD memfs_winfsp_install_embedded_driver(void) {
                  */
                 install_path = select_private_update_path(
                     running_path, primary_path, alternate_path);
-                error = extract_resource(IDR_MEMFS_WINFSP_SYS, install_path);
+                error = extract_resource(driver_spec.resource_id, install_path);
                 if (error != ERROR_SUCCESS)
                     goto exit;
 
@@ -496,7 +626,7 @@ DWORD memfs_winfsp_install_embedded_driver(void) {
             goto exit;
         }
 
-        error = extract_resource(IDR_MEMFS_WINFSP_SYS, primary_path);
+        error = extract_resource(driver_spec.resource_id, primary_path);
         if (error != ERROR_SUCCESS)
             goto exit;
         install_path = primary_path;
@@ -532,17 +662,11 @@ exit:
 DWORD memfs_winfsp_uninstall_embedded_driver(void) {
     SC_HANDLE manager = NULL;
     SC_HANDLE service = NULL;
-    wchar_t primary_path[MAX_PATH];
-    wchar_t alternate_path[MAX_PATH];
     SERVICE_STATUS status;
     DWORD state;
     DWORD error;
     DWORD first_error = ERROR_SUCCESS;
     BOOL reboot_required = FALSE;
-
-    error = embedded_driver_paths(primary_path, alternate_path);
-    if (error != ERROR_SUCCESS)
-        return error;
 
     manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
     if (manager == NULL)
@@ -591,10 +715,7 @@ DWORD memfs_winfsp_uninstall_embedded_driver(void) {
      * service path as a deletion target: a tampered/legacy service must not
      * make us delete an official WinFsp binary.
      */
-    error = delete_private_file(primary_path, &reboot_required);
-    if (first_error == ERROR_SUCCESS && error != ERROR_SUCCESS)
-        first_error = error;
-    error = delete_private_file(alternate_path, &reboot_required);
+    error = delete_all_private_driver_files(&reboot_required);
     if (first_error == ERROR_SUCCESS && error != ERROR_SUCCESS)
         first_error = error;
 

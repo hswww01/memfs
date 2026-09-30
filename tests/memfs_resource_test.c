@@ -42,10 +42,17 @@ int wmain(int argc, wchar_t** argv) {
     }
 
 #if defined(MEMFS_WINFSP_STATIC)
-    ok = check_resource(module, IDR_MEMFS_WINFSP_SYS, 100U * 1024U, "WinFsp SYS");
+    ok = check_resource(module, IDR_MEMFS_WINFSP_SYS_X64,
+                        100U * 1024U, "WinFsp x64 SYS") &&
+         check_resource(module, IDR_MEMFS_WINFSP_SYS_ARM64,
+                        100U * 1024U, "WinFsp ARM64 SYS");
 #else
-    ok = check_resource(module, IDR_MEMFS_WINFSP_DLL, 100U * 1024U, "WinFsp DLL") &&
-         check_resource(module, IDR_MEMFS_WINFSP_SYS, 100U * 1024U, "WinFsp SYS");
+    ok = check_resource(module, IDR_MEMFS_WINFSP_DLL,
+                        100U * 1024U, "WinFsp x64 DLL") &&
+         check_resource(module, IDR_MEMFS_WINFSP_SYS_X64,
+                        100U * 1024U, "WinFsp x64 SYS") &&
+         check_resource(module, IDR_MEMFS_WINFSP_SYS_ARM64,
+                        100U * 1024U, "WinFsp ARM64 SYS");
 #endif
 
     FreeLibrary(module);

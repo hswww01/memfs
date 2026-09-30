@@ -21,7 +21,7 @@ All file-system contents are volatile. Unmounting or terminating the process los
 
 ## Prerequisites
 
-- Windows 10/11 x64 for native local execution. ARM64 cross-builds are also supported; ARM64 runtime verification requires a Windows ARM64 machine/VM.
+- Windows 10/11 x64, or Windows 11 ARM64 running the x64 user-mode executable under Windows x64 emulation. 32-bit Windows and Windows 10 ARM64 are not supported.
 - WinFsp Git source tree at `D:\\src\\winfsp`; `scripts\\prepare-winfsp-static.ps1` derives the exact source commit from the installed signed driver and prepares `D:\\src\\winfsp-memfs-static`.
 - Visual Studio C/C++ build tools.
 - LLVM/clang-cl.
@@ -30,7 +30,7 @@ All file-system contents are volatile. Unmounting or terminating the process los
 
 The vcpkg manifest installs `zstd` and `libsodium`. Before the first build, run `scripts\\prepare-winfsp-static.ps1`. It reads the installed signed WinFsp driver's FileVersion, resolves the matching Git commit, creates `D:\\src\\winfsp-memfs-static`, applies the minimal static-user-mode support, and builds Debug/Release static libraries from that exact source version. The supplied presets then link that matching static runtime, so `memfs.exe` does not require `winfsp-x64.dll` at runtime.
 
-The WinFsp kernel driver is embedded as an EXE resource from the installed SxS driver. CMake compares the static source canonical major/minor version with the driver's FileVersion and fails configuration on a mismatch. CTest also calls `FspVersion()` from the linked static library and parses the built PE import/delay-import tables, so a stale cached static library or reintroduced `winfsp*.dll` dependency fails the build verification. If no compatible WinFsp driver is available at runtime, an elevated memfs process can install/start the embedded signed fallback driver and retry `FspFileSystemCreate`.
+Both signed WinFsp kernel drivers (`winfsp-x64.sys` and `winfsp-a64.sys`) are embedded into the single x64 `memfs.exe`. CMake requires the two SYS files to come from the same signed WinFsp release and to match the statically linked x64 user-mode runtime. At runtime memfs uses `IsWow64Process2` to determine the native Windows machine architecture: AMD64 hosts use the x64 SYS, while Windows 11 ARM64 hosts running the x64 EXE under emulation use the ARM64 SYS. Kernel drivers are never emulated. CTest also calls `FspVersion()` from the linked static library, checks both embedded SYS resources, and parses the built PE import/delay-import tables, so a stale cached static library or reintroduced `winfsp*.dll` dependency fails verification. If no compatible official WinFsp driver is available, an elevated memfs process installs/starts the matching embedded signed fallback driver and retries `FspFileSystemCreate`.
 
 ## Build
 
@@ -48,17 +48,6 @@ cmake --build --preset x64-release
 ctest --preset x64-release
 ```
 
-ARM64 is built with the same clang-cl + Ninja + vcpkg stack. The wrapper imports the Visual Studio `x64_arm64` environment before invoking the ARM64 presets, so the correct ARM64 CRT/Windows SDK libraries are selected:
-
-```powershell
-.\scripts\build-arm64.ps1 -Configuration Debug -SkipPackage
-.\scripts\build-arm64.ps1 -Configuration Release
-```
-
-Use `-RefreshWinFsp` when you want to recreate the driver-matched `winfsp-static-a64.lib` worktree before building. The Release invocation also creates `dist\memfs-arm64`.
-
-The x64 development machine can compile and statically inspect ARM64 binaries but cannot execute them. Runtime CTest and mounted-drive verification for ARM64 therefore remain a Windows ARM64 machine/VM validation.
-
 ## Release package and third-party notices
 
 Create the current x64 release package with:
@@ -67,14 +56,10 @@ Create the current x64 release package with:
 .\scripts\package-release.ps1
 ```
 
-For ARM64:
-
-```powershell
-.\scripts\package-release.ps1 -Architecture arm64
-```
-
 The package contains `memfs.exe`, `THIRD_PARTY_NOTICES.md`, SHA-256 sums,
 and the authoritative license texts for WinFsp, libsodium and zstd.
+
+This same x64 package is used on Windows 11 ARM64. Windows runs `memfs.exe` under x64 emulation, while memfs selects the embedded native ARM64 WinFsp kernel driver when a fallback driver is required.
 
 The current build statically links WinFsp user-mode code. WinFsp's local
 `License.txt` states GPLv3 and its FLOSS special exception explicitly covers
@@ -382,7 +367,6 @@ tests/
   service-recovery.ps1  SCM abnormal-termination restart/remount integration test
 scripts/
   prepare-winfsp-static.ps1 derive/build a static WinFsp runtime matching the signed driver
-  build-arm64.ps1           import x64_arm64 VS environment, cross-build/verify/package ARM64
   memfs-service.ps1         install/start/query/stop/delete wrapper around sc.exe
   verify-deployment.ps1     repeatable official/no-service/private-fallback deployment harness
 ```

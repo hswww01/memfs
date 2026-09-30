@@ -5,6 +5,7 @@
 #include <wchar.h>
 
 #include "memfs_driver.h"
+#include "memfs_resource.h"
 
 static int g_failures;
 
@@ -52,6 +53,41 @@ int wmain(void) {
     CHECK(_snwprintf_s(path, _countof(path), _TRUNCATE,
                        L"%smemfs-driver-test-%lu.bin",
                        temp_dir, GetCurrentProcessId()) >= 0);
+    {
+        WORD resource_id = 0;
+        const wchar_t* primary = NULL;
+        const wchar_t* alternate = NULL;
+        USHORT native_machine = IMAGE_FILE_MACHINE_UNKNOWN;
+
+        CHECK(memfs_driver_test_spec_for_machine(
+                  IMAGE_FILE_MACHINE_AMD64,
+                  &resource_id, &primary, &alternate) == ERROR_SUCCESS);
+        CHECK(resource_id == IDR_MEMFS_WINFSP_SYS_X64);
+        CHECK(primary != NULL &&
+              _wcsicmp(primary, L"memfs-winfsp-x64.sys") == 0);
+        CHECK(alternate != NULL &&
+              _wcsicmp(alternate, L"memfs-winfsp-x64.alt.sys") == 0);
+
+        resource_id = 0;
+        primary = NULL;
+        alternate = NULL;
+        CHECK(memfs_driver_test_spec_for_machine(
+                  IMAGE_FILE_MACHINE_ARM64,
+                  &resource_id, &primary, &alternate) == ERROR_SUCCESS);
+        CHECK(resource_id == IDR_MEMFS_WINFSP_SYS_ARM64);
+        CHECK(primary != NULL &&
+              _wcsicmp(primary, L"memfs-winfsp-a64.sys") == 0);
+        CHECK(alternate != NULL &&
+              _wcsicmp(alternate, L"memfs-winfsp-a64.alt.sys") == 0);
+
+        CHECK(memfs_driver_test_spec_for_machine(
+                  IMAGE_FILE_MACHINE_I386,
+                  NULL, NULL, NULL) == ERROR_NOT_SUPPORTED);
+
+        CHECK(memfs_driver_test_native_machine(&native_machine) == ERROR_SUCCESS);
+        CHECK(native_machine == IMAGE_FILE_MACHINE_AMD64 ||
+              native_machine == IMAGE_FILE_MACHINE_ARM64);
+    }
     {
         const wchar_t* primary = L"C:\\Windows\\System32\\drivers\\memfs-winfsp-x64.sys";
         const wchar_t* alternate = L"C:\\Windows\\System32\\drivers\\memfs-winfsp-x64.alt.sys";

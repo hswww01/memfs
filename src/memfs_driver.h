@@ -16,4 +16,10 @@ const wchar_t* memfs_driver_test_select_update_path(
     const wchar_t* running_path,
     const wchar_t* primary_path,
     const wchar_t* alternate_path);
+DWORD memfs_driver_test_spec_for_machine(
+    USHORT native_machine,
+    WORD* resource_id,
+    const wchar_t** primary_file,
+    const wchar_t** alternate_file);
+DWORD memfs_driver_test_native_machine(USHORT* native_machine);
 #endif

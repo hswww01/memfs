@@ -8,6 +8,18 @@ if(NOT WIN32)
 	message(FATAL_ERROR "memfs currently targets Windows + WinFsp only")
 endif()
 
+# The product ships one 64-bit x64 user-mode executable. Windows 11 on Arm
+# runs it under x64 emulation; kernel drivers are embedded separately for
+# AMD64 and ARM64 and selected at runtime.
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+	message(FATAL_ERROR "32-bit Windows/user-mode builds are not supported")
+endif()
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|arm64|aarch64")
+	message(FATAL_ERROR
+		"Native ARM64 memfs.exe is intentionally not built. Build the x64 executable; "
+		"Windows 11 on Arm runs it under x64 emulation and memfs selects the ARM64 SYS at runtime.")
+endif()
+
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -23,7 +35,8 @@ set(WINFSP_ROOT "" CACHE PATH "WinFsp installation root")
 option(MEMFS_STATIC_WINFSP "Statically link the WinFsp user-mode runtime" ON)
 set(WINFSP_SOURCE_ROOT "" CACHE PATH "WinFsp source tree containing inc/ and build/VStudio/")
 set(WINFSP_STATIC_LIBRARY "" CACHE FILEPATH "Prebuilt static WinFsp user-mode library")
-set(WINFSP_DRIVER_SOURCE "" CACHE FILEPATH "WinFsp driver binary to embed into memfs.exe")
+set(WINFSP_DRIVER_X64_SOURCE "" CACHE FILEPATH "Signed WinFsp x64 driver to embed into memfs.exe")
+set(WINFSP_DRIVER_ARM64_SOURCE "" CACHE FILEPATH "Signed WinFsp ARM64 driver to embed into memfs.exe")
 set(WINFSP_EXPECTED_VERSION "" CACHE STRING
 	"Expected WinFsp major.minor for static runtime and embedded driver")
 
@@ -65,15 +78,8 @@ else()
 		REQUIRED)
 endif()
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|arm64|aarch64")
-	set(_winfsp_lib_name winfsp-a64)
-	set(_winfsp_dll_name winfsp-a64.dll)
-	set(_winfsp_sys_name winfsp-a64.sys)
-else()
-	set(_winfsp_lib_name winfsp-x64)
-	set(_winfsp_dll_name winfsp-x64.dll)
-	set(_winfsp_sys_name winfsp-x64.sys)
-endif()
+set(_winfsp_lib_name winfsp-x64)
+set(_winfsp_dll_name winfsp-x64.dll)
 
 if(MEMFS_STATIC_WINFSP)
 	if(WINFSP_SOURCE_ROOT)
@@ -83,9 +89,8 @@ if(MEMFS_STATIC_WINFSP)
 			set(_winfsp_static_config Release)
 		endif()
 
-		string(REPLACE "winfsp-" "" _winfsp_static_arch "${_winfsp_lib_name}")
 		set(_winfsp_static_candidate
-			"${WINFSP_SOURCE_ROOT}/build/VStudio/build/${_winfsp_static_config}/winfsp-static-${_winfsp_static_arch}.lib")
+			"${WINFSP_SOURCE_ROOT}/build/VStudio/build/${_winfsp_static_config}/winfsp-static-x64.lib")
 
 		if(EXISTS "${_winfsp_static_candidate}")
 			set(WINFSP_STATIC_LIBRARY "${_winfsp_static_candidate}" CACHE FILEPATH
@@ -112,17 +117,55 @@ else()
 		REQUIRED)
 endif()
 
-if(WINFSP_DRIVER_SOURCE)
-	if(NOT EXISTS "${WINFSP_DRIVER_SOURCE}")
-		message(FATAL_ERROR "WINFSP_DRIVER_SOURCE does not exist: ${WINFSP_DRIVER_SOURCE}")
+if(WINFSP_DRIVER_X64_SOURCE)
+	if(NOT EXISTS "${WINFSP_DRIVER_X64_SOURCE}")
+		message(FATAL_ERROR "WINFSP_DRIVER_X64_SOURCE does not exist: ${WINFSP_DRIVER_X64_SOURCE}")
 	endif()
-	set(WINFSP_DRIVER "${WINFSP_DRIVER_SOURCE}" CACHE FILEPATH "WinFsp driver binary to embed" FORCE)
+	set(WINFSP_DRIVER_X64 "${WINFSP_DRIVER_X64_SOURCE}" CACHE FILEPATH
+		"WinFsp x64 driver binary to embed" FORCE)
 else()
-	find_file(WINFSP_DRIVER
-		NAMES ${_winfsp_sys_name}
+	find_file(WINFSP_DRIVER_X64
+		NAMES winfsp-x64.sys
 		HINTS ${_winfsp_bin_hints}
 		REQUIRED)
 endif()
+
+if(WINFSP_DRIVER_ARM64_SOURCE)
+	if(NOT EXISTS "${WINFSP_DRIVER_ARM64_SOURCE}")
+		message(FATAL_ERROR "WINFSP_DRIVER_ARM64_SOURCE does not exist: ${WINFSP_DRIVER_ARM64_SOURCE}")
+	endif()
+	set(WINFSP_DRIVER_ARM64 "${WINFSP_DRIVER_ARM64_SOURCE}" CACHE FILEPATH
+		"WinFsp ARM64 driver binary to embed" FORCE)
+else()
+	find_file(WINFSP_DRIVER_ARM64
+		NAMES winfsp-a64.sys
+		HINTS ${_winfsp_bin_hints}
+		REQUIRED)
+endif()
+function(_memfs_read_driver_version driver_path out_full out_canonical)
+	execute_process(
+		COMMAND powershell.exe -NoLogo -NoProfile -NonInteractive -Command
+			"(Get-Item -LiteralPath '${driver_path}').VersionInfo.FileVersion"
+		RESULT_VARIABLE _driver_version_result
+		OUTPUT_VARIABLE _driver_file_version
+		ERROR_VARIABLE _driver_version_error
+		OUTPUT_STRIP_TRAILING_WHITESPACE)
+	if(NOT _driver_version_result EQUAL 0)
+		message(FATAL_ERROR
+			"Cannot read WinFsp driver version from ${driver_path}: ${_driver_version_error}")
+	endif()
+
+	string(REGEX MATCH "^([0-9]+)\\.([0-9]+)"
+		_driver_version_match "${_driver_file_version}")
+	if(NOT _driver_version_match)
+		message(FATAL_ERROR
+			"Cannot parse WinFsp driver FileVersion '${_driver_file_version}' from ${driver_path}")
+	endif()
+
+	set(${out_full} "${_driver_file_version}" PARENT_SCOPE)
+	set(${out_canonical} "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}" PARENT_SCOPE)
+endfunction()
+
 if(MEMFS_STATIC_WINFSP)
 	set(_winfsp_source_version "")
 	if(WINFSP_SOURCE_ROOT AND
@@ -160,33 +203,25 @@ if(MEMFS_STATIC_WINFSP)
 			"WINFSP_SOURCE_ROOT with build/VStudio/build.version.props")
 	endif()
 
-	execute_process(
-		COMMAND powershell.exe -NoLogo -NoProfile -NonInteractive -Command
-			"(Get-Item -LiteralPath '${WINFSP_DRIVER}').VersionInfo.FileVersion"
-		RESULT_VARIABLE _winfsp_driver_version_result
-		OUTPUT_VARIABLE _winfsp_driver_file_version
-		ERROR_VARIABLE _winfsp_driver_version_error
-		OUTPUT_STRIP_TRAILING_WHITESPACE)
+	_memfs_read_driver_version("${WINFSP_DRIVER_X64}"
+		_winfsp_driver_x64_full _winfsp_driver_x64_version)
+	_memfs_read_driver_version("${WINFSP_DRIVER_ARM64}"
+		_winfsp_driver_arm64_full _winfsp_driver_arm64_version)
 
-	if(NOT _winfsp_driver_version_result EQUAL 0)
-		message(FATAL_ERROR
-			"Cannot read embedded WinFsp driver version: "
-			"${_winfsp_driver_version_error}")
-	endif()
+	foreach(_driver_version IN ITEMS
+		"${_winfsp_driver_x64_version}"
+		"${_winfsp_driver_arm64_version}")
+		if(NOT _driver_version STREQUAL _winfsp_expected_version)
+			message(FATAL_ERROR
+				"WinFsp version mismatch: static x64 runtime expects "
+				"${_winfsp_expected_version}, but an embedded driver is ${_driver_version}")
+		endif()
+	endforeach()
 
-	string(REGEX MATCH "^([0-9]+)\\.([0-9]+)"
-		_winfsp_driver_version_match "${_winfsp_driver_file_version}")
-	if(NOT _winfsp_driver_version_match)
+	if(NOT _winfsp_driver_x64_full STREQUAL _winfsp_driver_arm64_full)
 		message(FATAL_ERROR
-			"Cannot parse WinFsp driver FileVersion '${_winfsp_driver_file_version}'")
-	endif()
-	set(_winfsp_driver_version "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}")
-
-	if(NOT _winfsp_driver_version STREQUAL _winfsp_expected_version)
-		message(FATAL_ERROR
-			"WinFsp version mismatch: static runtime expects "
-			"${_winfsp_expected_version}, but embedded driver "
-			"${WINFSP_DRIVER} is ${_winfsp_driver_file_version}")
+			"Embedded WinFsp drivers must be the same signed release: "
+			"x64=${_winfsp_driver_x64_full}, ARM64=${_winfsp_driver_arm64_full}")
 	endif()
 
 	string(REGEX MATCH "^([0-9]+)\\.([0-9]+)$"
@@ -203,8 +238,8 @@ if(MEMFS_STATIC_WINFSP)
 		OUTPUT_FORMAT HEXADECIMAL)
 
 	message(STATUS
-		"WinFsp static/runtime version ${_winfsp_expected_version}; "
-		"driver ${_winfsp_driver_file_version}")
+		"WinFsp static x64 runtime ${_winfsp_expected_version}; "
+		"embedded drivers x64/ARM64 ${_winfsp_driver_x64_full}")
 endif()
 
 if(MEMFS_STATIC_WINFSP)
@@ -215,7 +250,8 @@ else()
 		"IDR_MEMFS_WINFSP_DLL RCDATA \"${WINFSP_RUNTIME_RC}\"")
 endif()
 
-file(TO_CMAKE_PATH "${WINFSP_DRIVER}" WINFSP_DRIVER_RC)
+file(TO_CMAKE_PATH "${WINFSP_DRIVER_X64}" WINFSP_DRIVER_X64_RC)
+file(TO_CMAKE_PATH "${WINFSP_DRIVER_ARM64}" WINFSP_DRIVER_ARM64_RC)
 configure_file(
 	${CMAKE_CURRENT_SOURCE_DIR}/src/memfs_resources.rc.in
 	${CMAKE_CURRENT_BINARY_DIR}/memfs_resources.rc
