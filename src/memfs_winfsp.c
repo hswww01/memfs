@@ -536,6 +536,33 @@ static NTSTATUS fs_GetDirInfoByName(FSP_FILE_SYSTEM* file_system, PVOID file_con
 	return STATUS_SUCCESS;
 }
 
+static VOID fs_DispatcherStopped(
+    FSP_FILE_SYSTEM* file_system,
+    BOOLEAN normally) {
+	MemfsWinFsp* instance = memfs_instance(file_system);
+
+	if (instance == NULL)
+		return;
+
+	InterlockedExchange(
+		&instance->dispatcher_stop_reason,
+		normally
+			? MEMFS_DISPATCHER_STOPPED_NORMALLY
+			: MEMFS_DISPATCHER_STOPPED_ABNORMALLY);
+
+	if (instance->dispatcher_stopped_event != NULL)
+		SetEvent(instance->dispatcher_stopped_event);
+}
+
+#if defined(MEMFS_WINFSP_TESTING)
+void memfs_winfsp_test_dispatcher_stopped(
+    MemfsWinFsp* instance,
+    bool normally) {
+	if (instance != NULL && instance->file_system != NULL)
+		fs_DispatcherStopped(instance->file_system, normally ? TRUE : FALSE);
+}
+#endif
+
 static const FSP_FILE_SYSTEM_INTERFACE g_memfs_interface = {
 	.GetVolumeInfo = fs_GetVolumeInfo,
 	.SetVolumeLabel = fs_SetVolumeLabel,
@@ -557,6 +584,7 @@ static const FSP_FILE_SYSTEM_INTERFACE g_memfs_interface = {
 	.SetSecurity = fs_SetSecurity,
 	.ReadDirectory = fs_ReadDirectory,
 	.GetDirInfoByName = fs_GetDirInfoByName,
+	.DispatcherStopped = fs_DispatcherStopped,
 };
 
 static NTSTATUS memfs_win32_status(DWORD error) {
@@ -614,6 +642,15 @@ NTSTATUS memfs_winfsp_create_ex(
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
 	instance->store = instance_store;
+	instance->dispatcher_stopped_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+	if (instance->dispatcher_stopped_event == NULL) {
+		runtime_error = GetLastError();
+		if (detail_error)
+			*detail_error = runtime_error;
+		memfs_allocator_free(&instance_store->allocator, instance, sizeof(*instance));
+		memfs_destroy(instance_store);
+		return memfs_win32_status(runtime_error);
+	}
 
 	memset(&volume_params, 0, sizeof(volume_params));
 	volume_params.Version = sizeof(volume_params);
@@ -648,6 +685,8 @@ NTSTATUS memfs_winfsp_create_ex(
 	}
 	if (!NT_SUCCESS(status)) {
 		Memfs* store = instance->store;
+		if (instance->dispatcher_stopped_event != NULL)
+			CloseHandle(instance->dispatcher_stopped_event);
 		memfs_allocator_free(&store->allocator, instance, sizeof(*instance));
 		memfs_destroy(store);
 		return runtime_error != ERROR_SUCCESS ? memfs_win32_status(runtime_error) : status;
@@ -674,10 +713,37 @@ NTSTATUS memfs_winfsp_mount(MemfsWinFsp* instance, const wchar_t* mount_point) {
 }
 
 NTSTATUS memfs_winfsp_start(MemfsWinFsp* instance, uint32_t thread_count) {
-	if (instance == NULL)
+	if (instance == NULL || instance->dispatcher_stopped_event == NULL)
 		return STATUS_INVALID_PARAMETER;
 
+	ResetEvent(instance->dispatcher_stopped_event);
+	InterlockedExchange(
+		&instance->dispatcher_stop_reason,
+		MEMFS_DISPATCHER_ACTIVE);
 	return FspFileSystemStartDispatcher(instance->file_system, thread_count);
+}
+
+HANDLE memfs_winfsp_dispatcher_stopped_event(MemfsWinFsp* instance) {
+	return instance ? instance->dispatcher_stopped_event : NULL;
+}
+
+bool memfs_winfsp_dispatcher_stopped_normally(const MemfsWinFsp* instance) {
+	return instance != NULL &&
+		InterlockedCompareExchange(
+			(volatile LONG*)&instance->dispatcher_stop_reason,
+			MEMFS_DISPATCHER_ACTIVE,
+			MEMFS_DISPATCHER_ACTIVE) ==
+			MEMFS_DISPATCHER_STOPPED_NORMALLY;
+}
+
+NTSTATUS memfs_winfsp_dispatcher_result(const MemfsWinFsp* instance) {
+	NTSTATUS status = STATUS_INVALID_PARAMETER;
+
+	if (instance == NULL || instance->file_system == NULL)
+		return status;
+
+	FspFileSystemGetDispatcherResult(instance->file_system, &status);
+	return status;
 }
 
 void memfs_winfsp_stop(MemfsWinFsp* instance) {
@@ -692,8 +758,18 @@ void memfs_winfsp_destroy(MemfsWinFsp* instance) {
 	{
 		Memfs* store = instance->store;
 
-		if (instance->file_system)
+		if (instance->file_system) {
+			/*
+			 * StopDispatcher is idempotent. On an abnormal dispatcher exit
+			 * the thread is already signaled, so this closes the retained
+			 * thread handle before FileSystemDelete frees the WinFsp object.
+			 */
+			FspFileSystemStopDispatcher(instance->file_system);
 			FspFileSystemDelete(instance->file_system);
+		}
+
+		if (instance->dispatcher_stopped_event != NULL)
+			CloseHandle(instance->dispatcher_stopped_event);
 
 		memfs_allocator_free(&store->allocator, instance, sizeof(*instance));
 		memfs_destroy(store);

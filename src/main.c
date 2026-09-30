@@ -511,11 +511,61 @@ static int run_filesystem(const MemfsRunConfig* config,
             print_runtime_stats(instance->store, "mounted", config->stats_json);
     }
 
-    WaitForSingleObject(stop_event, INFINITE);
-    if (console_mode && config->stats_enabled)
-        print_runtime_stats(instance->store, "stopping", config->stats_json);
-    exit_code = 0;
-    memfs_winfsp_stop(instance);
+    {
+        HANDLE wait_handles[2];
+        DWORD wait_result;
+
+        wait_handles[0] = stop_event;
+        wait_handles[1] = memfs_winfsp_dispatcher_stopped_event(instance);
+        wait_result = WaitForMultipleObjects(
+            (DWORD)_countof(wait_handles), wait_handles, FALSE, INFINITE);
+
+        if (wait_result == WAIT_OBJECT_0) {
+            if (console_mode && config->stats_enabled)
+                print_runtime_stats(instance->store, "stopping", config->stats_json);
+            exit_code = 0;
+            memfs_winfsp_stop(instance);
+        } else if (wait_result == WAIT_OBJECT_0 + 1U) {
+            NTSTATUS dispatcher_status =
+                memfs_winfsp_dispatcher_result(instance);
+            bool normal =
+                memfs_winfsp_dispatcher_stopped_normally(instance);
+
+            /*
+             * A normal callback should only follow our own StopDispatcher,
+             * which is issued after the stop event wins the wait above. If it
+             * arrives here without a stop request, treat it as an unexpected
+             * lifetime break rather than silently leaving a "running" service.
+             */
+            if (normal &&
+                WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0) {
+                exit_code = 0;
+            } else {
+                if (NT_SUCCESS(dispatcher_status))
+                    dispatcher_status = STATUS_DEVICE_NOT_CONNECTED;
+                if (detail_error)
+                    *detail_error = (DWORD)dispatcher_status;
+                if (console_mode) {
+                    fwprintf(stderr,
+                             L"WinFsp dispatcher stopped unexpectedly: "
+                             L"0x%08X\n",
+                             (unsigned)dispatcher_status);
+                }
+                exit_code = 7;
+            }
+        } else {
+            DWORD wait_error =
+                wait_result == WAIT_FAILED ? GetLastError()
+                                           : ERROR_GEN_FAILURE;
+            if (detail_error)
+                *detail_error = wait_error;
+            if (console_mode)
+                fwprintf(stderr,
+                         L"Dispatcher/stop wait failed: %lu\n",
+                         wait_error);
+            exit_code = 8;
+        }
+    }
 
 exit:
     memfs_winfsp_destroy(instance);

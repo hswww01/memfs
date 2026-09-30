@@ -347,6 +347,39 @@ if(MEMFS_STATIC_WINFSP)
 			shlwapi
 			version
 			wldap32)
+	add_executable(memfs_winfsp_state_test
+		tests/memfs_winfsp_state_test.c
+		src/memfs_winfsp.c
+		src/memfs_driver.c)
+
+	target_include_directories(memfs_winfsp_state_test
+		SYSTEM PRIVATE
+			${WINFSP_INCLUDE_DIR})
+	target_include_directories(memfs_winfsp_state_test
+		PRIVATE
+			${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+	target_compile_definitions(memfs_winfsp_state_test
+		PRIVATE
+			WINFSP_STATIC
+			MEMFS_WINFSP_STATIC=1
+			MEMFS_WINFSP_TESTING
+			_CRT_SECURE_NO_WARNINGS
+			UNICODE
+			_UNICODE)
+
+	target_link_libraries(memfs_winfsp_state_test
+		PRIVATE
+			memfs_core
+			${WINFSP_LIBRARY}
+			advapi32
+			credui
+			netapi32
+			rpcrt4
+			secur32
+			shlwapi
+			version
+			wldap32)
 else()
 	target_link_libraries(memfs PRIVATE delayimp)
 	target_link_options(memfs
@@ -501,6 +534,8 @@ if(MEMFS_STATIC_WINFSP)
 		COMMAND memfs_static_import_test $<TARGET_FILE:memfs>)
 	add_test(NAME memfs_static_winfsp_version
 		COMMAND memfs_winfsp_version_test)
+	add_test(NAME memfs_winfsp_dispatcher_state
+		COMMAND memfs_winfsp_state_test)
 endif()
 
 add_test(NAME memfs_cli_help COMMAND memfs --help)
