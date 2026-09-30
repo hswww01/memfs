@@ -165,6 +165,16 @@ The helper is also verified end-to-end:
 
 `stop` and `delete` now handle an already-absent service cleanly.
 
+Abnormal-termination recovery is also verified with `tests\service-recovery.ps1`. The service was started as LocalSystem on R:, its process was forcibly terminated, and SCM restarted it with a new PID:
+
+```text
+old_pid=13196
+new_pid=46288
+readback=service-recovery-ok
+```
+
+The remounted filesystem was correctly empty after the crash (volatile data did not survive process death), new I/O succeeded, no private WinFsp fallback was created while the official SxS driver was available, and the test cleaned up `MemfsC` afterward. Reboot recovery remains a separate clean-machine/manual validation because this test intentionally does not reboot the development machine.
+
 Service startup failures preserve the underlying WinFsp NTSTATUS in
 `SERVICE_EXIT_CODE`. For example, deliberately trying to mount an already-existing
 normal directory produced:
@@ -278,5 +288,5 @@ Before broad external distribution, separately validate:
 - Windows 10 and Windows 11 clean-machine installation;
 - full memfs ARM64 configure/build/package after the Visual Studio ARM64 C/C++ toolchain is installed (the driver-matched ARM64 WinFsp static runtime already builds);
 - coexistence testing against materially older/newer official WinFsp installations, while preserving the private-service isolation rules already implemented;
-- service recovery after reboot and abnormal termination;
+- service recovery across a real OS reboot (abnormal process termination is now covered automatically);
 - clean-machine embedded-driver fallback with no WinFsp installation present, using the now-checked-in `verify-deployment.ps1 -Scenario PrivateFallback -ExercisePrivateFallback` harness.

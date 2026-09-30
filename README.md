@@ -156,6 +156,14 @@ A helper that still uses `sc.exe` for all service control is included:
 
 The service runs as LocalSystem by default. The first driver installation requires administrator rights. If a compatible official WinFsp SxS driver is already installed, memfs reuses it and does not create a parallel driver service. If the driver is missing or unloadable, memfs extracts the embedded signed WinFsp SYS resource, registers it through SCM, starts it, and retries `FspFileSystemCreate`.
 
+Abnormal service recovery is covered by a destructive-but-self-cleaning integration test:
+
+```powershell
+.\tests\service-recovery.ps1 -Exe .\build\x64-release\memfs.exe -Drive R: -Size 64M
+```
+
+The test installs `MemfsC` with the configured SCM restart policy, starts it, writes a sentinel file, forcibly terminates the service process, waits for SCM to restart it with a new PID and remount a fresh volatile filesystem, verifies post-restart I/O, and finally stops/deletes the service. On a machine with official WinFsp installed it also asserts that no private `WinFsp+MemfsC` fallback driver appears.
+
 If Service initialization fails, `sc.exe query MemfsC` preserves the underlying WinFsp/NTSTATUS value in `SERVICE_EXIT_CODE` instead of exposing only the generic Windows service error 1066.
 
 ### Deployment verification harness
@@ -352,8 +360,9 @@ src/
   memfs_winfsp.c    WinFsp callbacks
 
 tests/
-  memfs_core_test.c unit/stress/concurrency/codec tests
-  integration.ps1   real mounted-drive integration test
+  memfs_core_test.c      unit/stress/concurrency/codec tests
+  integration.ps1       real mounted-drive integration test
+  service-recovery.ps1  SCM abnormal-termination restart/remount integration test
 scripts/
   prepare-winfsp-static.ps1 derive/build a static WinFsp runtime matching the signed driver
   memfs-service.ps1         install/start/query/stop/delete wrapper around sc.exe
