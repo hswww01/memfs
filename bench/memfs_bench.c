@@ -10,6 +10,7 @@
 #define BENCH_4KB_FILE_COUNT 10000U
 #define BENCH_1MB_FILE_COUNT 100U
 #define BENCH_RANDOM_REWRITE_COUNT 1000U
+#define BENCH_COMPRESSION_PAGE_REWRITE_COUNT 200000U
 #define BENCH_1MB_SIZE (1ULL * 1024ULL * 1024ULL)
 #define BENCH_4KB_SIZE 4096U
 #define BENCH_1B_SIZE 1U
@@ -20,6 +21,7 @@ typedef enum BenchMode {
 	BENCH_MODE_COMPRESSION,
 	BENCH_MODE_ENCRYPTION,
 	BENCH_MODE_COMBINED,
+	BENCH_MODE_COMPRESSION_PAGE,
 	BENCH_MODE_PRESSURE_POLICY
 } BenchMode;
 
@@ -1469,6 +1471,70 @@ static void print_comparison_csv(const BenchResult* plain, const BenchResult* co
 		}
 	}
 }
+static int bench_compression_page_rewrite(const BenchConfig* config, LARGE_INTEGER frequency) {
+	Memfs* fs = NULL;
+	MemfsNode* node = NULL;
+	uint8_t page[BENCH_4KB_SIZE];
+	uint8_t verify[BENCH_4KB_SIZE];
+	LARGE_INTEGER start;
+	LARGE_INTEGER end;
+	uint64_t private_before;
+	uint64_t private_after;
+	uint32_t written = 0;
+	uint32_t read = 0;
+	uint32_t i;
+	double seconds;
+	int rc = 1;
+
+	if (create_fs(config, &fs) != MEMFS_OK || fs == NULL)
+		return 1;
+
+	if (memfs_node_create(fs, fs->root, L"compression-page.bin", false,
+						  FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) != MEMFS_OK || node == NULL)
+		goto cleanup;
+
+	private_before = private_bytes();
+	memset(page, 0x5a, sizeof(page));
+	if (memfs_node_write(node, page, 0, sizeof(page), false, false, &written) != MEMFS_OK ||
+		written != sizeof(page))
+		goto cleanup;
+
+	QueryPerformanceCounter(&start);
+	for (i = 0; i < BENCH_COMPRESSION_PAGE_REWRITE_COUNT; i++) {
+		page[0] = (uint8_t)i;
+		if (memfs_node_write(node, page, 0, sizeof(page), false, false, &written) != MEMFS_OK ||
+			written != sizeof(page))
+			goto cleanup;
+	}
+	QueryPerformanceCounter(&end);
+
+	seconds = seconds_between(start, end, frequency);
+	memset(verify, 0, sizeof(verify));
+	if (memfs_node_read(node, verify, 0, sizeof(verify), &read) != MEMFS_OK ||
+		read != sizeof(verify) || 0 != memcmp(page, verify, sizeof(page)))
+		goto cleanup;
+
+	private_after = private_bytes();
+	printf("\n[compression 4KB page rewrite]\n");
+	printf("rewrites:         %u\n", BENCH_COMPRESSION_PAGE_REWRITE_COUNT);
+	printf("compression:      level=%d\n", config->compression_level);
+	print_rate("rewrite4k", BENCH_COMPRESSION_PAGE_REWRITE_COUNT, seconds);
+	printf("ns/op:            %.1f\n",
+		   seconds > 0.0 ? seconds * 1000000000.0 / (double)BENCH_COMPRESSION_PAGE_REWRITE_COUNT : 0.0);
+	printf("resident_bytes:   %llu\n", (unsigned long long)memfs_node_resident_bytes(node));
+	printf("private_delta:    %lld B\n", (long long)(private_after - private_before));
+	rc = 0;
+
+cleanup:
+	if (node != NULL) {
+		(void)memfs_node_unlink(node);
+		memfs_node_close(node);
+	}
+	if (fs != NULL)
+		memfs_destroy(fs);
+	return rc;
+}
+
 static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* compression, BenchConfig* encryption,
 					  BenchConfig* combined, BenchMode* mode, bool* csv_enabled) {
 	int i;
@@ -1502,6 +1568,8 @@ static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* co
 			*mode = BENCH_MODE_ENCRYPTION;
 		} else if (strcmp(argv[i], "--combined") == 0) {
 			*mode = BENCH_MODE_COMBINED;
+		} else if (strcmp(argv[i], "--compression-page") == 0) {
+			*mode = BENCH_MODE_COMPRESSION_PAGE;
 		} else if (strcmp(argv[i], "--pressure-policy") == 0) {
 			*mode = BENCH_MODE_PRESSURE_POLICY;
 		} else if (strcmp(argv[i], "--compare") == 0) {
@@ -1521,6 +1589,7 @@ static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* co
 			printf("  --compression        run compression mode only\n");
 			printf("  --encryption         run encryption mode only\n");
 			printf("  --combined           run compression+encryption combined mode only\n");
+			printf("  --compression-page   run 200k repeated compressible 4KB page rewrites\n");
 			printf("  --pressure-policy    run deterministic auto-capacity pressure/scavenge benchmark (Debug)\n");
 			printf("  --compression-level N set compression level for compression mode\n");
 			printf("  --csv                append CSV comparison data after --compare table\n");
@@ -1592,6 +1661,8 @@ int main(int argc, char** argv) {
 		rc = run_suite(&encryption, "encryption", frequency, encryption_results);
 	} else if (mode == BENCH_MODE_COMBINED) {
 		rc = run_suite(&combined, "combined", frequency, combined_results);
+	} else if (mode == BENCH_MODE_COMPRESSION_PAGE) {
+		rc = bench_compression_page_rewrite(&compression, frequency);
 	} else if (mode == BENCH_MODE_PRESSURE_POLICY) {
 		rc = bench_pressure_policy(frequency);
 	}

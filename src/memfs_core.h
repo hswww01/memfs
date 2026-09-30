@@ -19,6 +19,7 @@
 #define MEMFS_SMALL_GRANULE 8U
 #define MEMFS_SMALL_LIMIT 4096U
 #define MEMFS_COMPRESSION_SKIP_SCORE 4
+#define MEMFS_COMPRESSION_CONTEXT_LANES 16U
 
 // 大文件按 4KB logical page 管理，一个二级 group 覆盖 1MB 文件范围。
 #define MEMFS_PAGE_SHIFT 12U
@@ -59,6 +60,11 @@ typedef struct MemfsSecurity MemfsSecurity;
 typedef struct MemfsPage MemfsPage;
 typedef struct MemfsPageGroup MemfsPageGroup;
 typedef struct MemfsPageGroupEntry MemfsPageGroupEntry;
+
+typedef struct MemfsCompressionLane {
+	SRWLOCK lock;
+	void* context;
+} MemfsCompressionLane;
 
 typedef struct MemfsOptions {
 	uint64_t capacity;
@@ -241,6 +247,8 @@ struct Memfs {
 	bool compression_enabled;
 	bool encryption_enabled;
 	int compression_level;
+
+	MemfsCompressionLane compression_lanes[MEMFS_COMPRESSION_CONTEXT_LANES];
 
 	uint8_t encryption_key[MEMFS_ENCRYPTION_KEY_SIZE];
 	uint8_t encryption_nonce_prefix[MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE];

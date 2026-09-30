@@ -9,6 +9,9 @@
 
 #define MEMFS_DEFAULT_SDDL L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)"
 
+_Static_assert((MEMFS_COMPRESSION_CONTEXT_LANES & (MEMFS_COMPRESSION_CONTEXT_LANES - 1U)) == 0,
+	"compression context lane count must be a power of two");
+
 struct MemfsStorageMeta {
 	MemfsPageGroupEntry* groups;
 	uint32_t count;
@@ -438,6 +441,101 @@ static void memfs_storage_adjust_compression_score(MemfsNode* node, bool useful)
 	}
 }
 
+static uint32_t memfs_compression_home_lane(void) {
+	uint32_t value = (uint32_t)GetCurrentThreadId();
+
+	value ^= value >> 16;
+	value *= 0x7feb352dU;
+	value ^= value >> 15;
+	value *= 0x846ca68bU;
+	value ^= value >> 16;
+	return value & (MEMFS_COMPRESSION_CONTEXT_LANES - 1U);
+}
+
+static ZSTD_CCtx* memfs_compression_context_acquire(Memfs* fs, uint32_t* lane_index) {
+	uint32_t home;
+	uint32_t probe;
+
+	if (fs == NULL || lane_index == NULL)
+		return NULL;
+
+	home = memfs_compression_home_lane();
+	for (probe = 0; probe < MEMFS_COMPRESSION_CONTEXT_LANES; probe++) {
+		uint32_t index = (home + probe) & (MEMFS_COMPRESSION_CONTEXT_LANES - 1U);
+		MemfsCompressionLane* lane = &fs->compression_lanes[index];
+
+		if (!TryAcquireSRWLockExclusive(&lane->lock))
+			continue;
+
+		if (lane->context == NULL)
+			lane->context = ZSTD_createCCtx();
+
+		if (lane->context != NULL) {
+			*lane_index = index;
+			return (ZSTD_CCtx*)lane->context;
+		}
+
+		ReleaseSRWLockExclusive(&lane->lock);
+	}
+
+	/*
+	 * All lanes are busy (or lazy allocation raced with memory pressure).
+	 * Block only on this thread's home lane, never on one global compression
+	 * lock. This preserves FINE-guard parallel writes across independent files.
+	 */
+	AcquireSRWLockExclusive(&fs->compression_lanes[home].lock);
+	if (fs->compression_lanes[home].context == NULL)
+		fs->compression_lanes[home].context = ZSTD_createCCtx();
+
+	if (fs->compression_lanes[home].context == NULL) {
+		ReleaseSRWLockExclusive(&fs->compression_lanes[home].lock);
+		return NULL;
+	}
+
+	*lane_index = home;
+	return (ZSTD_CCtx*)fs->compression_lanes[home].context;
+}
+
+static void memfs_compression_context_release(Memfs* fs, uint32_t lane_index) {
+	ReleaseSRWLockExclusive(&fs->compression_lanes[lane_index].lock);
+}
+
+static size_t memfs_compress_payload(Memfs* fs, void* dst, size_t dst_capacity,
+									 const void* src, size_t src_size) {
+	uint32_t lane_index;
+	ZSTD_CCtx* context;
+	size_t result;
+
+	context = memfs_compression_context_acquire(fs, &lane_index);
+	if (context == NULL) {
+		/*
+		 * Keep the old allocation-on-demand path as an OOM fallback. A failure
+		 * to allocate a reusable lane must not turn a writable page into an
+		 * application-visible compression error.
+		 */
+		return ZSTD_compress(dst, dst_capacity, src, src_size, fs->compression_level);
+	}
+
+	result = ZSTD_compressCCtx(
+		context, dst, dst_capacity, src, src_size, fs->compression_level);
+	memfs_compression_context_release(fs, lane_index);
+	return result;
+}
+
+static void memfs_compression_contexts_destroy(Memfs* fs) {
+	uint32_t i;
+
+	if (fs == NULL)
+		return;
+
+	for (i = 0; i < MEMFS_COMPRESSION_CONTEXT_LANES; i++) {
+		if (fs->compression_lanes[i].context != NULL) {
+			ZSTD_freeCCtx((ZSTD_CCtx*)fs->compression_lanes[i].context);
+			fs->compression_lanes[i].context = NULL;
+		}
+	}
+}
+
 static bool memfs_compression_should_try(MemfsNode* node, uint64_t storage_index, uint16_t plain_size) {
 	if (!node->fs->compression_enabled || plain_size < 128U)
 		return false;
@@ -487,7 +585,7 @@ static MemfsResult memfs_page_encode(MemfsNode* node, uint64_t storage_index, co
 	if (memfs_compression_should_try(node, storage_index, plain_size)) {
 		size_t compressed_size;
 
-		compressed_size = ZSTD_compress(compressed, sizeof(compressed), plain, plain_size, node->fs->compression_level);
+		compressed_size = memfs_compress_payload(node->fs, compressed, sizeof(compressed), plain, plain_size);
 
 		if (!ZSTD_isError(compressed_size) && compressed_size + 32U < plain_size) {
 			payload = compressed;
@@ -2520,6 +2618,11 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 		return MEMFS_ERR_NO_MEMORY;
 	}
 
+	for (uint32_t i = 0; i < MEMFS_COMPRESSION_CONTEXT_LANES; i++) {
+		InitializeSRWLock(&fs->compression_lanes[i].lock);
+		fs->compression_lanes[i].context = NULL;
+	}
+
 	fs->capacity = options->capacity;
 	fs->capacity_auto = options->capacity_auto;
 	fs->pressure_last_scavenge_tick = 0;
@@ -2611,6 +2714,7 @@ void memfs_destroy(Memfs* fs) {
 		(void)sodium_munlock(fs->encryption_key, MEMFS_ENCRYPTION_KEY_SIZE);
 	}
 
+	memfs_compression_contexts_destroy(fs);
 	memfs_allocator_destroy(&fs->allocator);
 	memfs_allocator_free_control(fs, sizeof(*fs));
 }
