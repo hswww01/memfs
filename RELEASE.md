@@ -210,6 +210,10 @@ blocks are covered by tests to ensure zeroed callers never observe stale data.
 
 Per-node metadata was subsequently reduced from 136 to 128 bytes without packing or removing the cached directory-name hash. This moves every `MemfsNode` from the allocator's 192-byte class into the 128-byte class, saving 64 slab bytes per live file/directory node. The former stored 64-bit `index_number` was replaced by a per-filesystem-seeded stable opaque ID derived from the node address; file IDs stay stable for the node lifetime and encryption AAD uses the same derived identity. Debug/Release tests, a 10-second soak, and real mounted plain/compression/encryption/combined integration all pass.
 
+Plain uncompressed full pages were also redesigned so a logical 4 KiB page consumes the allocator's 4096-byte class directly instead of storing an 8-byte `MemfsPage` header beside 4096 bytes of data and rounding the 4104-byte request into the 8192-byte class. Raw pages use a tagged aligned pointer representation; compressed/encrypted pages retain the structured `MemfsPage` object. Existing raw pages overwrite in place, full-zero writes remain sparse, and new-page writes use two-phase encode/commit for rollback safety. The measured resident backing for one plain full page is now 4096 bytes rather than 8192 bytes.
+
+To keep the 16 slab lanes from increasing allocator high-water across repeated identical workloads, a size-class pool now exposes an atomic available-shard bitmap. Allocation stays on the thread's home shard while it has capacity; before growing a new slab it probes only lanes advertised as having free objects and reuses that capacity across shards. At most one shard lock is held at a time. An 8-round fragmentation/reuse benchmark now keeps slab backing stable, final scavenging returns to baseline, allocator MT benchmarks report zero errors, and a 10-second soak reports zero committed/private drift.
+
 ## Repeatable deployment verification
 
 `scripts\verify-deployment.ps1` separates safe development-machine checks from the destructive clean-machine fallback path.
@@ -250,13 +254,13 @@ The harness verifies private service creation, MemfsC-owned driver filename/path
 
 Debug:
 
-- size: 3,313,152 bytes
-- SHA-256: `B67929681871F6DEFC62ADACCE3AF37B53124604D58B413D30C8601F6E987EB3`
+- size: 3,315,200 bytes
+- SHA-256: `9AD497AD07FD44859D641643405477EB68306D5FC9ACE670C31DF8A6853FFD9D`
 
 Release:
 
-- size: 1,318,912 bytes
-- SHA-256: `D0C1883A28205A3016394AC1E60A13B677AAABAF85D0713A779B098A1177D3E7`
+- size: 1,319,424 bytes
+- SHA-256: `D9CFF0432EE5F5CB7BDC9B30F600B1D59B677E513A30C995D55731ECDE959B85`
 
 These hashes are verification artifacts for this local build, not permanent release
 identifiers.
