@@ -180,7 +180,10 @@ namespace MemfsKit {
         throw "Expected native $ExpectedNativeMachine but machine is $nativeName"
     }
     if ($Scenario -eq 'Runtime') {
-        $cases = @(Get-Content -LiteralPath (Resolve-KitFile 'cases.json') -Raw | ConvertFrom-Json)
+        # PS5.1 emits a JSON array as one pipeline object; first assign its
+        # value, then enumerate it, instead of wrapping the pipeline itself.
+        $caseData = Get-Content -LiteralPath (Resolve-KitFile 'cases.json') -Raw | ConvertFrom-Json
+        $cases = @($caseData)
         if ($cases.Count -ne 20) { throw "Expected 20 portable registered tests, got $($cases.Count)" }
         foreach ($case in $cases) {
             $file = if ($case.executable -eq '@powershell') { $hostExe } else { Resolve-KitFile $case.executable }

@@ -20,8 +20,8 @@ manifest='\n'.join(lines)+'\n'
 ps5=Path(os.environ['WINDIR'])/'System32/WindowsPowerShell/v1.0/powershell.exe'
 ps7=Path(shutil.which('pwsh') or ps5)
 results=[]
-def run(name,success,host=ps7,extra=()):
- p=subprocess.run([str(host),'-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',str(fixture/runner.name),'-Scenario','Integrity',*extra],capture_output=True,encoding='utf-8',errors='replace',timeout=30,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+def run(name,success,host=ps7,extra=(),scenario="Integrity"):
+ p=subprocess.run([str(host),'-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',str(fixture/runner.name),'-Scenario',scenario,*extra],capture_output=True,encoding='utf-8',errors='replace',timeout=30,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
  (fixture/(name+'.outside.log')).write_text(p.stdout+'\n'+p.stderr,encoding='utf-8')
  # Logs are outside the payload trust set; move immediately into results.
  dest=fixture/'results'/(name+'.selftest.log')
@@ -57,6 +57,18 @@ run('wrong-native-architecture-rejected',False,extra=['-ExpectedNativeMachine',o
 lines2=[hashlib.sha256((fixture/line.split('  ',1)[1]).read_bytes()).hexdigest()+'  '+line.split('  ',1)[1] for line in lines]
 (fixture/'SHA256SUMS.txt').write_text('\n'.join(lines2)+'\n',encoding='utf-8')
 run('provenance-revision-mismatch-rejected',False)
+# Real Runtime dispatch in both PowerShell versions: 20 harmless child cases.
+# In Windows PowerShell 5.1 ConvertFrom-Json emits an array as one pipeline
+# item, so @(... | ConvertFrom-Json) incorrectly becomes a one-case catalog.
+(fixture/'KIT_INFO.json').write_text(json.dumps({'source_commit':'0'*40,'exe_sha256':h}),encoding='utf-8')
+cases=[{'name':'synthetic-case-'+str(i),'executable':'@powershell',
+        'arguments':['-NoLogo','-NoProfile','-NonInteractive','-Command','exit 0'],
+        'expected_exit':0,'timeout_seconds':15} for i in range(20)]
+(fixture/'cases.json').write_text(json.dumps(cases),encoding='utf-8')
+lines3=[hashlib.sha256((fixture/line.split('  ',1)[1]).read_bytes()).hexdigest()+'  '+line.split('  ',1)[1] for line in lines]
+(fixture/'SHA256SUMS.txt').write_text('\n'.join(lines3)+'\n',encoding='utf-8')
+run('runtime-catalog-powershell51',True,ps5,scenario='Runtime')
+run('runtime-catalog-powershell7',True,ps7,scenario='Runtime')
 out=root/'.agent/portable-runner-selftest.json'
 out.write_text(json.dumps({'time':datetime.datetime.now().astimezone().isoformat(),'fixture':str(fixture),'results':results,'passed':True},indent=2),encoding='utf-8')
 print(out)
