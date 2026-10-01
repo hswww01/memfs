@@ -101,6 +101,7 @@ struct MemfsAllocatorState {
     size_t allocation_granularity;
     uint64_t region_bytes;
     volatile LONG64 committed_total_bytes;
+    volatile LONG64 gross_commit_total_bytes;
     MemfsPool pools[MEMFS_ALLOC_CLASS_COUNT];
 
     MemfsAreaShard area_shards[MEMFS_POOL_SHARD_COUNT];
@@ -117,6 +118,7 @@ static MemfsAllocator g_control_allocator;
 static void state_add_committed(MemfsAllocatorState* state, uint64_t bytes) {
     if (state == NULL || bytes == 0)
         return;
+    InterlockedAdd64(&state->gross_commit_total_bytes, (LONG64)bytes);
     InterlockedAdd64(&state->committed_total_bytes, (LONG64)bytes);
 }
 
@@ -1018,6 +1020,7 @@ static MemfsAllocatorState* state_create(void) {
     state->allocation_granularity = vm_info.allocation_granularity;
     state->region_bytes = memfs_vm_region_bytes(state);
     state->committed_total_bytes = (LONG64)state->region_bytes;
+    state->gross_commit_total_bytes = (LONG64)state->region_bytes;
     for (shard_index = 0; shard_index < MEMFS_POOL_SHARD_COUNT; ++shard_index)
         InitializeSRWLock(&state->area_shards[shard_index].lock);
 
@@ -1244,6 +1247,13 @@ uint32_t memfs_allocator_test_shard_count(void) {
     return MEMFS_POOL_SHARD_COUNT;
 }
 #endif
+
+uint64_t memfs_allocator_commit_total_bytes(MemfsAllocator* allocator) {
+    if (allocator == NULL || allocator->state == NULL)
+        return 0;
+    return (uint64_t)InterlockedCompareExchange64(
+        &allocator->state->gross_commit_total_bytes, 0, 0);
+}
 
 uint64_t memfs_allocator_committed_bytes(MemfsAllocator* allocator) {
     if (allocator == NULL || allocator->state == NULL)

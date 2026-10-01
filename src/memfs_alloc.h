@@ -159,6 +159,8 @@ void memfs_allocator_free(MemfsAllocator* allocator, void* ptr, size_t bytes);
  * from memfs_allocator_get_stats().
  */
 uint64_t memfs_allocator_committed_bytes(MemfsAllocator* allocator);
+/* Cumulative successful VM commitments; frees do not reduce this counter. */
+uint64_t memfs_allocator_commit_total_bytes(MemfsAllocator* allocator);
 void memfs_allocator_get_stats(MemfsAllocator* allocator, MemfsAllocatorStats* stats);
 uint64_t memfs_allocator_scavenge(MemfsAllocator* allocator);
 

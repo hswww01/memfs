@@ -226,21 +226,25 @@ Area-cache retention is size-aware rather than uniformly keeping two idle region
 
 ## Auto-capacity available-memory sample cache
 
-After the allocator committed-byte query was reduced to O(1), the remaining auto-capacity growth overhead was dominated by a `GlobalMemoryStatusEx` call on every growth check. The production growth path now caches that OS sample for only 1 ms using a QPC deadline. Public `memfs_auto_allowance_bytes()` and runtime-stat queries remain live.
+The final task-66 review corrected three issues before accepting this optimization:
 
-The cache is conservative with respect to memfs's own allocations: it stores the allocator committed-byte count alongside the OS sample and subtracts any committed growth before using a cached value. Committed shrinkage does not increase the cached sample. Near soft pressure or when a request does not fit the cached allowance, the path scavenges and forces a fresh OS query. Debug builds bypass the cache so injected pressure values remain deterministic.
+- A forced refresh could overwrite sample fields while an old deadline remained valid. The entire snapshot is now read/published under the same SRW lock, not as unrelated atomic fields.
+- The former net-commit baseline was taken after the OS query. Gross successful commitments are now sampled before it; growth during the query and free/reallocate churn are conservatively debited.
+- The TTL now begins before the OS query. Normal Debug no longer bypasses the cache; a separate NDEBUG test executable deterministically exercises the real production path without enabling test hooks in memfs.exe.
 
-Seven Release benchmark runs on the same machine:
+Five Release measurements on 2026-10-01:
 
-| metric | before | after median | change |
-| --- | ---: | ---: | ---: |
-| committed query | 5.2 ns | 5.2 ns | unchanged |
-| live allowance query | 321.9 ns | 319.3 ns | intentionally unchanged |
-| fixed growth | 27.7 ns | 27.7 ns | unchanged |
-| auto growth | 347.3 ns | 63.8 ns | 5.44x faster / -81.6% |
-| auto/fixed ratio | 12.54x | 2.30x | substantially narrowed |
+| metric | before final correctness fix | after final correctness fix |
+| --- | ---: | ---: |
+| auto growth median | 63.9 ns | 62.6 ns |
+| fixed growth median | 27.8 ns | 27.7 ns |
+| original uncached auto growth (historical baseline) | 347.3 ns | — |
 
-Debug and Release pass 18/18 tests; Release `memfs_core_test` passed 50 consecutive runs, the MT stress test passed 10 consecutive runs, a 10-second compression+encryption soak reported zero private/committed drift, and a real mounted `--size auto` integration run passed.
+The small before/after difference is within normal microbenchmark variation; the correctness changes preserve the cache's performance benefit rather than claiming another material speedup. Public allowance queries still use a live OS sample. System memory can change between observation and allocation, so the cache is not a hard reservation against unrelated processes.
+
+Debug and Release now pass 19/19 CTest cases. The dedicated production-path test includes 200,000 cached reads racing 20,000 publications, and deterministic tests for expiry/forced refresh/slow-query aging, gross-commit debit, pressure rejection without data loss, and pressure relief.
+
+Mounted integration now checks multi-page byte-for-byte I/O, a cross-page rewrite, truncate/regrow zero filling, sparse holes, case-insensitive lookup and wildcard enumeration. It launches without a console and reports PASS only after graceful zero-exit shutdown and DOS-device removal. Forced termination is cleanup, not a passing result. A deliberately invalid CLI launch was confirmed to fail the integration harness rather than produce a false PASS.
 
 ## Hardware AES-GCM encryption fast path
 

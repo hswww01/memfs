@@ -107,9 +107,36 @@ static uint64_t memfs_min_u64(uint64_t a, uint64_t b) {
 	return a < b ? a : b;
 }
 
+#if defined(MEMFS_CAPACITY_TESTING)
+static MemfsCapacityTestHooks g_memfs_capacity_hooks;
+
+void memfs_test_capacity_set_hooks(const MemfsCapacityTestHooks* hooks) {
+	/* Install/remove only while no filesystem/test worker is running. */
+	if (hooks)
+		g_memfs_capacity_hooks = *hooks;
+	else
+		memset(&g_memfs_capacity_hooks, 0, sizeof(g_memfs_capacity_hooks));
+}
+#endif
+
+static bool memfs_capacity_clock(uint64_t* ticks) {
+	LARGE_INTEGER now;
+#if defined(MEMFS_CAPACITY_TESTING)
+	if (g_memfs_capacity_hooks.clock)
+		return g_memfs_capacity_hooks.clock(g_memfs_capacity_hooks.context, ticks);
+#endif
+	if (!QueryPerformanceCounter(&now) || now.QuadPart < 0)
+		return false;
+	*ticks = (uint64_t)now.QuadPart;
+	return true;
+}
+
 static uint64_t memfs_system_available_bytes(void) {
 	MEMORYSTATUSEX status;
-
+#if defined(MEMFS_CAPACITY_TESTING)
+	if (g_memfs_capacity_hooks.available)
+		return g_memfs_capacity_hooks.available(g_memfs_capacity_hooks.context);
+#endif
 #if !defined(NDEBUG)
 	{
 		LONG64 forced = InterlockedCompareExchange64(
@@ -118,27 +145,22 @@ static uint64_t memfs_system_available_bytes(void) {
 			return (uint64_t)forced;
 	}
 #endif
-
 	status.dwLength = sizeof(status);
 	if (!GlobalMemoryStatusEx(&status))
 		return 0;
-
 	return memfs_min_u64(status.ullAvailPhys, status.ullAvailPageFile);
 }
 
 static uint64_t memfs_adjust_cached_available(
 	uint64_t sampled_available,
-	uint64_t sampled_committed,
-	uint64_t current_committed) {
-	uint64_t own_growth;
-
-	if (current_committed <= sampled_committed)
-		return sampled_available;
-
-	own_growth = current_committed - sampled_committed;
-	return own_growth < sampled_available
-		? sampled_available - own_growth
-		: 0;
+	uint64_t sampled_commit_total,
+	uint64_t current_commit_total) {
+	uint64_t growth;
+	/* Cumulative gross commitments never decrease. Fail closed on wrap. */
+	if (current_commit_total < sampled_commit_total)
+		return 0;
+	growth = current_commit_total - sampled_commit_total;
+	return growth < sampled_available ? sampled_available - growth : 0;
 }
 
 #if !defined(NDEBUG)
@@ -151,96 +173,77 @@ uint64_t memfs_test_adjust_cached_available(
 }
 #endif
 
-static uint64_t memfs_auto_capacity_available_bytes(
-	Memfs* fs,
-	bool force_refresh) {
+/* Caller holds the cache's shared or exclusive lock. */
+static bool memfs_cached_available_locked(Memfs* fs, uint64_t now, uint64_t* available) {
+	if (now < fs->auto_available_sample_qpc ||
+		now >= fs->auto_available_cache_deadline_qpc)
+		return false;
+	*available = memfs_adjust_cached_available(
+		fs->auto_available_cached_bytes,
+		fs->auto_available_cached_commit_total,
+		memfs_allocator_commit_total_bytes(&fs->allocator));
+	return true;
+}
+
+static uint64_t memfs_auto_capacity_available_bytes(Memfs* fs, bool force_refresh) {
+	uint64_t now;
+	uint64_t available;
+	uint64_t commit_total;
+	uint64_t sampled_at;
+	bool valid;
+
 #if !defined(NDEBUG)
-	/*
-	 * Debug capacity/pressure tests intentionally change the available-memory
-	 * override between adjacent operations. Bypass the production cache so
-	 * those tests observe the requested value immediately.
-	 */
-	(void)fs;
-	(void)force_refresh;
-	return memfs_system_available_bytes();
-#else
-	LARGE_INTEGER now;
-	LARGE_INTEGER frequency;
-	LONG64 deadline;
-	uint64_t sampled_available;
-	uint64_t sampled_committed;
-	uint64_t current_committed;
-	uint64_t interval_ticks;
-
-	if (fs == NULL)
+	/* Only explicit legacy pressure overrides bypass caching. Normal Debug
+	 * and the dedicated instrumented Release tests use the production path. */
+	if (InterlockedCompareExchange64(&g_memfs_test_system_available_bytes, 0, 0) >= 0)
+		return memfs_system_available_bytes();
+#endif
+	if (fs == NULL || fs->auto_available_cache_interval_qpc == 0)
 		return memfs_system_available_bytes();
 
-	if (!QueryPerformanceCounter(&now))
-		return memfs_system_available_bytes();
-
-	deadline = InterlockedCompareExchange64(
-		&fs->auto_available_cache_deadline_qpc, 0, 0);
-	if (!force_refresh && deadline > now.QuadPart) {
-		sampled_available = (uint64_t)InterlockedCompareExchange64(
-			&fs->auto_available_cached_bytes, 0, 0);
-		sampled_committed = (uint64_t)InterlockedCompareExchange64(
-			&fs->auto_available_cached_committed, 0, 0);
-		current_committed = memfs_committed_bytes(fs);
-		return memfs_adjust_cached_available(
-			sampled_available, sampled_committed, current_committed);
+	if (!force_refresh) {
+		AcquireSRWLockShared(&fs->auto_available_refresh_lock);
+		valid = memfs_capacity_clock(&now) && memfs_cached_available_locked(fs, now, &available);
+		ReleaseSRWLockShared(&fs->auto_available_refresh_lock);
+		if (valid)
+			return available;
 	}
 
 	AcquireSRWLockExclusive(&fs->auto_available_refresh_lock);
-
-	/*
-	 * Another thread may have refreshed while we waited. Recheck before
-	 * entering the OS query.
-	 */
-	if (!force_refresh && QueryPerformanceCounter(&now)) {
-		deadline = InterlockedCompareExchange64(
-			&fs->auto_available_cache_deadline_qpc, 0, 0);
-		if (deadline > now.QuadPart) {
-			sampled_available = (uint64_t)InterlockedCompareExchange64(
-				&fs->auto_available_cached_bytes, 0, 0);
-			sampled_committed = (uint64_t)InterlockedCompareExchange64(
-				&fs->auto_available_cached_committed, 0, 0);
-			current_committed = memfs_committed_bytes(fs);
-			ReleaseSRWLockExclusive(&fs->auto_available_refresh_lock);
-			return memfs_adjust_cached_available(
-				sampled_available, sampled_committed, current_committed);
-		}
+	if (!memfs_capacity_clock(&sampled_at)) {
+		fs->auto_available_cache_deadline_qpc = 0;
+		available = memfs_system_available_bytes();
+		ReleaseSRWLockExclusive(&fs->auto_available_refresh_lock);
+		return available;
+	}
+	/* Refresh may have been completed by a thread ahead of us. */
+	if (!force_refresh && memfs_cached_available_locked(fs, sampled_at, &available)) {
+		ReleaseSRWLockExclusive(&fs->auto_available_refresh_lock);
+		return available;
 	}
 
-	sampled_available = memfs_system_available_bytes();
-	sampled_committed = memfs_committed_bytes(fs);
-
-	/*
-	 * Publish the deadline last. Cached readers that see a valid deadline
-	 * therefore also see the corresponding available/committed sample.
-	 */
-	InterlockedExchange64(
-		&fs->auto_available_cached_bytes, (LONG64)sampled_available);
-	InterlockedExchange64(
-		&fs->auto_available_cached_committed, (LONG64)sampled_committed);
-
-	if (QueryPerformanceFrequency(&frequency) &&
-		QueryPerformanceCounter(&now)) {
-		interval_ticks =
-			(uint64_t)frequency.QuadPart *
-			MEMFS_AUTO_AVAILABLE_CACHE_INTERVAL_US / 1000000ULL;
-		if (interval_ticks == 0)
-			interval_ticks = 1;
-		InterlockedExchange64(
-			&fs->auto_available_cache_deadline_qpc,
-			(LONG64)((uint64_t)now.QuadPart + interval_ticks));
-	} else {
-		InterlockedExchange64(&fs->auto_available_cache_deadline_qpc, 0);
-	}
-
+	/* Sample gross commits BEFORE asking the OS. Growth during the query is
+	 * debited too; free/reallocate churn cannot erase it via a net counter. */
+	commit_total = memfs_allocator_commit_total_bytes(&fs->allocator);
+	available = memfs_system_available_bytes();
+	fs->auto_available_cached_bytes = available;
+	fs->auto_available_cached_commit_total = commit_total;
+	fs->auto_available_sample_qpc = sampled_at;
+	fs->auto_available_cache_deadline_qpc =
+		sampled_at <= UINT64_MAX - fs->auto_available_cache_interval_qpc
+		? sampled_at + fs->auto_available_cache_interval_qpc : 0;
+	/* The TTL starts before the OS query, not after a potentially slow one. */
+	available = memfs_adjust_cached_available(available, commit_total,
+		memfs_allocator_commit_total_bytes(&fs->allocator));
 	ReleaseSRWLockExclusive(&fs->auto_available_refresh_lock);
-	return sampled_available;
-#endif
+	return available;
 }
+
+#if defined(MEMFS_CAPACITY_TESTING)
+uint64_t memfs_test_capacity_available(Memfs* fs, bool force_refresh) {
+	return memfs_auto_capacity_available_bytes(fs, force_refresh);
+}
+#endif
 
 static uint64_t memfs_auto_allowance_for_available(Memfs* fs, uint64_t available) {
 	uint64_t system_allowance;
@@ -3048,8 +3051,19 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 	fs->pressure_last_scavenge_tick = 0;
 	InitializeSRWLock(&fs->auto_available_refresh_lock);
 	fs->auto_available_cached_bytes = 0;
-	fs->auto_available_cached_committed = 0;
+	fs->auto_available_cached_commit_total = 0;
+	fs->auto_available_sample_qpc = 0;
 	fs->auto_available_cache_deadline_qpc = 0;
+	fs->auto_available_cache_interval_qpc = 0;
+	{
+		LARGE_INTEGER frequency;
+		if (QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0) {
+			fs->auto_available_cache_interval_qpc =
+				(uint64_t)frequency.QuadPart / (1000000ULL / MEMFS_AUTO_AVAILABLE_CACHE_INTERVAL_US);
+			if (fs->auto_available_cache_interval_qpc == 0)
+				fs->auto_available_cache_interval_qpc = 1;
+		}
+	}
 	randombytes_buf(&fs->treap_seed, sizeof(fs->treap_seed));
 	if (fs->treap_seed == 0)
 		fs->treap_seed = 0x9e3779b97f4a7c15ULL;

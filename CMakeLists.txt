@@ -411,6 +411,23 @@ endif()
 
 enable_testing()
 
+# Exercise the real production capacity cache with deterministic OS/clock
+# providers. NDEBUG deliberately keeps the Release path enabled in both presets.
+# Instrumentation is confined to this executable, never the shipping library.
+add_executable(memfs_capacity_snapshot_test
+	tests/memfs_capacity_snapshot_test.c
+	src/memfs_core.c src/memfs_alloc.c src/memfs_vm.c src/memfs_object.c)
+target_include_directories(memfs_capacity_snapshot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(memfs_capacity_snapshot_test PRIVATE
+	MEMFS_CAPACITY_TESTING NDEBUG _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(memfs_capacity_snapshot_test PRIVATE
+	advapi32 unofficial-sodium::sodium zstd::libzstd)
+if(MSVC)
+	target_compile_options(memfs_capacity_snapshot_test PRIVATE /W4 /utf-8)
+endif()
+add_test(NAME memfs_capacity_snapshot_test COMMAND memfs_capacity_snapshot_test)
+set_tests_properties(memfs_capacity_snapshot_test PROPERTIES TIMEOUT 45)
+
 add_executable(memfs_core_test
 	tests/memfs_core_test.c)
 

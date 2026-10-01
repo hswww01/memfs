@@ -258,9 +258,12 @@ struct Memfs {
 	volatile LONG64 resident_bytes;
 	volatile LONG64 pressure_last_scavenge_tick;
 	SRWLOCK auto_available_refresh_lock;
-	volatile LONG64 auto_available_cached_bytes;
-	volatile LONG64 auto_available_cached_committed;
-	volatile LONG64 auto_available_cache_deadline_qpc;
+	/* Snapshot fields are protected by auto_available_refresh_lock. */
+	uint64_t auto_available_cached_bytes;
+	uint64_t auto_available_cached_commit_total;
+	uint64_t auto_available_sample_qpc;
+	uint64_t auto_available_cache_deadline_qpc;
+	uint64_t auto_available_cache_interval_qpc;
 	uint64_t treap_seed;
 
 	bool compression_enabled;
@@ -296,6 +299,16 @@ uint64_t memfs_committed_bytes(Memfs* fs);
 uint64_t memfs_physical_bytes(Memfs* fs);
 // Concurrent snapshot semantics are documented on MemfsRuntimeStats above.
 void memfs_get_runtime_stats(Memfs* fs, MemfsRuntimeStats* stats);
+
+#if defined(MEMFS_CAPACITY_TESTING)
+typedef struct MemfsCapacityTestHooks {
+	uint64_t (*available)(void* context);
+	bool (*clock)(void* context, uint64_t* ticks);
+	void* context;
+} MemfsCapacityTestHooks;
+void memfs_test_capacity_set_hooks(const MemfsCapacityTestHooks* hooks);
+uint64_t memfs_test_capacity_available(Memfs* fs, bool force_refresh);
+#endif
 
 #if !defined(NDEBUG)
 void memfs_test_set_system_available_bytes(uint64_t bytes);
