@@ -369,6 +369,7 @@ static void memfs_dir_destroy(MemfsDir* dir) {
 		dir->hash = NULL;
 	}
 }
+// Caller holds lifetime_lock, or all filesystem callers have quiesced.
 static void memfs_orphan_insert(Memfs* fs, MemfsNode* node) {
 	// orphan 已经不在 namespace treap 中，复用 tree_left/tree_right
 	// 作为 prev/next，避免给每个普通节点额外保存一套全局链指针。
@@ -3048,6 +3049,7 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 
 	fs->capacity = options->capacity;
 	fs->capacity_auto = options->capacity_auto;
+	InitializeSRWLock(&fs->lifetime_lock);
 	fs->pressure_last_scavenge_tick = 0;
 	InitializeSRWLock(&fs->auto_available_refresh_lock);
 	fs->auto_available_cached_bytes = 0;
@@ -3489,21 +3491,49 @@ MemfsResult memfs_node_create(Memfs* fs, MemfsNode* parent, const wchar_t* name,
 }
 
 void memfs_node_open(MemfsNode* node) {
-	if (node)
-		node->open_count++;
+	Memfs* fs;
+	if (node == NULL)
+		return;
+	fs = node->fs;
+	AcquireSRWLockExclusive(&fs->lifetime_lock);
+	node->open_count++;
+	ReleaseSRWLockExclusive(&fs->lifetime_lock);
 }
 
 void memfs_node_close(MemfsNode* node) {
+	Memfs* fs;
+	bool dispose = false;
 	if (node == NULL)
 		return;
-
-	if (node->open_count)
+	fs = node->fs;
+	AcquireSRWLockExclusive(&fs->lifetime_lock);
+	if (node->open_count) {
 		node->open_count--;
-
-	if (node->deleted && node->open_count == 0) {
-		memfs_orphan_remove(node->fs, node);
-		memfs_node_free(node);
+		if (node->deleted && node->open_count == 0) {
+			memfs_orphan_remove(fs, node);
+			dispose = true;
+		}
 	}
+	ReleaseSRWLockExclusive(&fs->lifetime_lock);
+	/* Only the final valid reference reaches destruction. Keep potentially
+	 * expensive allocator/security/storage cleanup outside the lifetime lock. */
+	if (dispose)
+		memfs_node_free(node);
+}
+
+static void memfs_node_retire_unlinked(MemfsNode* node) {
+	Memfs* fs = node->fs;
+	bool dispose;
+	/* Namespace removal and timestamps must be complete before publication:
+	 * a concurrent final Close can destroy the node as soon as we unlock. */
+	AcquireSRWLockExclusive(&fs->lifetime_lock);
+	node->deleted = true;
+	dispose = node->open_count == 0;
+	if (!dispose)
+		memfs_orphan_insert(fs, node);
+	ReleaseSRWLockExclusive(&fs->lifetime_lock);
+	if (dispose)
+		memfs_node_free(node);
 }
 
 bool memfs_node_is_directory(const MemfsNode* node) {
@@ -3530,14 +3560,9 @@ MemfsResult memfs_node_unlink(MemfsNode* node) {
 
 	parent = node->parent;
 	memfs_dir_remove(node);
-	node->deleted = true;
 	memfs_node_set_change_time(node, memfs_now());
 	memfs_touch_directory(parent);
-
-	if (node->open_count == 0)
-		memfs_node_free(node);
-	else
-		memfs_orphan_insert(node->fs, node);
+	memfs_node_retire_unlinked(node);
 
 	return MEMFS_OK;
 }
@@ -3578,13 +3603,8 @@ MemfsResult memfs_node_rename(MemfsNode* node, MemfsNode* new_parent, const wcha
 		MemfsNode* existing_parent = existing->parent;
 
 		memfs_dir_remove(existing);
-		existing->deleted = true;
 		memfs_touch_directory(existing_parent);
-
-		if (existing->open_count == 0)
-			memfs_node_free(existing);
-		else
-			memfs_orphan_insert(existing->fs, existing);
+		memfs_node_retire_unlinked(existing);
 	}
 
 	old_parent = node->parent;

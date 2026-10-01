@@ -96,13 +96,11 @@ static void cleanup_file(StressThread* thread, MemfsNode* node) {
     if (node == NULL)
         return;
 
-    /*
-     * Close before unlink so open_count is zero. The unlink then frees the
-     * node immediately instead of touching the shared orphan list.
-     */
-    memfs_node_close(node);
+    /* Close is asynchronous under WinFsp FINE. Exercise the actual orphan
+     * path instead of avoiding the shared list by closing before unlink. */
     if (guarded_unlink(node) != MEMFS_OK)
         thread->errors++;
+    memfs_node_close(node);
 }
 
 static DWORD WINAPI stress_worker(LPVOID argument) {
@@ -186,13 +184,10 @@ static DWORD WINAPI stress_worker(LPVOID argument) {
         }
         thread->rename_ops++;
 
-        /*
-         * Do not unlink an open node in this direct-core test: WinFsp would
-         * normally serialize orphan-list transitions. Closing first keeps the
-         * test on the no-orphan path while preserving real unlink/free churn.
-         */
-        memfs_node_close(node);
+        /* Namespace mutation remains externally serialized, but independent
+         * final closes must be safe without the namespace guard. */
         result = guarded_unlink(node);
+        memfs_node_close(node);
         if (result != MEMFS_OK) {
             thread->errors++;
             thread->cycles++;

@@ -65,6 +65,7 @@ $process = [Diagnostics.Process]::new()
 $process.StartInfo = $info
 $started = $false
 $failure = $null
+$stage = "launch"
 $cleanupErrors = [Collections.Generic.List[string]]::new()
 $stdoutTask = $null
 $stderrTask = $null
@@ -75,6 +76,7 @@ try {
     # Drain both pipes concurrently; never wait with an unread full pipe.
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
+    $stage = "mount-wait"
     $mounted = $false
     for ($i = 0; $i -lt 100; $i++) {
         if ($process.HasExited) { break }
@@ -83,13 +85,16 @@ try {
     }
     if (-not $mounted) { throw "memfs did not mount $Drive" }
 
+    $stage = "create-directory"
     New-Item -ItemType Directory -Path "$Drive\dir" | Out-Null
+    $stage = "tiny-text-write"
     [IO.File]::WriteAllText("$Drive\hello.txt", "hello memfs")
     if ([IO.File]::ReadAllText("$Drive\HELLO.TXT") -ne "hello memfs") {
         throw 'case-insensitive text readback mismatch'
     }
 
     # Exercise real multi-page storage, not only tiny-file endpoints.
+    $stage = "paged-write-read"
     $payload = New-Object byte[] (128KB + 37)
     for ($i = 0; $i -lt $payload.Length; $i++) { $payload[$i] = [byte](($i * 37 + 11) % 251) }
     [IO.File]::WriteAllBytes("$Drive\dir\data.bin", $payload)
@@ -98,6 +103,7 @@ try {
     for ($i = 0; $i -lt $bytes.Length; $i++) {
         if ($bytes[$i] -ne $payload[$i]) { throw "paged readback mismatch at $i" }
     }
+    $stage = "paged-rewrite"
     $stream = [IO.File]::Open("$Drive\dir\data.bin", [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite)
     try {
         $patch = New-Object byte[] 10013
@@ -122,6 +128,7 @@ try {
         if ($bytes[$i] -ne $expected) { throw "truncate/regrow zero-fill mismatch at $i" }
     }
 
+    $stage = "sparse-write-read"
     $stream = [IO.File]::Open("$Drive\dir\sparse.bin", [IO.FileMode]::Create, [IO.FileAccess]::ReadWrite)
     try {
         $stream.SetLength(8MB)
@@ -137,17 +144,35 @@ try {
     }
     finally { $stream.Dispose() }
 
+    $stage = "rename-move"
     Rename-Item "$Drive\hello.txt" "renamed.txt"
     Move-Item "$Drive\renamed.txt" "$Drive\dir\moved.txt"
+    $stage = "enumeration"
     $names = @(Get-ChildItem "$Drive\dir" | Sort-Object Name | Select-Object -ExpandProperty Name)
     if (($names -join ',') -ne 'data.bin,moved.txt,sparse.bin') { throw "directory mismatch: $($names -join ',')" }
+    $stage = "wildcard-enumeration"
     $filtered = @(Get-ChildItem "$Drive\dir" -Filter '*.TXT' | Select-Object -ExpandProperty Name)
     if (($filtered -join ',') -ne 'moved.txt') { throw 'wildcard directory mismatch' }
+    $stage = "delete-files"
     Remove-Item "$Drive\dir\moved.txt", "$Drive\dir\data.bin", "$Drive\dir\sparse.bin"
+    $stage = "delete-directory"
     Remove-Item "$Drive\dir"
     if (@(Get-ChildItem "$Drive\").Count -ne 0) { throw 'root is not empty after I/O cleanup' }
 }
-catch { $failure = $_ }
+catch {
+    $failure = $_
+    $diagnostic = [ordered]@{
+        stage = $stage
+        message = $_.Exception.Message
+        exception_type = $_.Exception.GetType().FullName
+        hresult = ('0x{0:X8}' -f $_.Exception.HResult)
+        position = $_.InvocationInfo.PositionMessage
+        script_stack_trace = $_.ScriptStackTrace
+        inner = $(if ($_.Exception.InnerException) { $_.Exception.InnerException.ToString() } else { $null })
+    }
+    [IO.File]::WriteAllText((Join-Path $LogDirectory ("integration-"+$token+".failure.json")),
+        ($diagnostic | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
+}
 finally {
     if ($started) {
         $force = $false
@@ -196,6 +221,6 @@ finally {
 if ($null -ne $failure -or $cleanupErrors.Count -ne 0) {
     $detail = if ($null -ne $failure) { $failure.Exception.Message } else { 'I/O passed but lifecycle validation failed' }
     if ($cleanupErrors.Count) { $detail += '; cleanup: ' + ($cleanupErrors -join '; ') }
-    throw "$detail; stdout=$stdoutPath; stderr=$stderrPath"
+    throw "stage=$stage; $detail; stdout=$stdoutPath; stderr=$stderrPath"
 }
 Write-Host "integration PASS: paged I/O, cross-page rewrite, truncate/regrow, sparse, namespace, graceful zero-exit unmount ($Drive)"

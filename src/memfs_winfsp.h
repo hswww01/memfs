@@ -29,6 +29,12 @@ HANDLE memfs_winfsp_dispatcher_stopped_event(MemfsWinFsp* instance);
 bool memfs_winfsp_dispatcher_stopped_normally(const MemfsWinFsp* instance);
 NTSTATUS memfs_winfsp_dispatcher_result(const MemfsWinFsp* instance);
 #if defined(MEMFS_WINFSP_TESTING)
+NTSTATUS memfs_winfsp_test_get_security(FSP_FILE_SYSTEM* fs, MemfsNode* node,
+    PSECURITY_DESCRIPTOR buffer, SIZE_T* size);
+NTSTATUS memfs_winfsp_test_get_security_by_name(FSP_FILE_SYSTEM* fs, PWSTR name,
+    PSECURITY_DESCRIPTOR buffer, SIZE_T* size);
+NTSTATUS memfs_winfsp_test_set_security(FSP_FILE_SYSTEM* fs, MemfsNode* node,
+    SECURITY_INFORMATION information, PSECURITY_DESCRIPTOR descriptor);
 void memfs_winfsp_test_dispatcher_stopped(
     MemfsWinFsp* instance,
     bool normally);

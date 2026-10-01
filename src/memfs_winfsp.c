@@ -497,9 +497,14 @@ static NTSTATUS fs_Rename(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWST
 
 static NTSTATUS fs_GetSecurity(FSP_FILE_SYSTEM* file_system, PVOID file_context,
 							   PSECURITY_DESCRIPTOR security_descriptor, SIZE_T* security_descriptor_size) {
-	(void)file_system;
-
-	return memfs_copy_security((MemfsNode*)file_context, security_descriptor, security_descriptor_size);
+	NTSTATUS status;
+	/* QuerySecurity is not part of the FINE namespace guard. Pair it with the
+	 * explicit SetSecurity guard; GetSecurityByName already runs inside FINE. */
+	AcquireSRWLockShared(&file_system->OpGuardLock);
+	status = memfs_copy_security((MemfsNode*)file_context,
+		security_descriptor, security_descriptor_size);
+	ReleaseSRWLockShared(&file_system->OpGuardLock);
+	return status;
 }
 
 static NTSTATUS fs_SetSecurity(FSP_FILE_SYSTEM* file_system, PVOID file_context,
@@ -511,20 +516,44 @@ static NTSTATUS fs_SetSecurity(FSP_FILE_SYSTEM* file_system, PVOID file_context,
 	MemfsResult result;
 	NTSTATUS status;
 
-	(void)file_system;
-
+	/* SetSecurity is unguarded by FINE, yet Create/Open calls
+	 * GetSecurityByName on ancestors. Hold the same namespace guard while
+	 * replacing/freeing a descriptor so those borrowed snapshots stay alive.
+	 * Do not recursively acquire it inside GetSecurityByName. */
+	AcquireSRWLockExclusive(&file_system->OpGuardLock);
 	status = FspSetSecurityDescriptor(memfs_node_get_security(node)->data, security_information,
 									  modification_descriptor, &new_descriptor);
-	if (!NT_SUCCESS(status))
+	if (!NT_SUCCESS(status)) {
+		ReleaseSRWLockExclusive(&file_system->OpGuardLock);
 		return status;
+	}
 
 	new_size = GetSecurityDescriptorLength(new_descriptor);
 	result = memfs_node_replace_security(node, new_descriptor, new_size);
-
 	FspDeleteSecurityDescriptor(new_descriptor, (NTSTATUS (*)())FspSetSecurityDescriptor);
-
+	ReleaseSRWLockExclusive(&file_system->OpGuardLock);
 	return memfs_status(result);
 }
+
+#if defined(MEMFS_WINFSP_TESTING)
+NTSTATUS memfs_winfsp_test_get_security(FSP_FILE_SYSTEM* fs, MemfsNode* node,
+    PSECURITY_DESCRIPTOR buffer, SIZE_T* size) {
+    return fs_GetSecurity(fs, node, buffer, size);
+}
+NTSTATUS memfs_winfsp_test_get_security_by_name(FSP_FILE_SYSTEM* fs, PWSTR name,
+    PSECURITY_DESCRIPTOR buffer, SIZE_T* size) {
+    NTSTATUS result;
+    /* Mirror the FILE_OPEN FINE shared guard around this callback. */
+    AcquireSRWLockShared(&fs->OpGuardLock);
+    result = fs_GetSecurityByName(fs, name, NULL, buffer, size);
+    ReleaseSRWLockShared(&fs->OpGuardLock);
+    return result;
+}
+NTSTATUS memfs_winfsp_test_set_security(FSP_FILE_SYSTEM* fs, MemfsNode* node,
+    SECURITY_INFORMATION information, PSECURITY_DESCRIPTOR descriptor) {
+    return fs_SetSecurity(fs, node, information, descriptor);
+}
+#endif
 
 static NTSTATUS fs_ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR pattern, PWSTR marker,
 								 PVOID buffer, ULONG length, PULONG bytes_transferred) {

@@ -428,6 +428,14 @@ endif()
 add_test(NAME memfs_capacity_snapshot_test COMMAND memfs_capacity_snapshot_test)
 set_tests_properties(memfs_capacity_snapshot_test PROPERTIES TIMEOUT 45)
 
+add_executable(memfs_lifetime_test tests/memfs_lifetime_test.c)
+target_link_libraries(memfs_lifetime_test PRIVATE memfs_core)
+if(MSVC)
+    target_compile_options(memfs_lifetime_test PRIVATE /W4 /utf-8)
+endif()
+add_test(NAME memfs_lifetime_test COMMAND memfs_lifetime_test)
+set_tests_properties(memfs_lifetime_test PROPERTIES TIMEOUT 60)
+
 add_executable(memfs_core_test
 	tests/memfs_core_test.c)
 

@@ -224,7 +224,7 @@ struct MemfsNode {
 	uint64_t change_time;
 
 	uint32_t attributes;
-	uint32_t open_count;
+	uint32_t open_count; // protected by fs->lifetime_lock after publication
 	uint32_t name_hash;
 	uint16_t small_capacity;
 	uint8_t small_inline : 1;
@@ -249,9 +249,12 @@ struct Memfs {
 	// 仅保存已经从 namespace 移除但仍被 open handle 引用的节点。
 	// orphan 节点复用 tree_left/tree_right 作为 prev/next。
 	MemfsNode* orphan_head;
+	// FINE does NOT guard asynchronous Close. Serialize only handle counts and
+	// orphan publication/removal; ordinary file data I/O never takes this lock.
+	SRWLOCK lifetime_lock;
 
-	// WinFsp FINE guard 负责 namespace + per-file I/O 并发。
-	// accounting_lock 只保护跨文件共享容量/驻留统计。
+	// Namespace and same-file I/O retain their external WinFsp/caller guard.
+	// Cross-file accounting is atomic; handle lifetime is guarded separately.
 	uint64_t capacity;
 	bool capacity_auto;
 	volatile LONG64 used_bytes;
@@ -342,6 +345,8 @@ MemfsNode* memfs_dir_next(MemfsNode* node);
 MemfsResult memfs_node_create(Memfs* fs, MemfsNode* parent, const wchar_t* name, bool directory, uint32_t attributes,
 							  PSECURITY_DESCRIPTOR security, uint64_t allocation_size, MemfsNode** out_node);
 
+// Retaining requires a live handle or an externally guarded namespace lookup.
+// Release/unlink/replace coordinate lifetime internally; destroy requires quiescence.
 void memfs_node_open(MemfsNode* node);
 void memfs_node_close(MemfsNode* node);
 MemfsResult memfs_node_unlink(MemfsNode* node);

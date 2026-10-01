@@ -4011,9 +4011,9 @@ static void test_rename_replace_open_target_lifetime(void) {
 	CHECK(memfs_node_read(new_file, &out, 0, 1, &transferred) == MEMFS_OK);
 	CHECK(out == new_data);
 
-	while (old_file->open_count > 0) {
+	// The final Close may free old_file; never read its count afterward.
+	for (uint32_t remaining = old_file->open_count; remaining != 0; --remaining)
 		memfs_node_close(old_file);
-	}
 	CHECK(!test_orphan_contains(fs, old_file));
 
 	memfs_node_close(new_file);
