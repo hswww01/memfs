@@ -199,10 +199,11 @@ try {
         $catalog = (Invoke-Native 'test-catalog' $ctest @('--test-dir',$BuildDir,'--show-only=json-v1')).stdout | ConvertFrom-Json
         $names = @($catalog.tests | ForEach-Object { $_.name })
         $snapshot = @($names | Where-Object { $_ -match '^memfs_capacity_(cache|snapshot)_test$' })
-        if ($snapshot.Count -ne 1 -or $names -notcontains 'memfs_core_test' -or $names -notcontains 'memfs_mt_stress_test') {
-            throw "Required core/stress/production capacity-cache tests are not registered"
+        $required = @('memfs_core_test','memfs_mt_stress_test','memfs_lifetime_test','memfs_winfsp_dispatcher_state')
+        if ($snapshot.Count -ne 1 -or @($required | Where-Object { $names -notcontains $_ }).Count -ne 0) {
+            throw "Required core/stress/lifetime/security/production capacity-cache tests are not registered"
         }
-        $script:repeatRegex = '^(memfs_core_test|memfs_mt_stress_test|' + $snapshot[0] + ')$'
+        $script:repeatRegex = '^(' + (($required + $snapshot[0]) -join '|') + ')$'
         $report['registered_tests'] = $names
         $report.exe_sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
     }

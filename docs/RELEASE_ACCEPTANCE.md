@@ -26,7 +26,10 @@ The verification covers:
 
 1. Debug and Release builds and their full registered CTest suites. An empty test
    suite is an error, and the production capacity snapshot test must be registered.
-2. Repeated Release core, multithread stress and production capacity snapshot tests.
+2. Repeated Release core, multithread stress, production capacity snapshot,
+   shared-node lifetime/orphan transitions and WinFsp security snapshot tests.
+   The last two are mandatory regressions for the intermittent mounted crash
+   found during the first full acceptance run; retries alone are not a fix.
 3. Seven capacity microbenchmark runs, recording each result and the median.
 4. A short fixed-capacity soak followed by the requested **10–60 minute automatic
    capacity** soak. Both use the existing mixed compression/encryption workload;
