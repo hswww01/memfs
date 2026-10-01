@@ -34,7 +34,11 @@
 #define MEMFS_ENCRYPTION_KEY_SIZE 32U
 #define MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE 16U
 
-enum { MEMFS_PAGE_COMPRESSED = 0x01, MEMFS_PAGE_ENCRYPTED = 0x02 };
+enum {
+	MEMFS_PAGE_COMPRESSED = 0x01,
+	MEMFS_PAGE_ENCRYPTED = 0x02,
+	MEMFS_PAGE_AES_GCM = 0x04,
+};
 
 typedef enum MemfsResult {
 	MEMFS_OK = 0,
@@ -130,7 +134,8 @@ struct MemfsSecurity {
 };
 
 // encoded blob header。raw/compressed payload 存在 data 中。
-// 加密 payload 前 8B 保存 nonce sequence，XChaCha nonce 的前 16B 来自 fs 随机 prefix。
+// 加密 payload 前 8B 保存 nonce sequence；flags 记录实际 AEAD 算法。
+// AES-GCM 使用每挂载派生子密钥 + 64-bit sequence nonce；无硬件支持时回落 XChaCha20-Poly1305。
 struct MemfsPage {
 	uint16_t stored_size;
 	uint16_t plain_size;
@@ -256,11 +261,17 @@ struct Memfs {
 
 	bool compression_enabled;
 	bool encryption_enabled;
+	bool encryption_aes_gcm;
 	int compression_level;
 
 	MemfsCompressionLane compression_lanes[MEMFS_COMPRESSION_CONTEXT_LANES];
 
 	uint8_t encryption_key[MEMFS_ENCRYPTION_KEY_SIZE];
+	uint8_t encryption_aes_key[MEMFS_ENCRYPTION_KEY_SIZE];
+	SRWLOCK encryption_aes_epoch_lock;
+	uint64_t encryption_aes_epoch;
+	uint8_t encryption_aes_epoch_key[MEMFS_ENCRYPTION_KEY_SIZE];
+	bool encryption_aes_epoch_valid;
 	uint8_t encryption_nonce_prefix[MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE];
 	volatile LONG64 encryption_nonce_counter;
 
@@ -285,6 +296,7 @@ void memfs_get_runtime_stats(Memfs* fs, MemfsRuntimeStats* stats);
 #if !defined(NDEBUG)
 void memfs_test_set_system_available_bytes(uint64_t bytes);
 void memfs_test_clear_system_available_bytes(void);
+void memfs_test_force_xchacha(bool force);
 bool memfs_test_page_info(MemfsNode* node,
                           uint64_t page_index,
                           bool* is_raw,

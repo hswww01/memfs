@@ -56,6 +56,9 @@ static int run_case(int thread_count) {
 
     if (memfs_create_ex(&options, &fs) != MEMFS_OK || fs == NULL)
         goto cleanup;
+    printf("algorithm=%s threads=%d\n",
+           fs->encryption_aes_gcm ? "aes-256-gcm" : "xchacha20-poly1305",
+           thread_count);
     start_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (start_event == NULL)
         goto cleanup;

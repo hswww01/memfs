@@ -12,7 +12,7 @@ A high-performance volatile Windows memory file system written in C17 on top of 
 - Sparse file storage with 4 KiB logical pages.
 - Tiny-file storage with 8-byte plaintext granularity.
 - Optional per-page Zstd compression.
-- Optional per-page XChaCha20-Poly1305 authenticated encryption.
+- Optional per-page authenticated encryption: hardware AES-256-GCM when available, with XChaCha20-Poly1305 fallback.
 - Windows file attributes, timestamps and ACL/security descriptors.
 - WinFsp FINE operation guard so different files can perform I/O concurrently.
 - Thread-safe global capacity and resident-memory accounting.
@@ -112,7 +112,7 @@ Options:
 --threads <n>           Dispatcher threads; 0 = automatic, otherwise 2..64
 --compress              Enable Zstd compression at level 1
 --compression-level <n> Enable Zstd level 1..22
---encrypt               Use a random XChaCha20-Poly1305 key
+--encrypt               Use a random 256-bit key; hardware AES-256-GCM when available, else XChaCha20-Poly1305
 --key-hex <64hex>       Use a fixed 256-bit key
 --key-env <name>        Read a 64-hex key from an environment variable
 --debug                 Enable WinFsp debug logging
@@ -236,7 +236,7 @@ Uncompressed/unencrypted local measurements:
 | 500 B | 512 B | 500 B | 512 B |
 | 1024 B | 1024 B | 1024 B | 1032 B |
 
-With encryption enabled a 1-byte file uses 33 bytes of tracked encoded storage: 8-byte blob header + 8-byte nonce sequence + 1 byte payload + 16-byte Poly1305 tag.
+With encryption enabled a 1-byte file uses 33 bytes of tracked encoded storage: 8-byte blob header + 8-byte nonce sequence + 1 byte payload + 16-byte AEAD authentication tag.
 
 resident_bytes tracks encoded data blobs/pages and intentionally excludes host allocator bookkeeping and namespace metadata.
 ### Allocator v2 and auto capacity
@@ -300,13 +300,15 @@ Compression is not enabled by default because truly incompressible workloads wou
 Encryption is optional and local to each non-zero blob/page. The encoding order is:
 
 1. optional Zstd compression;
-2. XChaCha20-Poly1305 authenticated encryption.
+2. authenticated encryption.
 
-Each memfs instance creates a random 128-bit nonce prefix. Every encoded rewrite obtains an atomic monotonically increasing 64-bit sequence; together they form the 192-bit XChaCha nonce. Only the 8-byte sequence is stored with each blob/page, reducing per-page nonce overhead while retaining a fresh nonce space for every mount even when a fixed key is reused.
+On CPUs where libsodium reports AES-256-GCM hardware support, new encrypted pages use AES-256-GCM. Otherwise they use XChaCha20-Poly1305. The algorithm is recorded in the page flags and that flag is itself authenticated as AAD, so reads select the decoder from each stored page rather than from the current encoder preference. This also keeps mixed-algorithm pages readable if the preferred encoder changes during a mount.
 
-AEAD additional authenticated data binds ciphertext to the node identity, storage/page index (or tiny-blob sentinel), nonce sequence, plaintext size and codec flags. Normal reads therefore detect ciphertext or authenticated-metadata tampering.
+Every memfs instance creates a random 128-bit mount prefix and keeps the caller/random 256-bit master key for XChaCha. AES-GCM derives a separate mount-specific root key from the master key plus that prefix. Every encoded rewrite then obtains a globally unique monotonically increasing 64-bit sequence. XChaCha combines the 128-bit prefix with the sequence for its 192-bit nonce. AES-GCM uses the sequence in its 96-bit nonce under the independent mount key and derives a new epoch subkey every 2^20 encrypted blobs/pages. Only the 8-byte sequence is stored with each blob/page.
 
-The in-memory 256-bit key is kept in a dedicated field, locked with sodium_mlock on a best-effort basis, and explicitly zeroed during teardown. The nonce prefix is also zeroed during teardown.
+AEAD additional authenticated data binds ciphertext to the node identity, storage/page index (or tiny-blob sentinel), nonce sequence, plaintext size and all codec/algorithm flags. Normal reads therefore detect ciphertext, metadata or algorithm-selector tampering.
+
+The master/XChaCha key, derived AES root key, and one filesystem-wide cached current AES epoch key are held in dedicated in-memory fields and locked with `sodium_mlock` on a best-effort basis. The epoch cache is protected by an SRW lock and only retains the newest epoch; old-epoch reads derive a temporary key on demand instead of growing a key cache. Scratch epoch keys and nonce buffers are explicitly zeroed after use, and all retained keys plus the mount nonce prefix are zeroed/unlocked during teardown.
 
 Encryption protects the stored page representation in the memfs heap. It is not process-memory isolation: plaintext necessarily exists transiently in application I/O buffers and small stack work buffers during reads, writes, compression and decompression.
 

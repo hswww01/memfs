@@ -224,6 +224,33 @@ To keep the 16 slab lanes from increasing allocator high-water across repeated i
 
 Area-cache retention is size-aware rather than uniformly keeping two idle regions per lane. Small area blocks retain the two-slot lane cache, while VM regions larger than 64 KiB retain at most one cached block per lane. In the 64 KiB allocation benchmark this reduced 16-thread retained cached backing from about 1,392,640 bytes to a three-run median of 696,320 bytes (zeroed) / 765,952 bytes (uninitialized). Uninitialized 16-thread throughput stayed effectively flat at about 38.4M ops/s versus a 38.7M baseline, while zeroed throughput remained within a few percent. Debug/Release tests, a 10-second soak, and real mounted integration all pass.
 
+## Hardware AES-GCM encryption fast path
+
+Encrypted pages now select AES-256-GCM automatically when libsodium reports hardware AES-GCM support, with XChaCha20-Poly1305 retained as the portable fallback. The per-page `MEMFS_PAGE_AES_GCM` flag is part of AEAD AAD, and decoding follows that authenticated page flag rather than the current encoder preference.
+
+A fixed/reused master key remains safe across mounts: every mount creates a random 128-bit prefix; AES-GCM derives an independent mount root key from the master key plus that prefix, and derives a new epoch key every 2^20 encrypted blobs/pages. The global 64-bit nonce sequence remains monotonic and unique across all encryption writers. XChaCha keeps the master key and uses the 128-bit mount prefix plus the same sequence as its 192-bit nonce.
+
+Tests cover hardware auto-selection, forced XChaCha fallback, mixed AES/XChaCha pages in one mount, algorithm-flag tampering, ciphertext tampering, mount-key separation, rewrite/truncate/regrow, compression+encryption and concurrent nonce allocation.
+
+Release `memfs_bench --encryption` on this machine, five runs, compared with the pre-change XChaCha baseline recorded immediately before the change:
+
+| workload | XChaCha baseline | AES-GCM median | change |
+| --- | ---: | ---: | ---: |
+| 4 KiB create+write | 196,507 ops/s | 306,789 ops/s | +56.1% / 1.56x |
+| random 4 KiB rewrite | 64,993 ops/s | 133,763 ops/s | +105.8% / 2.06x |
+
+The dedicated encrypted-rewrite benchmark was also rebuilt from the exact pre-change commit `af3dc50` and compared against the current AES-GCM path on the same machine:
+
+| threads | XChaCha `af3dc50` | AES-GCM | speedup |
+| ---: | ---: | ---: | ---: |
+| 1 | 175,527 ops/s | 578,177 ops/s | 3.29x |
+| 2 | 328,743 ops/s | 1,023,758 ops/s | 3.11x |
+| 4 | 651,550 ops/s | 2,057,334 ops/s | 3.16x |
+| 8 | 969,836 ops/s | 2,869,890 ops/s | 2.96x |
+| 16 | 1,480,658 ops/s | 3,821,251 ops/s | 2.58x |
+
+All MT runs reported zero errors. To avoid paying a KDF on every write without retaining an unbounded key set, the filesystem keeps only the newest AES epoch key in one SRWLOCK-protected cache. Old-epoch reads derive a temporary key on demand; there is no thread-local or multi-epoch key cache.
+
 ## Repeatable deployment verification
 
 `scripts\verify-deployment.ps1` separates safe development-machine checks from the destructive clean-machine fallback path.
@@ -264,13 +291,13 @@ The harness verifies private service creation, MemfsC-owned driver filename/path
 
 Debug:
 
-- size: 3,320,320 bytes
-- SHA-256: `D16B51C8FEB789649F72B94948CA1567DD49F770DCFC34BB9BAB48577C0605C2`
+- size: 3,350,528 bytes
+- SHA-256: `2497B86464ED176E84C01D33C0AC3E8C0FC364CCF2F1C570742118B70227A6FE`
 
 Release:
 
-- size: 1,325,568 bytes
-- SHA-256: `B3A8D631E7F8889A2782B1E21F732A2E48E094B0CE535EDC0091D289347D56AF`
+- size: 1,350,144 bytes
+- SHA-256: `2146E06F7A7A6D3D2565A642A031DD2FD27E0C7D836B41EFD7FD6E3D56F440DB`
 
 These hashes are verification artifacts for this local build, not permanent release
 identifiers.

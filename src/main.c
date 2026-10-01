@@ -122,7 +122,7 @@ static void print_usage(const wchar_t* exe) {
              L"  --stop-event <name>     Optional named event for graceful console shutdown/automation.\n"
              L"  --compress              Enable per-page Zstd compression (level 1).\n"
              L"  --compression-level <n> Enable compression with level 1..22.\n"
-             L"  --encrypt               Enable XChaCha20-Poly1305 with random session key.\n"
+             L"  --encrypt               Enable authenticated encryption (hardware AES-256-GCM, else XChaCha20-Poly1305).\n"
              L"  --key-hex <64hex>       Enable encryption with a fixed 256-bit key.\n"
              L"  --key-env <name>        Read the 64-hex encryption key from an env variable.\n"
              L"  --debug                 Enable all WinFsp debug logging.\n"

@@ -1990,15 +1990,16 @@ static void test_compression_incompressible_page_fallback(void) {
 static void test_encryption(void) {
 	MemfsOptions options = {0};
 	Memfs* fs = NULL;
-	MemfsNode* file;
+	Memfs* second_fs = NULL;
+	MemfsNode* file = NULL;
 	uint8_t key[MEMFS_ENCRYPTION_KEY_SIZE];
 	uint8_t value = 0x5a;
 	uint8_t output = 0;
 	uint8_t saved;
-	uint32_t transferred;
+	uint32_t transferred = 0;
 	uint32_t i;
 
-	printf("== XChaCha20-Poly1305 encryption ==\n");
+	printf("== authenticated encryption auto-selection ==\n");
 
 	for (i = 0; i < sizeof(key); i++)
 		key[i] = (uint8_t)(i * 7U + 3U);
@@ -2010,23 +2011,69 @@ static void test_encryption(void) {
 	options.encryption_key_size = sizeof(key);
 
 	CHECK(memfs_create_ex(&options, &fs) == MEMFS_OK);
-	CHECK(memfs_node_create(fs, fs->root, L"secret.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(fs != NULL);
+	if (fs == NULL)
+		return;
+
+	CHECK(memfs_create_ex(&options, &second_fs) == MEMFS_OK);
+	CHECK(second_fs != NULL);
+	if (second_fs != NULL) {
+		CHECK(fs->encryption_aes_gcm == second_fs->encryption_aes_gcm);
+		CHECK(memcmp(fs->encryption_key,
+					 second_fs->encryption_key,
+					 MEMFS_ENCRYPTION_KEY_SIZE) == 0);
+		CHECK(memcmp(fs->encryption_nonce_prefix,
+					 second_fs->encryption_nonce_prefix,
+					 MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE) != 0);
+		if (fs->encryption_aes_gcm) {
+			CHECK(memcmp(fs->encryption_aes_key,
+						 second_fs->encryption_aes_key,
+						 MEMFS_ENCRYPTION_KEY_SIZE) != 0);
+		}
+		memfs_destroy(second_fs);
+		second_fs = NULL;
+	}
+
+	CHECK(memfs_node_create(fs, fs->root, L"secret.bin", false,
+							FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(file != NULL);
+	if (file == NULL) {
+		memfs_destroy(fs);
+		return;
+	}
 
 	CHECK(memfs_node_write(file, &value, 0, 1, false, false, &transferred) == MEMFS_OK);
 	CHECK(transferred == 1);
 	CHECK(file->small_capacity == 1);
 	CHECK(!file->small_inline);
-	CHECK(memfs_node_resident_bytes(file) == sizeof(MemfsPage) + sizeof(uint64_t) + 1U + 16U);
+	CHECK(memfs_node_resident_bytes(file) ==
+		  sizeof(MemfsPage) + sizeof(uint64_t) + 1U +
+			  16U);
 
-	if (file->small_page) {
-		CHECK(0 != (file->small_page->flags & MEMFS_PAGE_ENCRYPTED));
+	if (file->small_page != NULL) {
+		bool saved_preference = fs->encryption_aes_gcm;
+		uint8_t saved_flags = file->small_page->flags;
+
+		CHECK((saved_flags & MEMFS_PAGE_ENCRYPTED) != 0);
+		CHECK(((saved_flags & MEMFS_PAGE_AES_GCM) != 0) == saved_preference);
 		CHECK(file->small_page->stored_size > file->small_capacity);
+
+		/* Decode by authenticated page flag, not by current encoder preference. */
+		fs->encryption_aes_gcm = !saved_preference;
+		CHECK(memfs_node_read(file, &output, 0, 1, &transferred) == MEMFS_OK);
+		CHECK(output == value);
+		fs->encryption_aes_gcm = saved_preference;
+
+		/* The algorithm selector is authenticated as part of page AAD. */
+		file->small_page->flags ^= MEMFS_PAGE_AES_GCM;
+		CHECK(memfs_node_read(file, &output, 0, 1, &transferred) == MEMFS_ERR_DATA);
+		file->small_page->flags = saved_flags;
 	}
 
 	CHECK(memfs_node_read(file, &output, 0, 1, &transferred) == MEMFS_OK);
 	CHECK(output == value);
 
-	if (file->small_page && file->small_page->stored_size) {
+	if (file->small_page != NULL && file->small_page->stored_size != 0) {
 		saved = file->small_page->data[file->small_page->stored_size - 1U];
 		file->small_page->data[file->small_page->stored_size - 1U] ^= 0x80;
 		CHECK(memfs_node_read(file, &output, 0, 1, &transferred) == MEMFS_ERR_DATA);
@@ -2038,6 +2085,142 @@ static void test_encryption(void) {
 
 	CHECK(memfs_node_unlink(file) == MEMFS_OK);
 	memfs_node_close(file);
+	memfs_destroy(fs);
+}
+
+static void test_encryption_algorithm_selection(void) {
+	MemfsOptions options = {0};
+	Memfs* fs = NULL;
+	MemfsNode* aes_file = NULL;
+	MemfsNode* xchacha_file = NULL;
+	uint8_t key[MEMFS_ENCRYPTION_KEY_SIZE];
+	uint8_t aes_value = 0x31;
+	uint8_t xchacha_value = 0xc7;
+	uint8_t output = 0;
+	uint32_t transferred = 0;
+	uint32_t i;
+	bool aes_available;
+
+	printf("== encryption algorithm selection / mixed decode ==\n");
+
+	for (i = 0; i < sizeof(key); i++)
+		key[i] = (uint8_t)(0xa5U ^ (i * 13U));
+
+	options.capacity = 8ULL * 1024ULL * 1024ULL;
+	options.volume_label = L"AEADMIX";
+	options.encryption_enabled = true;
+	options.encryption_key = key;
+	options.encryption_key_size = sizeof(key);
+
+	CHECK(memfs_create_ex(&options, &fs) == MEMFS_OK);
+	CHECK(fs != NULL);
+	if (fs == NULL)
+		return;
+
+	aes_available = fs->encryption_aes_gcm;
+
+#if !defined(NDEBUG)
+	if (aes_available) {
+		Memfs* fallback_fs = NULL;
+		MemfsNode* fallback_file = NULL;
+		MemfsResult fallback_result;
+
+		memfs_test_force_xchacha(true);
+		fallback_result = memfs_create_ex(&options, &fallback_fs);
+		memfs_test_force_xchacha(false);
+
+		CHECK(fallback_result == MEMFS_OK);
+		CHECK(fallback_fs != NULL);
+		if (fallback_fs != NULL) {
+			CHECK(!fallback_fs->encryption_aes_gcm);
+			CHECK(memcmp(fallback_fs->encryption_key,
+						 key, MEMFS_ENCRYPTION_KEY_SIZE) == 0);
+			CHECK(memfs_node_create(
+					  fallback_fs, fallback_fs->root, L"fallback.bin",
+					  false, FILE_ATTRIBUTE_NORMAL, NULL, 0,
+					  &fallback_file) == MEMFS_OK);
+			CHECK(fallback_file != NULL);
+			if (fallback_file != NULL) {
+				CHECK(memfs_node_write(
+						  fallback_file, &xchacha_value, 0, 1,
+						  false, false, &transferred) == MEMFS_OK);
+				CHECK(fallback_file->small_page != NULL);
+				if (fallback_file->small_page != NULL)
+					CHECK((fallback_file->small_page->flags &
+						   MEMFS_PAGE_AES_GCM) == 0);
+
+				/* Decoder still follows the page flag after preference changes. */
+				fallback_fs->encryption_aes_gcm = true;
+				CHECK(memfs_node_read(
+						  fallback_file, &output, 0, 1,
+						  &transferred) == MEMFS_OK);
+				CHECK(output == xchacha_value);
+
+				CHECK(memfs_node_unlink(fallback_file) == MEMFS_OK);
+				memfs_node_close(fallback_file);
+			}
+			memfs_destroy(fallback_fs);
+		}
+	}
+#endif
+
+	if (!aes_available) {
+		CHECK(!fs->encryption_aes_gcm);
+		memfs_destroy(fs);
+		return;
+	}
+
+	CHECK(memfs_node_create(
+			  fs, fs->root, L"aes.bin", false,
+			  FILE_ATTRIBUTE_NORMAL, NULL, 0, &aes_file) == MEMFS_OK);
+	CHECK(aes_file != NULL);
+	if (aes_file == NULL) {
+		memfs_destroy(fs);
+		return;
+	}
+
+	CHECK(memfs_node_write(
+			  aes_file, &aes_value, 0, 1,
+			  false, false, &transferred) == MEMFS_OK);
+	CHECK(aes_file->small_page != NULL);
+	if (aes_file->small_page != NULL)
+		CHECK((aes_file->small_page->flags & MEMFS_PAGE_AES_GCM) != 0);
+
+	fs->encryption_aes_gcm = false;
+	CHECK(memfs_node_create(
+			  fs, fs->root, L"xchacha.bin", false,
+			  FILE_ATTRIBUTE_NORMAL, NULL, 0, &xchacha_file) == MEMFS_OK);
+	CHECK(xchacha_file != NULL);
+	if (xchacha_file != NULL) {
+		CHECK(memfs_node_write(
+				  xchacha_file, &xchacha_value, 0, 1,
+				  false, false, &transferred) == MEMFS_OK);
+		CHECK(xchacha_file->small_page != NULL);
+		if (xchacha_file->small_page != NULL)
+			CHECK((xchacha_file->small_page->flags & MEMFS_PAGE_AES_GCM) == 0);
+	}
+
+	for (i = 0; i < 2; ++i) {
+		fs->encryption_aes_gcm = i == 0;
+		output = 0;
+		CHECK(memfs_node_read(
+				  aes_file, &output, 0, 1, &transferred) == MEMFS_OK);
+		CHECK(output == aes_value);
+		if (xchacha_file != NULL) {
+			output = 0;
+			CHECK(memfs_node_read(
+					  xchacha_file, &output, 0, 1,
+					  &transferred) == MEMFS_OK);
+			CHECK(output == xchacha_value);
+		}
+	}
+
+	if (xchacha_file != NULL) {
+		CHECK(memfs_node_unlink(xchacha_file) == MEMFS_OK);
+		memfs_node_close(xchacha_file);
+	}
+	CHECK(memfs_node_unlink(aes_file) == MEMFS_OK);
+	memfs_node_close(aes_file);
 	memfs_destroy(fs);
 }
 
@@ -4867,6 +5050,7 @@ int main(void) {
 	test_adaptive_compression();
 	test_compression_incompressible_page_fallback();
 	test_encryption();
+	test_encryption_algorithm_selection();
 	test_compression_encryption();
 	test_encryption_rewrite_truncate_regrow();
 	test_compression_encryption_sparse_rewrite_truncate_regrow();

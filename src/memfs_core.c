@@ -87,6 +87,7 @@ void memfs_node_set_change_time(MemfsNode* node, uint64_t value) {
 
 #if !defined(NDEBUG)
 static volatile LONG64 g_memfs_test_system_available_bytes = -1;
+static volatile LONG g_memfs_test_force_xchacha;
 
 void memfs_test_set_system_available_bytes(uint64_t bytes) {
 	InterlockedExchange64(&g_memfs_test_system_available_bytes, (LONG64)bytes);
@@ -94,6 +95,10 @@ void memfs_test_set_system_available_bytes(uint64_t bytes) {
 
 void memfs_test_clear_system_available_bytes(void) {
 	InterlockedExchange64(&g_memfs_test_system_available_bytes, -1);
+}
+
+void memfs_test_force_xchacha(bool force) {
+	InterlockedExchange(&g_memfs_test_force_xchacha, force ? 1 : 0);
 }
 #endif
 
@@ -282,11 +287,100 @@ typedef struct MemfsPageAad {
 	uint8_t reserved[5];
 } MemfsPageAad;
 
-static void memfs_build_nonce(Memfs* fs, uint64_t sequence,
-							  uint8_t nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES]) {
+static void memfs_build_xchacha_nonce(
+	Memfs* fs,
+	uint64_t sequence,
+	uint8_t nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES]) {
 	memcpy(nonce, fs->encryption_nonce_prefix, MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE);
 	memcpy(nonce + MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE, &sequence, sizeof(sequence));
 }
+
+static void memfs_build_aes_gcm_nonce(
+	uint64_t sequence,
+	uint8_t nonce[crypto_aead_aes256gcm_NPUBBYTES]) {
+	/*
+	 * AES-GCM uses a per-mount derived key, so nonce uniqueness only needs
+	 * to hold inside that derived-key domain. Keep a fixed 32-bit domain
+	 * prefix and the monotonic 64-bit sequence.
+	 */
+	memset(nonce, 0, crypto_aead_aes256gcm_NPUBBYTES);
+	memcpy(nonce + crypto_aead_aes256gcm_NPUBBYTES - sizeof(sequence),
+		   &sequence, sizeof(sequence));
+}
+
+static bool memfs_derive_aes_gcm_key(
+	const uint8_t master_key[MEMFS_ENCRYPTION_KEY_SIZE],
+	const uint8_t nonce_prefix[MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE],
+	uint8_t derived_key[MEMFS_ENCRYPTION_KEY_SIZE]) {
+	static const uint8_t domain[] = "memfs-aes-gcm-v1";
+	uint8_t input[(sizeof(domain) - 1U) + MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE];
+
+	memcpy(input, domain, sizeof(domain) - 1U);
+	memcpy(input + sizeof(domain) - 1U,
+		   nonce_prefix, MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE);
+
+	if (crypto_generichash(derived_key, MEMFS_ENCRYPTION_KEY_SIZE,
+						   input, sizeof(input),
+						   master_key, MEMFS_ENCRYPTION_KEY_SIZE) != 0) {
+		sodium_memzero(input, sizeof(input));
+		return false;
+	}
+
+	sodium_memzero(input, sizeof(input));
+	return true;
+}
+
+/* Rotate the AES-GCM subkey every 2^20 encrypted blobs/pages. */
+#define MEMFS_AES_GCM_EPOCH_SHIFT 20U
+
+static bool memfs_aes_gcm_epoch_key(
+	Memfs* fs,
+	uint64_t sequence,
+	bool cache_on_miss,
+	uint8_t epoch_key[MEMFS_ENCRYPTION_KEY_SIZE]) {
+	static const char context[crypto_kdf_CONTEXTBYTES] = {
+		'M', 'F', 'S', 'A', 'E', 'S', '0', '1'
+	};
+	uint64_t epoch;
+
+	if (fs == NULL || sequence == 0 || epoch_key == NULL)
+		return false;
+
+	epoch = (sequence - 1ULL) >> MEMFS_AES_GCM_EPOCH_SHIFT;
+
+	AcquireSRWLockShared(&fs->encryption_aes_epoch_lock);
+	if (fs->encryption_aes_epoch_valid &&
+		fs->encryption_aes_epoch == epoch) {
+		memcpy(epoch_key, fs->encryption_aes_epoch_key,
+			   MEMFS_ENCRYPTION_KEY_SIZE);
+		ReleaseSRWLockShared(&fs->encryption_aes_epoch_lock);
+		return true;
+	}
+	ReleaseSRWLockShared(&fs->encryption_aes_epoch_lock);
+
+	if (crypto_kdf_derive_from_key(
+			epoch_key, MEMFS_ENCRYPTION_KEY_SIZE,
+			epoch, context, fs->encryption_aes_key) != 0)
+		return false;
+
+	if (cache_on_miss) {
+		AcquireSRWLockExclusive(&fs->encryption_aes_epoch_lock);
+		if (!fs->encryption_aes_epoch_valid ||
+			epoch > fs->encryption_aes_epoch) {
+			memcpy(fs->encryption_aes_epoch_key, epoch_key,
+				   MEMFS_ENCRYPTION_KEY_SIZE);
+			fs->encryption_aes_epoch = epoch;
+			fs->encryption_aes_epoch_valid = true;
+		}
+		ReleaseSRWLockExclusive(&fs->encryption_aes_epoch_lock);
+	}
+
+	return true;
+}
+
+_Static_assert(crypto_aead_xchacha20poly1305_ietf_ABYTES ==
+			   crypto_aead_aes256gcm_ABYTES,
+			   "supported AEADs must use the same tag size");
 
 #define MEMFS_NONCE_SEQUENCE_BLOCK_SIZE 256ULL
 
@@ -681,11 +775,11 @@ static MemfsResult memfs_page_encode(MemfsNode* node, uint64_t storage_index, co
 
 	if (node->fs->encryption_enabled) {
 		MemfsPageAad aad;
-		uint8_t nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
 		uint8_t* sequence_data = page->data;
 		uint8_t* cipher = page->data + sizeof(uint64_t);
 		unsigned long long cipher_size = 0;
 		uint64_t sequence;
+		int crypto_result;
 
 		if (!memfs_nonce_sequence_next(node->fs, &sequence)) {
 			memfs_page_free(node, page);
@@ -693,9 +787,10 @@ static MemfsResult memfs_page_encode(MemfsNode* node, uint64_t storage_index, co
 		}
 
 		page->flags |= MEMFS_PAGE_ENCRYPTED;
+		if (node->fs->encryption_aes_gcm)
+			page->flags |= MEMFS_PAGE_AES_GCM;
 
 		memcpy(sequence_data, &sequence, sizeof(sequence));
-		memfs_build_nonce(node->fs, sequence, nonce);
 
 		memset(&aad, 0, sizeof(aad));
 		aad.node_index = memfs_node_index_number(node);
@@ -704,17 +799,36 @@ static MemfsResult memfs_page_encode(MemfsNode* node, uint64_t storage_index, co
 		aad.plain_size = plain_size;
 		aad.flags = page->flags;
 
-		if (0 != crypto_aead_xchacha20poly1305_ietf_encrypt(
-					 cipher, &cipher_size, payload, (unsigned long long)payload_size, (const unsigned char*)&aad,
-					 sizeof(aad), NULL, nonce, node->fs->encryption_key)) {
+		if (node->fs->encryption_aes_gcm) {
+			uint8_t nonce[crypto_aead_aes256gcm_NPUBBYTES];
+			uint8_t epoch_key[MEMFS_ENCRYPTION_KEY_SIZE];
+
+			if (!memfs_aes_gcm_epoch_key(
+					node->fs, sequence, true, epoch_key)) {
+				memfs_page_free(node, page);
+				return MEMFS_ERR_DATA;
+			}
+			memfs_build_aes_gcm_nonce(sequence, nonce);
+			crypto_result = crypto_aead_aes256gcm_encrypt(
+				cipher, &cipher_size,
+				payload, (unsigned long long)payload_size,
+				(const unsigned char*)&aad, sizeof(aad),
+				NULL, nonce, epoch_key);
+			sodium_memzero(epoch_key, sizeof(epoch_key));
 			sodium_memzero(nonce, sizeof(nonce));
-			memfs_page_free(node, page);
-			return MEMFS_ERR_DATA;
+		} else {
+			uint8_t nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+			memfs_build_xchacha_nonce(node->fs, sequence, nonce);
+			crypto_result = crypto_aead_xchacha20poly1305_ietf_encrypt(
+				cipher, &cipher_size,
+				payload, (unsigned long long)payload_size,
+				(const unsigned char*)&aad, sizeof(aad),
+				NULL, nonce, node->fs->encryption_key);
+			sodium_memzero(nonce, sizeof(nonce));
 		}
 
-		sodium_memzero(nonce, sizeof(nonce));
-
-		if (cipher_size != payload_size + crypto_aead_xchacha20poly1305_ietf_ABYTES) {
+		if (crypto_result != 0 ||
+			cipher_size != payload_size + crypto_aead_xchacha20poly1305_ietf_ABYTES) {
 			memfs_page_free(node, page);
 			return MEMFS_ERR_DATA;
 		}
@@ -747,6 +861,10 @@ static MemfsResult memfs_page_decode(MemfsNode* node, uint64_t storage_index, co
 		return MEMFS_OK;
 	}
 
+	if ((page->flags & MEMFS_PAGE_AES_GCM) &&
+		!(page->flags & MEMFS_PAGE_ENCRYPTED))
+		return MEMFS_ERR_DATA;
+
 	plain_size = page->plain_size;
 	if (plain_size != expected_plain_size)
 		return MEMFS_ERR_DATA;
@@ -756,23 +874,21 @@ static MemfsResult memfs_page_decode(MemfsNode* node, uint64_t storage_index, co
 
 	if (page->flags & MEMFS_PAGE_ENCRYPTED) {
 		MemfsPageAad aad;
-		uint8_t nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
 		unsigned long long decoded_size = 0;
 		uint64_t sequence;
 		const uint8_t* cipher;
 		size_t cipher_size;
+		int crypto_result;
 
 		if (!node->fs->encryption_enabled)
 			return MEMFS_ERR_DATA;
 
-		if (payload_size < sizeof(uint64_t) + crypto_aead_xchacha20poly1305_ietf_ABYTES) {
+		if (payload_size < sizeof(uint64_t) + crypto_aead_xchacha20poly1305_ietf_ABYTES)
 			return MEMFS_ERR_DATA;
-		}
 
 		memcpy(&sequence, payload, sizeof(sequence));
 		cipher = payload + sizeof(sequence);
 		cipher_size = payload_size - sizeof(sequence);
-		memfs_build_nonce(node->fs, sequence, nonce);
 
 		memset(&aad, 0, sizeof(aad));
 		aad.node_index = memfs_node_index_number(node);
@@ -781,16 +897,37 @@ static MemfsResult memfs_page_decode(MemfsNode* node, uint64_t storage_index, co
 		aad.plain_size = page->plain_size;
 		aad.flags = page->flags;
 
-		if (0 != crypto_aead_xchacha20poly1305_ietf_decrypt(stage, &decoded_size, NULL, cipher,
-															(unsigned long long)cipher_size, (const unsigned char*)&aad,
-															sizeof(aad), nonce, node->fs->encryption_key)) {
+		if (page->flags & MEMFS_PAGE_AES_GCM) {
+			uint8_t nonce[crypto_aead_aes256gcm_NPUBBYTES];
+			uint8_t epoch_key[MEMFS_ENCRYPTION_KEY_SIZE];
+
+			if (!crypto_aead_aes256gcm_is_available())
+				return MEMFS_ERR_DATA;
+			if (!memfs_aes_gcm_epoch_key(
+					node->fs, sequence, false, epoch_key))
+				return MEMFS_ERR_DATA;
+
+			memfs_build_aes_gcm_nonce(sequence, nonce);
+			crypto_result = crypto_aead_aes256gcm_decrypt(
+				stage, &decoded_size, NULL,
+				cipher, (unsigned long long)cipher_size,
+				(const unsigned char*)&aad, sizeof(aad),
+				nonce, epoch_key);
+			sodium_memzero(epoch_key, sizeof(epoch_key));
 			sodium_memzero(nonce, sizeof(nonce));
-			return MEMFS_ERR_DATA;
+		} else {
+			uint8_t nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+
+			memfs_build_xchacha_nonce(node->fs, sequence, nonce);
+			crypto_result = crypto_aead_xchacha20poly1305_ietf_decrypt(
+				stage, &decoded_size, NULL,
+				cipher, (unsigned long long)cipher_size,
+				(const unsigned char*)&aad, sizeof(aad),
+				nonce, node->fs->encryption_key);
+			sodium_memzero(nonce, sizeof(nonce));
 		}
 
-		sodium_memzero(nonce, sizeof(nonce));
-
-		if (decoded_size > sizeof(stage))
+		if (crypto_result != 0 || decoded_size > sizeof(stage))
 			return MEMFS_ERR_DATA;
 
 		payload = stage;
@@ -2761,6 +2898,7 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 	MemfsResult result;
 	const wchar_t* volume_label;
 	size_t label_chars;
+	uint8_t encryption_master_key[MEMFS_ENCRYPTION_KEY_SIZE] = {0};
 
 	if (options == NULL || out_fs == NULL || (!options->capacity_auto && options->capacity == 0) ||
 		options->capacity > INT64_MAX) {
@@ -2805,20 +2943,70 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 	}
 
 	fs->encryption_enabled = options->encryption_enabled || options->encryption_key != NULL;
+	fs->encryption_aes_gcm = false;
 
 	if (fs->encryption_enabled) {
+		bool aes_available;
+
 		if (options->encryption_key) {
-			memcpy(fs->encryption_key, options->encryption_key, MEMFS_ENCRYPTION_KEY_SIZE);
+			memcpy(encryption_master_key,
+				   options->encryption_key,
+				   MEMFS_ENCRYPTION_KEY_SIZE);
 		} else {
-			randombytes_buf(fs->encryption_key, MEMFS_ENCRYPTION_KEY_SIZE);
+			randombytes_buf(encryption_master_key, MEMFS_ENCRYPTION_KEY_SIZE);
 		}
 
-		// XChaCha nonce = random 128-bit process prefix + monotonic 64-bit sequence.
-		// Prefix makes nonce space fresh across mounts even when a fixed key is reused.
-		randombytes_buf(fs->encryption_nonce_prefix, MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE);
+		/*
+		 * Keep the master key for XChaCha pages and derive an independent
+		 * mount-specific AES root key. This lets the decoder honor each
+		 * page's authenticated algorithm flag even if the preferred
+		 * algorithm changes while the mount is alive.
+		 */
+		memcpy(fs->encryption_key,
+			   encryption_master_key,
+			   MEMFS_ENCRYPTION_KEY_SIZE);
+		memset(fs->encryption_aes_key, 0, sizeof(fs->encryption_aes_key));
+		InitializeSRWLock(&fs->encryption_aes_epoch_lock);
+		fs->encryption_aes_epoch = 0;
+		memset(fs->encryption_aes_epoch_key, 0,
+			   sizeof(fs->encryption_aes_epoch_key));
+		fs->encryption_aes_epoch_valid = false;
+		randombytes_buf(fs->encryption_nonce_prefix,
+						MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE);
 		fs->encryption_nonce_counter = 0;
 
+		aes_available = crypto_aead_aes256gcm_is_available() != 0;
+		if (aes_available &&
+			!memfs_derive_aes_gcm_key(
+				encryption_master_key,
+				fs->encryption_nonce_prefix,
+				fs->encryption_aes_key)) {
+			sodium_memzero(encryption_master_key,
+						   sizeof(encryption_master_key));
+			sodium_memzero(fs->encryption_key,
+						   MEMFS_ENCRYPTION_KEY_SIZE);
+			sodium_memzero(fs->encryption_aes_key,
+						   MEMFS_ENCRYPTION_KEY_SIZE);
+			sodium_memzero(fs->encryption_nonce_prefix,
+						   MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE);
+			memfs_allocator_destroy(&fs->allocator);
+			memfs_allocator_free_control(fs, sizeof(*fs));
+			return MEMFS_ERR_ACCESS;
+		}
+
+		fs->encryption_aes_gcm = aes_available;
+#if !defined(NDEBUG)
+		if (InterlockedCompareExchange(
+				&g_memfs_test_force_xchacha, 0, 0) != 0)
+			fs->encryption_aes_gcm = false;
+#endif
+
+		sodium_memzero(encryption_master_key, sizeof(encryption_master_key));
 		(void)sodium_mlock(fs->encryption_key, MEMFS_ENCRYPTION_KEY_SIZE);
+		(void)sodium_mlock(fs->encryption_aes_key,
+						  MEMFS_ENCRYPTION_KEY_SIZE);
+		(void)sodium_mlock(fs->encryption_aes_epoch_key,
+						  MEMFS_ENCRYPTION_KEY_SIZE);
 	}
 
 	volume_label = options->volume_label;
@@ -2837,7 +3025,14 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 	if (result != MEMFS_OK) {
 		if (fs->encryption_enabled) {
 			sodium_memzero(fs->encryption_key, MEMFS_ENCRYPTION_KEY_SIZE);
+			sodium_memzero(fs->encryption_aes_key, MEMFS_ENCRYPTION_KEY_SIZE);
+			sodium_memzero(fs->encryption_aes_epoch_key,
+						   MEMFS_ENCRYPTION_KEY_SIZE);
 			(void)sodium_munlock(fs->encryption_key, MEMFS_ENCRYPTION_KEY_SIZE);
+			(void)sodium_munlock(fs->encryption_aes_key,
+							 MEMFS_ENCRYPTION_KEY_SIZE);
+			(void)sodium_munlock(fs->encryption_aes_epoch_key,
+							 MEMFS_ENCRYPTION_KEY_SIZE);
 		}
 		memfs_allocator_destroy(&fs->allocator);
 		memfs_allocator_free_control(fs, sizeof(*fs));
@@ -2875,8 +3070,15 @@ void memfs_destroy(Memfs* fs) {
 
 	if (fs->encryption_enabled) {
 		sodium_memzero(fs->encryption_key, MEMFS_ENCRYPTION_KEY_SIZE);
+		sodium_memzero(fs->encryption_aes_key, MEMFS_ENCRYPTION_KEY_SIZE);
+		sodium_memzero(fs->encryption_aes_epoch_key,
+					   MEMFS_ENCRYPTION_KEY_SIZE);
 		sodium_memzero(fs->encryption_nonce_prefix, MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE);
 		(void)sodium_munlock(fs->encryption_key, MEMFS_ENCRYPTION_KEY_SIZE);
+		(void)sodium_munlock(fs->encryption_aes_key,
+						 MEMFS_ENCRYPTION_KEY_SIZE);
+		(void)sodium_munlock(fs->encryption_aes_epoch_key,
+						 MEMFS_ENCRYPTION_KEY_SIZE);
 	}
 
 	memfs_compression_contexts_destroy(fs);
