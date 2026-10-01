@@ -149,39 +149,59 @@ static void test_memory_accounting_layers(void) {
 static void test_adaptive_capacity_mode(void) {
 	MemfsOptions options = {0};
 	Memfs* fs = NULL;
-	MemfsNode* file;
+	MemfsNode* file = NULL;
 	uint8_t input[1024];
 	uint8_t output[1024];
 	uint32_t transferred;
 	uint32_t i;
-	uint64_t allowance;
+	MemfsRuntimeStats stats;
 
 	printf("== adaptive capacity mode ==\n");
+
+#if !defined(NDEBUG)
+	/*
+	 * Production auto-capacity intentionally samples live
+	 * GlobalMemoryStatusEx values. Freeze the available-memory input in
+	 * Debug so this unit test is deterministic rather than comparing two
+	 * independent live system snapshots.
+	 */
+	memfs_test_set_system_available_bytes(
+		MEMFS_AUTO_SOFT_MARGIN_BYTES + (1024ULL * 1024ULL * 1024ULL));
+#endif
 
 	options.capacity = 0;
 	options.capacity_auto = true;
 	options.volume_label = L"AUTO";
 	CHECK(memfs_create_ex(&options, &fs) == MEMFS_OK);
 	CHECK(fs != NULL);
-	if (fs == NULL)
+	if (fs == NULL) {
+#if !defined(NDEBUG)
+		memfs_test_clear_system_available_bytes();
+#endif
 		return;
+	}
 
 	CHECK(fs->capacity_auto);
 	CHECK(fs->capacity == 0);
 	CHECK(memfs_auto_allowance_bytes(fs) > 0);
 	CHECK(memfs_free_bytes(fs) > 0);
 
-	CHECK(memfs_node_create(fs, fs->root, L"auto.bin", false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, fs->root, L"auto.bin", false,
+						FILE_ATTRIBUTE_NORMAL, NULL, 0, &file) == MEMFS_OK);
 	CHECK(file != NULL);
 	if (file == NULL) {
 		memfs_destroy(fs);
+#if !defined(NDEBUG)
+		memfs_test_clear_system_available_bytes();
+#endif
 		return;
 	}
 
 	for (i = 0; i < sizeof(input); i++)
 		input[i] = (uint8_t)(0x31 + (i % 251U));
 
-	CHECK(memfs_node_write(file, input, 0, sizeof(input), false, false, &transferred) == MEMFS_OK);
+	CHECK(memfs_node_write(file, input, 0, sizeof(input),
+						   false, false, &transferred) == MEMFS_OK);
 	CHECK(transferred == sizeof(input));
 	CHECK(file->file_size == sizeof(input));
 	CHECK((uint64_t)fs->used_bytes == sizeof(input));
@@ -192,18 +212,26 @@ static void test_adaptive_capacity_mode(void) {
 	CHECK(transferred == sizeof(input));
 	CHECK(memcmp(input, output, sizeof(input)) == 0);
 
-	allowance = memfs_auto_allowance_bytes(fs);
-	CHECK(allowance > 0);
-	CHECK(memfs_free_bytes(fs) <= allowance);
+	/*
+	 * A single runtime-stats snapshot computes free_bytes from the same
+	 * auto_allowance_bytes value, so these fields are semantically
+	 * comparable even in Release where live system memory is not frozen.
+	 */
+	memfs_get_runtime_stats(fs, &stats);
+	CHECK(stats.auto_allowance_bytes > 0);
+	CHECK(stats.free_bytes == stats.auto_allowance_bytes);
 
 	CHECK(memfs_node_unlink(file) == MEMFS_OK);
 	memfs_node_close(file);
+	file = NULL;
 	CHECK((uint64_t)fs->used_bytes == 0);
 	CHECK(memfs_free_bytes(fs) > 0);
 
 	memfs_destroy(fs);
+#if !defined(NDEBUG)
+	memfs_test_clear_system_available_bytes();
+#endif
 }
-
 
 #if !defined(NDEBUG)
 static void test_adaptive_memory_pressure_scavenger(void) {
