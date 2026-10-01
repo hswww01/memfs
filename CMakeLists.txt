@@ -513,10 +513,17 @@ target_link_libraries(memfs_adaptive_compression_bench
 add_executable(memfs_alloc_mt_bench
 	bench/memfs_alloc_mt_bench.c)
 
+add_executable(memfs_encryption_mt_bench
+	bench/memfs_encryption_mt_bench.c)
+
 add_executable(memfs_soak_bench
 	bench/memfs_soak_bench.c)
 
 target_link_libraries(memfs_alloc_mt_bench
+	PRIVATE
+		memfs_core)
+
+target_link_libraries(memfs_encryption_mt_bench
 	PRIVATE
 		memfs_core)
 
@@ -549,7 +556,7 @@ endif()
 add_test(NAME memfs_mt_stress_test COMMAND memfs_mt_stress_test)
 
 if(MSVC)
-	foreach(target memfs_core memfs memfs_core_test memfs_bench memfs_capacity_bench memfs_compression_unit_bench memfs_adaptive_compression_bench memfs_alloc_mt_bench memfs_soak_bench memfs_no_crt_heap_guard memfs_resource_test memfs_driver_test memfs_cli_test)
+	foreach(target memfs_core memfs memfs_core_test memfs_bench memfs_capacity_bench memfs_compression_unit_bench memfs_adaptive_compression_bench memfs_alloc_mt_bench memfs_encryption_mt_bench memfs_soak_bench memfs_no_crt_heap_guard memfs_resource_test memfs_driver_test memfs_cli_test)
 		target_compile_options(${target}
 			PRIVATE
 				/W4

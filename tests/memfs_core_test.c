@@ -4384,6 +4384,118 @@ cleanup:
 		memfs_destroy(fs);
 }
 
+#define NONCE_BATCH_TEST_THREADS 16
+#define NONCE_BATCH_TEST_PER_THREAD 300
+
+typedef struct NonceBatchTestWorker {
+	Memfs* fs;
+	uint64_t* sequences;
+	LONG errors;
+} NonceBatchTestWorker;
+
+static DWORD WINAPI nonce_batch_test_worker(void* context) {
+	NonceBatchTestWorker* worker = (NonceBatchTestWorker*)context;
+
+	for (uint32_t i = 0; i < NONCE_BATCH_TEST_PER_THREAD; ++i) {
+		if (!memfs_test_next_nonce_sequence(worker->fs,
+										   &worker->sequences[i])) {
+			InterlockedIncrement(&worker->errors);
+			break;
+		}
+	}
+	return 0;
+}
+
+static int nonce_sequence_compare(const void* left, const void* right) {
+	uint64_t a = *(const uint64_t*)left;
+	uint64_t b = *(const uint64_t*)right;
+	return (a > b) - (a < b);
+}
+
+static void test_encryption_nonce_sequence_batching(void) {
+	MemfsOptions options = {0};
+	Memfs* first = NULL;
+	Memfs* second = NULL;
+	uint64_t sequence = 0;
+
+	printf("== encryption nonce sequence batching ==\n");
+
+	options.capacity = 8ULL * 1024ULL * 1024ULL;
+	options.volume_label = L"NONCE";
+	options.encryption_enabled = true;
+
+	CHECK(memfs_create_ex(&options, &first) == MEMFS_OK);
+	CHECK(first != NULL);
+	if (first == NULL)
+		return;
+
+	for (uint64_t expected = 1; expected <= 300; ++expected) {
+		CHECK(memfs_test_next_nonce_sequence(first, &sequence));
+		CHECK(sequence == expected);
+	}
+	CHECK(first->encryption_nonce_counter == 512);
+
+	{
+		uint64_t sequences[NONCE_BATCH_TEST_THREADS *
+						   NONCE_BATCH_TEST_PER_THREAD];
+		NonceBatchTestWorker workers[NONCE_BATCH_TEST_THREADS];
+		HANDLE threads[NONCE_BATCH_TEST_THREADS] = {0};
+		uint32_t started = 0;
+
+		memset(sequences, 0, sizeof(sequences));
+		memset(workers, 0, sizeof(workers));
+		for (uint32_t i = 0; i < NONCE_BATCH_TEST_THREADS; ++i) {
+			workers[i].fs = first;
+			workers[i].sequences =
+				&sequences[i * NONCE_BATCH_TEST_PER_THREAD];
+			threads[i] = CreateThread(
+				NULL, 0, nonce_batch_test_worker, &workers[i], 0, NULL);
+			CHECK(threads[i] != NULL);
+			if (threads[i] == NULL)
+				break;
+			started++;
+		}
+
+		if (started != 0) {
+			CHECK(WaitForMultipleObjects(
+					  started, threads, TRUE, 30000) == WAIT_OBJECT_0);
+		}
+		for (uint32_t i = 0; i < started; ++i) {
+			CHECK(workers[i].errors == 0);
+			CloseHandle(threads[i]);
+		}
+		CHECK(started == NONCE_BATCH_TEST_THREADS);
+
+		if (started == NONCE_BATCH_TEST_THREADS) {
+			qsort(sequences, _countof(sequences), sizeof(sequences[0]),
+				  nonce_sequence_compare);
+			CHECK(sequences[0] != 0);
+			for (uint32_t i = 1; i < _countof(sequences); ++i) {
+				CHECK(sequences[i] > sequences[i - 1]);
+			}
+		}
+	}
+
+	memfs_destroy(first);
+	first = NULL;
+
+	/*
+	 * The calling thread still owns a TLS cache entry for the old mount.
+	 * A new mount must bind the cache to its fresh 128-bit nonce prefix and
+	 * therefore start its own sequence space at one.
+	 */
+	CHECK(memfs_create_ex(&options, &second) == MEMFS_OK);
+	CHECK(second != NULL);
+	if (second != NULL) {
+		sequence = 0;
+		CHECK(memfs_test_next_nonce_sequence(second, &sequence));
+		CHECK(sequence == 1);
+		CHECK(second->encryption_nonce_counter == 256);
+		memfs_destroy(second);
+	}
+}
+
+
 static void test_allocator_failure_injection_primitives(void) {
 	MemfsAllocator allocator;
 	MemfsAllocatorStats baseline;
@@ -4722,6 +4834,7 @@ int main(void) {
 	test_allocator_fast_committed_counter();
 	test_allocator_bootstrap_control();
 #if !defined(NDEBUG)
+	test_encryption_nonce_sequence_batching();
 	test_allocator_failure_injection_primitives();
 	test_allocator_alignment_contract();
 	test_raw_page_compact_representation();

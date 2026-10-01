@@ -287,6 +287,67 @@ static void memfs_build_nonce(Memfs* fs, uint64_t sequence,
 	memcpy(nonce, fs->encryption_nonce_prefix, MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE);
 	memcpy(nonce + MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE, &sequence, sizeof(sequence));
 }
+
+#define MEMFS_NONCE_SEQUENCE_BLOCK_SIZE 256ULL
+
+typedef struct MemfsNonceSequenceCache {
+	Memfs* fs;
+	uint8_t nonce_prefix[MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE];
+	uint64_t next;
+	uint64_t end;
+} MemfsNonceSequenceCache;
+
+static __declspec(thread) MemfsNonceSequenceCache g_memfs_nonce_sequence_cache;
+
+static bool memfs_nonce_sequence_next(Memfs* fs, uint64_t* sequence) {
+	MemfsNonceSequenceCache* cache = &g_memfs_nonce_sequence_cache;
+
+	if (fs == NULL || sequence == NULL)
+		return false;
+
+	if (cache->fs != fs ||
+		memcmp(cache->nonce_prefix,
+			   fs->encryption_nonce_prefix,
+			   MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE) != 0 ||
+		cache->next >= cache->end) {
+		LONG64 reserved_end = InterlockedAdd64(
+			&fs->encryption_nonce_counter,
+			(LONG64)MEMFS_NONCE_SEQUENCE_BLOCK_SIZE);
+		uint64_t end;
+		uint64_t start;
+
+		/*
+		 * Sequence zero is intentionally unused. A signed wrap means the
+		 * 64-bit sequence space is exhausted; fail closed rather than reuse
+		 * a nonce. Reserving in blocks may leave at most 255 terminal values
+		 * unused, which is immaterial relative to the 2^63 sequence space.
+		 */
+		if (reserved_end <= 0 ||
+			(uint64_t)reserved_end < MEMFS_NONCE_SEQUENCE_BLOCK_SIZE) {
+			return false;
+		}
+
+		end = (uint64_t)reserved_end;
+		start = end - MEMFS_NONCE_SEQUENCE_BLOCK_SIZE + 1ULL;
+
+		cache->fs = fs;
+		memcpy(cache->nonce_prefix,
+			   fs->encryption_nonce_prefix,
+			   MEMFS_ENCRYPTION_NONCE_PREFIX_SIZE);
+		cache->next = start;
+		cache->end = end + 1ULL;
+	}
+
+	*sequence = cache->next++;
+	return true;
+}
+
+#if !defined(NDEBUG)
+bool memfs_test_next_nonce_sequence(Memfs* fs, uint64_t* sequence) {
+	return memfs_nonce_sequence_next(fs, sequence);
+}
+#endif
+
 static void memfs_security_release(MemfsSecurity* security);
 
 #define MEMFS_PAGE_RAW_TAG ((uintptr_t)1U)
@@ -624,15 +685,13 @@ static MemfsResult memfs_page_encode(MemfsNode* node, uint64_t storage_index, co
 		uint8_t* sequence_data = page->data;
 		uint8_t* cipher = page->data + sizeof(uint64_t);
 		unsigned long long cipher_size = 0;
-		LONG64 sequence_signed = InterlockedIncrement64(&node->fs->encryption_nonce_counter);
 		uint64_t sequence;
 
-		if (sequence_signed <= 0) {
+		if (!memfs_nonce_sequence_next(node->fs, &sequence)) {
 			memfs_page_free(node, page);
 			return MEMFS_ERR_DATA;
 		}
 
-		sequence = (uint64_t)sequence_signed;
 		page->flags |= MEMFS_PAGE_ENCRYPTED;
 
 		memcpy(sequence_data, &sequence, sizeof(sequence));

@@ -290,6 +290,7 @@ bool memfs_test_page_info(MemfsNode* node,
                           bool* is_raw,
                           size_t* heap_bytes,
                           uintptr_t* allocation_address);
+bool memfs_test_next_nonce_sequence(Memfs* fs, uint64_t* sequence);
 #endif
 
 MemfsResult memfs_create(uint64_t capacity, const wchar_t* volume_label, Memfs** out_fs);
