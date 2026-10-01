@@ -279,11 +279,12 @@ static void sample_stats(
 static void usage(const char* exe) {
     fprintf(
         stderr,
-        "Usage: %s [--seconds N] [--soak MINUTES] [--sample-ms N]\n"
+        "Usage: %s [--seconds N] [--soak MINUTES] [--sample-ms N] [--auto-capacity]\n"
         "  no arguments      short CI run (%u seconds)\n"
         "  --seconds N       explicit short run, 1..30 seconds\n"
         "  --soak MINUTES    long soak, %u..%u minutes\n"
-        "  --sample-ms N     sample interval, 250..10000 ms\n",
+        "  --sample-ms N     sample interval, 250..10000 ms\n"
+        "  --auto-capacity   exercise adaptive capacity/cache instead of fixed quota\n",
         exe,
         SOAK_DEFAULT_SECONDS,
         SOAK_MIN_MINUTES,
@@ -301,6 +302,7 @@ int main(int argc, char** argv) {
     DriftFit committed_fit = {0};
     uint32_t duration_seconds = SOAK_DEFAULT_SECONDS;
     uint32_t sample_ms = SOAK_DEFAULT_SAMPLE_MS;
+    bool auto_capacity = false;
     uint64_t duration_ms;
     uint64_t start_tick;
     uint64_t next_sample;
@@ -336,6 +338,8 @@ int main(int argc, char** argv) {
                 return 2;
             }
             sample_ms = (uint32_t)value;
+        } else if (strcmp(argv[i], "--auto-capacity") == 0) {
+            auto_capacity = true;
         } else if (strcmp(argv[i], "--help") == 0 ||
                    strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
@@ -347,7 +351,9 @@ int main(int argc, char** argv) {
     }
 
     memset(&options, 0, sizeof(options));
-    options.capacity = SOAK_CAPACITY_BYTES;
+    options.capacity = auto_capacity ? 0 : SOAK_CAPACITY_BYTES;
+    options.capacity_auto = auto_capacity;
+    printf("capacity_mode=%s\n", auto_capacity ? "auto" : "fixed");
     options.volume_label = L"SOAK";
     options.compression_enabled = true;
     options.compression_level = 1;
