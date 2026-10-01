@@ -389,3 +389,25 @@ scripts/
 - Password-based key derivation if persistent encrypted images are introduced.
 - More rename/delete/open race stress tests.
 - Continue profiling unified size-class shard counts, slab sizing and the slab/area threshold under real workloads; do not introduce object-type-specific physical pools.
+
+## Release-candidate acceptance and portable handoff
+
+Run `scripts/verify-release-acceptance.ps1` to record a bounded, fail-closed matrix
+for the actual revision; see `docs/RELEASE_ACCEPTANCE.md`. The current CTest
+registration includes 20 cases. The lifecycle regression covers shared opens and
+asynchronous final Close, which WinFsp FINE does not serialize. A separate short
+lifetime lock protects references/orphans without serializing ordinary data I/O.
+Security descriptor replacement and borrowed snapshots have compatible guards.
+
+After a passing extended report, create a portable kit with:
+
+```powershell
+python .\scripts\package-validation-kit.py --report .agent\<acceptance-run>\acceptance.json
+```
+
+The generated kit has a strict manifest and can run the matching Release tests
+on another Windows machine without a development environment. Follow
+`docs/PORTABLE_VALIDATION.zh-CN.md`; clean-VM installation, Win11 ARM64 execution,
+actual OS reboot, publisher signing and distribution licensing remain separate
+acceptance gates. The kit does not automatically enable Sandbox, resume or reset
+an existing VM, reboot the host, or certify those unexecuted gates.

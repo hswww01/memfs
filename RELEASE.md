@@ -73,22 +73,28 @@ cmake --build --preset x64-release
 ctest --preset x64-release --output-on-failure
 ```
 
-Both Debug and Release pass 13/13 tests:
+The current test registration contains 20 cases. The generated acceptance report records the executed revision, each result and all failures; source documentation is not a substitute for a passing report.
 
-1. `memfs_mt_stress_test`
-2. `memfs_core_test`
-3. `memfs_soak_smoke`
-4. `memfs_no_crt_heap_guard`
-5. `memfs_no_crt_heap_guard_good_fixture`
-6. `memfs_no_crt_heap_guard_bad_fixture`
-7. `memfs_driver_test`
-8. `memfs_static_winfsp_no_dll_import`
-9. `memfs_static_winfsp_version`
-10. `memfs_winfsp_dispatcher_state`
-11. `memfs_cli_help`
-12. `memfs_embedded_winfsp_resources`
-13. `memfs_winfsp_driver_provenance`
-
+1. `memfs_capacity_snapshot_test`
+2. `memfs_lifetime_test`
+3. `memfs_mt_stress_test`
+4. `memfs_core_test`
+5. `memfs_soak_smoke`
+6. `memfs_no_crt_heap_guard`
+7. `memfs_no_crt_heap_guard_good_fixture`
+8. `memfs_no_crt_heap_guard_bad_fixture`
+9. `memfs_driver_test`
+10. `memfs_cli_test`
+11. `memfs_static_winfsp_no_dll_import`
+12. `memfs_static_winfsp_version`
+13. `memfs_winfsp_dispatcher_state`
+14. `memfs_cli_help`
+15. `memfs_cli_reject_negative_size`
+16. `memfs_cli_reject_oversized_size`
+17. `memfs_cli_reject_thread_one`
+18. `memfs_cli_reject_thread_over_limit`
+19. `memfs_embedded_winfsp_resources`
+20. `memfs_winfsp_driver_provenance`
 
 ## Real mounted-drive integration
 
@@ -246,6 +252,35 @@ Debug and Release now pass 19/19 CTest cases. The dedicated production-path test
 
 Mounted integration now checks multi-page byte-for-byte I/O, a cross-page rewrite, truncate/regrow zero filling, sparse holes, case-insensitive lookup and wildcard enumeration. It launches without a console and reports PASS only after graceful zero-exit shutdown and DOS-device removal. Forced termination is cleanup, not a passing result. A deliberately invalid CLI launch was confirmed to fail the integration harness rather than produce a false PASS.
 
+## Final lifetime correctness review
+
+The extended acceptance run on 2026-10-01 first found an intermittent mounted
+combined-mode directory failure. A bounded fresh-child reproduction subsequently
+captured a native access violation in a security-descriptor copy. The original
+failed report and crash dump are retained; successful retries are not a fix.
+
+WinFsp FINE allows shared FILE_OPEN callbacks and delivers Close asynchronously
+without the namespace operation guard. The previous plain `open_count++/--` and
+shared orphan-list mutation were therefore unsafe. A newly added regression on
+the old core immediately observed only 44,528 references instead of 160,001.
+
+A dedicated 8-byte per-filesystem lifetime SRW lock now coordinates handle counts,
+unlink/replacement retirement, and orphan removal. Node size remains 128 bytes;
+ordinary file data reads/writes do not acquire this lock. Destruction happens
+outside it, after the final valid reference and namespace ownership are gone.
+The MT test now exercises unlink-before-close rather than incorrectly avoiding
+orphan transitions. A test that read a node after its final close was corrected.
+
+SetSecurity/GetSecurity callbacks additionally use exclusive/shared protection
+against FINE's namespace descriptor borrowers. GetSecurityByName must not acquire
+the guard recursively because Create/Open already holds it. The callback test
+checks a blocked descriptor replacement and 2,000 replacements racing 20,000
+validating reads. The lifecycle test checks exact concurrent counts plus final
+close, unlink/close and replacement/close races with baseline allocator live bytes.
+Fresh mounted repetitions and full acceptance must pass on the fixed revision
+before this build is promoted. This fixes confirmed synchronization defects; it
+does not assert that tests prove the absence of every possible filesystem bug.
+
 ## Hardware AES-GCM encryption fast path
 
 Encrypted pages now select AES-256-GCM automatically when libsodium reports hardware AES-GCM support, with XChaCha20-Poly1305 retained as the portable fallback. The per-page `MEMFS_PAGE_AES_GCM` flag is part of AEAD AAD, and decoding follows that authenticated page flag rather than the current encoder preference.
@@ -311,18 +346,26 @@ The harness verifies private service creation, MemfsC-owned driver filename/path
 
 ## Current binaries
 
-Debug:
+Do not use a hardcoded EXE hash from this source document. The current package's
+`dist/memfs-x64/BUILD_PROVENANCE.json` and `SHA256SUMS.txt` bind the exact source
+revision, toolchain, embedded driver inputs and executable. A package is accepted
+only when a passing report for that revision also verifies those hashes. A failed
+acceptance remains failed even when subsequent isolated reproductions pass.
 
-- size: 3,351,040 bytes
-- SHA-256: `F402A884BDCE885612D11820F1CEAC3228C932142EAEDA825FE3C140F0D7E7C5`
+## Portable validation handoff
 
-Release:
+`scripts/package-validation-kit.py` produces a diagnostic kit only from an actual
+passing acceptance report and identical accepted build/package EXEs. The kit can
+run the corresponding 20 Release tests without CMake, vcpkg or a compiler. It
+contains the signed driver reference files, test binaries, scripts, source-guard
+inputs, a strict SHA-256 manifest and copied host acceptance/provenance records.
+See `docs/PORTABLE_VALIDATION.zh-CN.md` for clean-guest and ARM64 instructions.
 
-- size: 1,350,656 bytes
-- SHA-256: `5E037BB9AFF75F667ED6F1770C5148B43D9B22109CC010BC934E3954C69C12E2`
-
-These hashes are verification artifacts for this local build, not permanent release
-identifiers.
+A later documentation/handoff-only revision may be paired with the original full
+run using `--extended-report`, but only after a new current-HEAD acceptance passes,
+the EXE hashes match, test registration is unchanged, and no compiled/runtime/build
+input changed. Both original reports are retained with their own revision; the
+old run is never relabeled. A failed extended run cannot be used for a kit.
 
 ## Release packaging
 
