@@ -224,6 +224,24 @@ To keep the 16 slab lanes from increasing allocator high-water across repeated i
 
 Area-cache retention is size-aware rather than uniformly keeping two idle regions per lane. Small area blocks retain the two-slot lane cache, while VM regions larger than 64 KiB retain at most one cached block per lane. In the 64 KiB allocation benchmark this reduced 16-thread retained cached backing from about 1,392,640 bytes to a three-run median of 696,320 bytes (zeroed) / 765,952 bytes (uninitialized). Uninitialized 16-thread throughput stayed effectively flat at about 38.4M ops/s versus a 38.7M baseline, while zeroed throughput remained within a few percent. Debug/Release tests, a 10-second soak, and real mounted integration all pass.
 
+## Auto-capacity available-memory sample cache
+
+After the allocator committed-byte query was reduced to O(1), the remaining auto-capacity growth overhead was dominated by a `GlobalMemoryStatusEx` call on every growth check. The production growth path now caches that OS sample for only 1 ms using a QPC deadline. Public `memfs_auto_allowance_bytes()` and runtime-stat queries remain live.
+
+The cache is conservative with respect to memfs's own allocations: it stores the allocator committed-byte count alongside the OS sample and subtracts any committed growth before using a cached value. Committed shrinkage does not increase the cached sample. Near soft pressure or when a request does not fit the cached allowance, the path scavenges and forces a fresh OS query. Debug builds bypass the cache so injected pressure values remain deterministic.
+
+Seven Release benchmark runs on the same machine:
+
+| metric | before | after median | change |
+| --- | ---: | ---: | ---: |
+| committed query | 5.2 ns | 5.2 ns | unchanged |
+| live allowance query | 321.9 ns | 319.3 ns | intentionally unchanged |
+| fixed growth | 27.7 ns | 27.7 ns | unchanged |
+| auto growth | 347.3 ns | 63.8 ns | 5.44x faster / -81.6% |
+| auto/fixed ratio | 12.54x | 2.30x | substantially narrowed |
+
+Debug and Release pass 18/18 tests; Release `memfs_core_test` passed 50 consecutive runs, the MT stress test passed 10 consecutive runs, a 10-second compression+encryption soak reported zero private/committed drift, and a real mounted `--size auto` integration run passed.
+
 ## Hardware AES-GCM encryption fast path
 
 Encrypted pages now select AES-256-GCM automatically when libsodium reports hardware AES-GCM support, with XChaCha20-Poly1305 retained as the portable fallback. The per-page `MEMFS_PAGE_AES_GCM` flag is part of AEAD AAD, and decoding follows that authenticated page flag rather than the current encoder preference.
@@ -291,13 +309,13 @@ The harness verifies private service creation, MemfsC-owned driver filename/path
 
 Debug:
 
-- size: 3,350,528 bytes
-- SHA-256: `2497B86464ED176E84C01D33C0AC3E8C0FC364CCF2F1C570742118B70227A6FE`
+- size: 3,351,040 bytes
+- SHA-256: `F402A884BDCE885612D11820F1CEAC3228C932142EAEDA825FE3C140F0D7E7C5`
 
 Release:
 
-- size: 1,350,144 bytes
-- SHA-256: `2146E06F7A7A6D3D2565A642A031DD2FD27E0C7D836B41EFD7FD6E3D56F440DB`
+- size: 1,350,656 bytes
+- SHA-256: `5E037BB9AFF75F667ED6F1770C5148B43D9B22109CC010BC934E3954C69C12E2`
 
 These hashes are verification artifacts for this local build, not permanent release
 identifiers.

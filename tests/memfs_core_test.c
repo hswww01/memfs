@@ -159,6 +159,12 @@ static void test_adaptive_capacity_mode(void) {
 	printf("== adaptive capacity mode ==\n");
 
 #if !defined(NDEBUG)
+	/* Cached samples must debit only allocator backing committed after the sample. */
+	CHECK(memfs_test_adjust_cached_available(1024U, 128U, 128U) == 1024U);
+	CHECK(memfs_test_adjust_cached_available(1024U, 128U, 256U) == 896U);
+	CHECK(memfs_test_adjust_cached_available(1024U, 256U, 128U) == 1024U);
+	CHECK(memfs_test_adjust_cached_available(1024U, 128U, 2048U) == 0U);
+
 	/*
 	 * Production auto-capacity intentionally samples live
 	 * GlobalMemoryStatusEx values. Freeze the available-memory input in

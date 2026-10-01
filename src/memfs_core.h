@@ -257,6 +257,10 @@ struct Memfs {
 	volatile LONG64 used_bytes;
 	volatile LONG64 resident_bytes;
 	volatile LONG64 pressure_last_scavenge_tick;
+	SRWLOCK auto_available_refresh_lock;
+	volatile LONG64 auto_available_cached_bytes;
+	volatile LONG64 auto_available_cached_committed;
+	volatile LONG64 auto_available_cache_deadline_qpc;
 	uint64_t treap_seed;
 
 	bool compression_enabled;
@@ -296,6 +300,10 @@ void memfs_get_runtime_stats(Memfs* fs, MemfsRuntimeStats* stats);
 #if !defined(NDEBUG)
 void memfs_test_set_system_available_bytes(uint64_t bytes);
 void memfs_test_clear_system_available_bytes(void);
+uint64_t memfs_test_adjust_cached_available(
+	uint64_t sampled_available,
+	uint64_t sampled_committed,
+	uint64_t current_committed);
 void memfs_test_force_xchacha(bool force);
 bool memfs_test_page_info(MemfsNode* node,
                           uint64_t page_index,

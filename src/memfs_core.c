@@ -84,6 +84,7 @@ void memfs_node_set_change_time(MemfsNode* node, uint64_t value) {
 }
 
 #define MEMFS_AUTO_REFRESH_INTERVAL_MS 250ULL
+#define MEMFS_AUTO_AVAILABLE_CACHE_INTERVAL_US 1000ULL
 
 #if !defined(NDEBUG)
 static volatile LONG64 g_memfs_test_system_available_bytes = -1;
@@ -123,6 +124,122 @@ static uint64_t memfs_system_available_bytes(void) {
 		return 0;
 
 	return memfs_min_u64(status.ullAvailPhys, status.ullAvailPageFile);
+}
+
+static uint64_t memfs_adjust_cached_available(
+	uint64_t sampled_available,
+	uint64_t sampled_committed,
+	uint64_t current_committed) {
+	uint64_t own_growth;
+
+	if (current_committed <= sampled_committed)
+		return sampled_available;
+
+	own_growth = current_committed - sampled_committed;
+	return own_growth < sampled_available
+		? sampled_available - own_growth
+		: 0;
+}
+
+#if !defined(NDEBUG)
+uint64_t memfs_test_adjust_cached_available(
+	uint64_t sampled_available,
+	uint64_t sampled_committed,
+	uint64_t current_committed) {
+	return memfs_adjust_cached_available(
+		sampled_available, sampled_committed, current_committed);
+}
+#endif
+
+static uint64_t memfs_auto_capacity_available_bytes(
+	Memfs* fs,
+	bool force_refresh) {
+#if !defined(NDEBUG)
+	/*
+	 * Debug capacity/pressure tests intentionally change the available-memory
+	 * override between adjacent operations. Bypass the production cache so
+	 * those tests observe the requested value immediately.
+	 */
+	(void)fs;
+	(void)force_refresh;
+	return memfs_system_available_bytes();
+#else
+	LARGE_INTEGER now;
+	LARGE_INTEGER frequency;
+	LONG64 deadline;
+	uint64_t sampled_available;
+	uint64_t sampled_committed;
+	uint64_t current_committed;
+	uint64_t interval_ticks;
+
+	if (fs == NULL)
+		return memfs_system_available_bytes();
+
+	if (!QueryPerformanceCounter(&now))
+		return memfs_system_available_bytes();
+
+	deadline = InterlockedCompareExchange64(
+		&fs->auto_available_cache_deadline_qpc, 0, 0);
+	if (!force_refresh && deadline > now.QuadPart) {
+		sampled_available = (uint64_t)InterlockedCompareExchange64(
+			&fs->auto_available_cached_bytes, 0, 0);
+		sampled_committed = (uint64_t)InterlockedCompareExchange64(
+			&fs->auto_available_cached_committed, 0, 0);
+		current_committed = memfs_committed_bytes(fs);
+		return memfs_adjust_cached_available(
+			sampled_available, sampled_committed, current_committed);
+	}
+
+	AcquireSRWLockExclusive(&fs->auto_available_refresh_lock);
+
+	/*
+	 * Another thread may have refreshed while we waited. Recheck before
+	 * entering the OS query.
+	 */
+	if (!force_refresh && QueryPerformanceCounter(&now)) {
+		deadline = InterlockedCompareExchange64(
+			&fs->auto_available_cache_deadline_qpc, 0, 0);
+		if (deadline > now.QuadPart) {
+			sampled_available = (uint64_t)InterlockedCompareExchange64(
+				&fs->auto_available_cached_bytes, 0, 0);
+			sampled_committed = (uint64_t)InterlockedCompareExchange64(
+				&fs->auto_available_cached_committed, 0, 0);
+			current_committed = memfs_committed_bytes(fs);
+			ReleaseSRWLockExclusive(&fs->auto_available_refresh_lock);
+			return memfs_adjust_cached_available(
+				sampled_available, sampled_committed, current_committed);
+		}
+	}
+
+	sampled_available = memfs_system_available_bytes();
+	sampled_committed = memfs_committed_bytes(fs);
+
+	/*
+	 * Publish the deadline last. Cached readers that see a valid deadline
+	 * therefore also see the corresponding available/committed sample.
+	 */
+	InterlockedExchange64(
+		&fs->auto_available_cached_bytes, (LONG64)sampled_available);
+	InterlockedExchange64(
+		&fs->auto_available_cached_committed, (LONG64)sampled_committed);
+
+	if (QueryPerformanceFrequency(&frequency) &&
+		QueryPerformanceCounter(&now)) {
+		interval_ticks =
+			(uint64_t)frequency.QuadPart *
+			MEMFS_AUTO_AVAILABLE_CACHE_INTERVAL_US / 1000000ULL;
+		if (interval_ticks == 0)
+			interval_ticks = 1;
+		InterlockedExchange64(
+			&fs->auto_available_cache_deadline_qpc,
+			(LONG64)((uint64_t)now.QuadPart + interval_ticks));
+	} else {
+		InterlockedExchange64(&fs->auto_available_cache_deadline_qpc, 0);
+	}
+
+	ReleaseSRWLockExclusive(&fs->auto_available_refresh_lock);
+	return sampled_available;
+#endif
 }
 
 static uint64_t memfs_auto_allowance_for_available(Memfs* fs, uint64_t available) {
@@ -195,7 +312,7 @@ static bool memfs_auto_capacity_allows(Memfs* fs, uint64_t request) {
 	if (request == 0)
 		return true;
 
-	available = memfs_system_available_bytes();
+	available = memfs_auto_capacity_available_bytes(fs, false);
 	allowance = memfs_auto_allowance_for_available(fs, available);
 
 	/*
@@ -206,7 +323,7 @@ static bool memfs_auto_capacity_allows(Memfs* fs, uint64_t request) {
 	 */
 	if (available <= MEMFS_AUTO_SOFT_MARGIN_BYTES || request > allowance) {
 		memfs_auto_pressure_scavenge(fs);
-		available = memfs_system_available_bytes();
+		available = memfs_auto_capacity_available_bytes(fs, true);
 		allowance = memfs_auto_allowance_for_available(fs, available);
 	}
 
@@ -2929,6 +3046,10 @@ MemfsResult memfs_create_ex(const MemfsOptions* options, Memfs** out_fs) {
 	fs->capacity = options->capacity;
 	fs->capacity_auto = options->capacity_auto;
 	fs->pressure_last_scavenge_tick = 0;
+	InitializeSRWLock(&fs->auto_available_refresh_lock);
+	fs->auto_available_cached_bytes = 0;
+	fs->auto_available_cached_committed = 0;
+	fs->auto_available_cache_deadline_qpc = 0;
 	randombytes_buf(&fs->treap_seed, sizeof(fs->treap_seed));
 	if (fs->treap_seed == 0)
 		fs->treap_seed = 0x9e3779b97f4a7c15ULL;
