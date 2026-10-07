@@ -271,6 +271,13 @@ else()
 		"IDR_MEMFS_WINFSP_DLL RCDATA \"${WINFSP_RUNTIME_RC}\"")
 endif()
 
+set(FS_FRONTEND_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../fs/frontend" CACHE PATH
+	"Shared WinFsp and Windows service frontend source directory")
+if(NOT EXISTS "${FS_FRONTEND_SOURCE_DIR}/CMakeLists.txt")
+	message(FATAL_ERROR "Shared fs_frontend source tree not found: ${FS_FRONTEND_SOURCE_DIR}")
+endif()
+add_subdirectory("${FS_FRONTEND_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/fs_frontend")
+
 file(TO_CMAKE_PATH "${WINFSP_DRIVER_X64}" WINFSP_DRIVER_X64_RC)
 file(TO_CMAKE_PATH "${WINFSP_DRIVER_ARM64}" WINFSP_DRIVER_ARM64_RC)
 configure_file(
@@ -300,6 +307,7 @@ target_link_libraries(memfs_core
 
 add_executable(memfs
 	src/main.c
+	src/memfs_gui.c
 	src/memfs_cli.c
 	src/memfs_winfsp.c
 	src/memfs_driver.c
@@ -312,12 +320,14 @@ target_include_directories(memfs
 target_compile_definitions(memfs
 	PRIVATE
 		_CRT_SECURE_NO_WARNINGS
+		WIN32_LEAN_AND_MEAN
 		UNICODE
 		_UNICODE)
 
 target_link_libraries(memfs
 	PRIVATE
 		memfs_core
+		fs_frontend
 		${WINFSP_LIBRARY}
 		advapi32)
 
@@ -354,12 +364,14 @@ if(MEMFS_STATIC_WINFSP)
 			WINFSP_STATIC
 			MEMFS_WINFSP_STATIC=1
 			_CRT_SECURE_NO_WARNINGS
+			WIN32_LEAN_AND_MEAN
 			UNICODE
 			_UNICODE)
 
 	target_link_libraries(memfs_winfsp_probe
 		PRIVATE
 			memfs_core
+		fs_frontend
 			${WINFSP_LIBRARY}
 			advapi32
 			credui
@@ -387,12 +399,14 @@ if(MEMFS_STATIC_WINFSP)
 			MEMFS_WINFSP_STATIC=1
 			MEMFS_WINFSP_TESTING
 			_CRT_SECURE_NO_WARNINGS
+			WIN32_LEAN_AND_MEAN
 			UNICODE
 			_UNICODE)
 
 	target_link_libraries(memfs_winfsp_state_test
 		PRIVATE
 			memfs_core
+		fs_frontend
 			${WINFSP_LIBRARY}
 			advapi32
 			credui
@@ -460,6 +474,15 @@ add_executable(memfs_cli_test
 target_include_directories(memfs_cli_test
 	PRIVATE
 		${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_executable(memfs_gui_config_test
+	tests/memfs_gui_config_test.c
+	src/memfs_gui.c
+	src/memfs_cli.c)
+target_include_directories(memfs_gui_config_test
+	PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/src
+		${FS_FRONTEND_SOURCE_DIR}/include)
 
 if(MEMFS_STATIC_WINFSP)
 	add_executable(memfs_static_import_test
@@ -581,7 +604,7 @@ endif()
 add_test(NAME memfs_mt_stress_test COMMAND memfs_mt_stress_test)
 
 if(MSVC)
-	foreach(target memfs_core memfs memfs_core_test memfs_bench memfs_capacity_bench memfs_compression_unit_bench memfs_adaptive_compression_bench memfs_alloc_mt_bench memfs_encryption_mt_bench memfs_soak_bench memfs_no_crt_heap_guard memfs_resource_test memfs_driver_test memfs_cli_test)
+	foreach(target memfs_core memfs memfs_core_test memfs_bench memfs_capacity_bench memfs_compression_unit_bench memfs_adaptive_compression_bench memfs_alloc_mt_bench memfs_encryption_mt_bench memfs_soak_bench memfs_no_crt_heap_guard memfs_resource_test memfs_driver_test memfs_cli_test memfs_gui_config_test)
 		target_compile_options(${target}
 			PRIVATE
 				/W4
@@ -612,6 +635,7 @@ set_tests_properties(memfs_no_crt_heap_guard_bad_fixture PROPERTIES
 
 add_test(NAME memfs_driver_test COMMAND memfs_driver_test)
 add_test(NAME memfs_cli_test COMMAND memfs_cli_test)
+add_test(NAME memfs_gui_config_test COMMAND memfs_gui_config_test)
 
 if(MEMFS_STATIC_WINFSP)
 	add_test(NAME memfs_static_winfsp_no_dll_import
@@ -632,11 +656,20 @@ add_test(NAME memfs_cli_reject_thread_one
 	COMMAND memfs --mount R: --threads 1)
 add_test(NAME memfs_cli_reject_thread_over_limit
 	COMMAND memfs --mount R: --threads 65)
+add_test(NAME memfs_cli_reject_encrypted_native_install_hex
+	COMMAND memfs --install --mount R: --key-hex
+		000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f)
+add_test(NAME memfs_cli_reject_encrypted_native_install_env
+	COMMAND "${CMAKE_COMMAND}" -E env
+		MEMFS_INSTALL_TEST_KEY=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+		$<TARGET_FILE:memfs> --install --mount R: --key-env MEMFS_INSTALL_TEST_KEY)
 set_tests_properties(
 	memfs_cli_reject_negative_size
 	memfs_cli_reject_oversized_size
 	memfs_cli_reject_thread_one
 	memfs_cli_reject_thread_over_limit
+	memfs_cli_reject_encrypted_native_install_hex
+	memfs_cli_reject_encrypted_native_install_env
 	PROPERTIES WILL_FAIL TRUE)
 
 add_test(NAME memfs_embedded_winfsp_resources
@@ -647,5 +680,17 @@ add_test(NAME memfs_winfsp_driver_provenance
 		-File "${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify-winfsp-drivers.ps1"
 		-X64Path "${WINFSP_DRIVER_X64}"
 		-Arm64Path "${WINFSP_DRIVER_ARM64}")
+
+if(MEMFS_STATIC_WINFSP)
+	add_test(NAME memfs_native_service_install
+		COMMAND "${MEMFS_POWERSHELL_EXECUTABLE}" -NoLogo -NoProfile -NonInteractive
+			-ExecutionPolicy Bypass
+			-File "${CMAKE_CURRENT_SOURCE_DIR}/tests/native-service-install.ps1"
+			-Exe "$<TARGET_FILE:memfs>"
+			-Drive "W:")
+	set_tests_properties(memfs_native_service_install PROPERTIES
+		SKIP_RETURN_CODE 77
+		TIMEOUT 240)
+endif()
 
 install(TARGETS memfs RUNTIME DESTINATION bin)

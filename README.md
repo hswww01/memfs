@@ -6,7 +6,7 @@ A high-performance volatile Windows memory file system written in C17 on top of 
 
 - Pure C17, CMake, Ninja, clang-cl and vcpkg.
 - Native WinFsp API; no FUSE layer.
-- Case-insensitive lookup with case-preserved names.
+- Case-sensitive lookup with case-preserved names; entries that differ only by case can coexist.
 - Adaptive directory index: intrusive treap plus a lazy open-addressing hash for large directories.
 - Create/open/read/write/truncate/rename/move/delete and directory enumeration.
 - Sparse file storage with 4 KiB logical pages.
@@ -18,6 +18,12 @@ A high-performance volatile Windows memory file system written in C17 on top of 
 - Thread-safe global capacity and resident-memory accounting.
 
 All file-system contents are volatile. Unmounting or terminating the process loses all files.
+
+## Filename comparison
+
+Names use exact, case-sensitive UTF-16 code-unit comparison throughout lookup, collision checks, directory ordering, wildcard filtering, rename and deletion. For example, `Readme.txt` and `README.TXT` are separate entries, and a lookup using another spelling does not resolve either one. Names are case-preserved, and Unicode names are compared as supplied without case folding or normalization.
+
+Case sensitivity is selected when WinFsp creates a volume, so an already-mounted instance keeps its existing behavior. Validate a rebuilt version on a newly mounted, unused volume; do not stop a live volatile volume unless its contents may be discarded.
 
 ## Prerequisites
 
@@ -69,6 +75,8 @@ applicable WinFsp/GPLv3 obligations. See `THIRD_PARTY_NOTICES.md`.
 
 ## Run
 
+Run `memfs.exe` with no arguments, or pass `--gui`, to open the native configuration window. Use **挂载** to start a temporary console-mode mount owned by that window and **卸载临时挂载** to stop only that instance. The **安装并启动服务** and **卸载服务** actions use the selected service name; uninstall requires only that name. Mount settings include capacity, label, dispatcher threads, compression, encryption, debug logging, and runtime statistics. The GUI accepts an environment-variable name for an existing 64-hex key but never asks for or displays the key itself. LocalSystem service installation rejects environment keys; choose **随机临时密钥** or disable encryption for that action.
+
 Basic 512 MiB RAM disk:
 
 ```powershell
@@ -117,6 +125,10 @@ Options:
 --key-env <name>        Read a 64-hex key from an environment variable
 --debug                 Enable WinFsp debug logging
 --service               Run under the Windows Service Control Manager
+--service-name <name>   Service name; default: MemfsC
+--log-file <path>       Absolute path for the protected service log
+--install               Install and start an automatic LocalSystem service
+--uninstall             Bounded-stop and remove only the named service
 --uninstall-private-driver  Remove only MemfsC-owned private WinFsp fallback service/files
 --stats                 Print a human-readable runtime snapshot at mount and stop
 --stats-json            Print stable one-line JSON runtime snapshots at mount and stop
@@ -127,22 +139,17 @@ Stop with Ctrl+C.
 
 ## Windows Service
 
-The production path is a normal Windows `SERVICE_WIN32_OWN_PROCESS` service named `MemfsC`. The executable uses the Service Control Manager directly (`StartServiceCtrlDispatcherW`, `RegisterServiceCtrlHandlerExW`) and handles both STOP and SHUTDOWN controls. Service stop first stops the WinFsp dispatcher and then tears down the filesystem/allocator before reporting `SERVICE_STOPPED`.
+The native installer creates a `SERVICE_WIN32_OWN_PROCESS` service named `MemfsC`, configures automatic start and bounded restart recovery, and starts it immediately. The service runs as LocalSystem. Its protected log defaults to `%ProgramData%\MemfsC\MemfsC.log`; its DACL grants access only to SYSTEM and the installing user's SID. Pass `--log-file` to select another absolute log path. The executable handles STOP and SHUTDOWN controls and stops the WinFsp dispatcher before tearing down the filesystem and allocator.
 
-Run the following from an elevated shell. Keep the service name `MemfsC`, because that is the service name registered by the executable:
+Run these commands from an elevated shell:
 
 ```powershell
-$exe = (Resolve-Path .\build\x64-release\memfs.exe).Path
-$bin = '"' + $exe + '" --service --mount R: --size 512M --label MEMFS'
-sc.exe create MemfsC "binPath=" $bin "start=" auto
-sc.exe description MemfsC "MemfsC volatile memory filesystem"
-
-sc.exe start MemfsC
+.\build\x64-release\memfs.exe --install --mount R: --size 512M --label MEMFS
 sc.exe queryex MemfsC
-
-sc.exe stop MemfsC
-sc.exe delete MemfsC
+.\build\x64-release\memfs.exe --uninstall
 ```
+
+Use `--service-name MemfsFrontendTest` to install a separate service for testing; pass the same name to `--uninstall`. Repeating an identical install is idempotent. An install that changes the registered executable or service arguments is rejected. Native install rejects `--key-hex` and `--key-env`, because a LocalSystem service cannot safely inherit a user's key argument or environment; `--encrypt` remains available and generates a fresh key at startup. Manual `--service` mode and the `scripts\memfs-service.ps1` helper remain available for existing SCM workflows.
 
 A helper that still uses `sc.exe` for all service control is included:
 

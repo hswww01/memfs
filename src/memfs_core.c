@@ -5,7 +5,6 @@
 #include <sddl.h>
 #include <sodium.h>
 #include <zstd.h>
-#include <wctype.h>
 
 #define MEMFS_DEFAULT_SDDL L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)"
 
@@ -2370,42 +2369,21 @@ static MemfsResult memfs_default_security(MemfsAllocator* allocator, MemfsSecuri
 	return result;
 }
 
-static inline uint32_t memfs_ascii_fold(uint32_t c) {
-	if (c >= (uint32_t)L'A' && c <= (uint32_t)L'Z')
-		return c + ((uint32_t)L'a' - (uint32_t)L'A');
-	return c;
-}
-
 static int memfs_name_compare(const wchar_t* left, const wchar_t* right) {
-	const wchar_t* left_start = left;
-	const wchar_t* right_start = right;
-
-	for (;;) {
-		uint32_t a = (uint32_t)*left;
-		uint32_t b = (uint32_t)*right;
-
-		if (a >= 0x80U || b >= 0x80U)
-			return _wcsicmp(left_start, right_start);
-
-		a = memfs_ascii_fold(a);
-		b = memfs_ascii_fold(b);
-		if (a != b)
-			return a < b ? -1 : 1;
-		if (a == 0)
-			return 0;
-
+	while (*left != L'\0' && *left == *right) {
 		left++;
 		right++;
 	}
+	if (*left == *right)
+		return 0;
+	return (uint16_t)*left < (uint16_t)*right ? -1 : 1;
 }
 
 static uint32_t memfs_name_hash(const wchar_t* name) {
 	uint32_t hash = 2166136261U;
 
 	while (*name) {
-		uint32_t c = (uint32_t)*name++;
-
-		c = c < 0x80U ? memfs_ascii_fold(c) : (uint32_t)towlower((wint_t)c);
+		uint32_t c = (uint16_t)*name++;
 		hash ^= c;
 		hash *= 16777619U;
 	}

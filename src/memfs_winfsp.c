@@ -6,7 +6,7 @@
 #include <winternl.h>
 
 static MemfsWinFsp* memfs_instance(FSP_FILE_SYSTEM* file_system) {
-	return (MemfsWinFsp*)file_system->UserContext;
+	return (MemfsWinFsp*)fs_frontend_backend_context(file_system);
 }
 
 typedef BOOLEAN (NTAPI *MemfsRtlIsNameInUnUpcasedExpressionFn)(
@@ -79,7 +79,7 @@ static bool memfs_name_matches_pattern(
 	candidate.Buffer = (PWSTR)name;
 
 	return FALSE != g_name_expression_match(
-		&expression, &candidate, TRUE, NULL);
+		&expression, &candidate, FALSE, NULL);
 }
 
 #if defined(MEMFS_WINFSP_TESTING)
@@ -646,30 +646,13 @@ static NTSTATUS fs_GetDirInfoByName(FSP_FILE_SYSTEM* file_system, PVOID file_con
 	return STATUS_SUCCESS;
 }
 
-static VOID fs_DispatcherStopped(
-    FSP_FILE_SYSTEM* file_system,
-    BOOLEAN normally) {
-	MemfsWinFsp* instance = memfs_instance(file_system);
-
-	if (instance == NULL)
-		return;
-
-	InterlockedExchange(
-		&instance->dispatcher_stop_reason,
-		normally
-			? MEMFS_DISPATCHER_STOPPED_NORMALLY
-			: MEMFS_DISPATCHER_STOPPED_ABNORMALLY);
-
-	if (instance->dispatcher_stopped_event != NULL)
-		SetEvent(instance->dispatcher_stopped_event);
-}
-
 #if defined(MEMFS_WINFSP_TESTING)
-void memfs_winfsp_test_dispatcher_stopped(
-    MemfsWinFsp* instance,
-    bool normally) {
-	if (instance != NULL && instance->file_system != NULL)
-		fs_DispatcherStopped(instance->file_system, normally ? TRUE : FALSE);
+NTSTATUS memfs_winfsp_test_get_dir_info_by_name(
+	FSP_FILE_SYSTEM* fs,
+	PVOID directory_context,
+	PWSTR name,
+	FSP_FSCTL_DIR_INFO* dir_info) {
+	return fs_GetDirInfoByName(fs, directory_context, name, dir_info);
 }
 #endif
 
@@ -694,7 +677,8 @@ static const FSP_FILE_SYSTEM_INTERFACE g_memfs_interface = {
 	.SetSecurity = fs_SetSecurity,
 	.ReadDirectory = fs_ReadDirectory,
 	.GetDirInfoByName = fs_GetDirInfoByName,
-	.DispatcherStopped = fs_DispatcherStopped,
+	/* Dispatcher event/status ownership is shared by fs_frontend. */
+	.DispatcherStopped = NULL,
 };
 
 static NTSTATUS memfs_win32_status(DWORD error) {
@@ -717,16 +701,43 @@ static bool memfs_winfsp_should_install_embedded_driver(NTSTATUS status) {
 		   status == STATUS_DRIVER_UNABLE_TO_LOAD;
 }
 
+static NTSTATUS memfs_winfsp_resolve_create_failure(
+	void* backend_context,
+	NTSTATUS first_create_status,
+	BOOL* retry_create,
+	DWORD* win32_detail_out) {
+	DWORD error;
+	(void)backend_context;
+	if (retry_create == NULL)
+		return STATUS_INVALID_PARAMETER;
+	*retry_create = FALSE;
+	if (win32_detail_out != NULL)
+		*win32_detail_out = ERROR_SUCCESS;
+	if (!memfs_winfsp_should_install_embedded_driver(first_create_status))
+		return first_create_status;
+
+	error = memfs_winfsp_install_embedded_driver();
+	if (error == ERROR_SUCCESS) {
+		*retry_create = TRUE;
+		return STATUS_SUCCESS;
+	}
+	if (win32_detail_out != NULL)
+		*win32_detail_out = error;
+	return memfs_win32_status(error);
+}
+
 NTSTATUS memfs_winfsp_create_ex(
     const MemfsOptions* options,
     MemfsWinFsp** out_instance,
     DWORD* detail_error) {
 	FSP_FSCTL_VOLUME_PARAMS volume_params;
+	FSF_WINFSP_CONFIG frontend_config;
 	MemfsWinFsp* instance;
 	Memfs* instance_store;
 	MemfsResult result;
 	NTSTATUS status;
 	DWORD runtime_error;
+	DWORD frontend_detail = ERROR_SUCCESS;
 
 	if (options == NULL || out_instance == NULL)
 		return STATUS_INVALID_PARAMETER;
@@ -752,15 +763,6 @@ NTSTATUS memfs_winfsp_create_ex(
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
 	instance->store = instance_store;
-	instance->dispatcher_stopped_event = CreateEventW(NULL, TRUE, FALSE, NULL);
-	if (instance->dispatcher_stopped_event == NULL) {
-		runtime_error = GetLastError();
-		if (detail_error)
-			*detail_error = runtime_error;
-		memfs_allocator_free(&instance_store->allocator, instance, sizeof(*instance));
-		memfs_destroy(instance_store);
-		return memfs_win32_status(runtime_error);
-	}
 
 	memset(&volume_params, 0, sizeof(volume_params));
 	volume_params.Version = sizeof(volume_params);
@@ -770,7 +772,7 @@ NTSTATUS memfs_winfsp_create_ex(
 	volume_params.VolumeCreationTime = memfs_now();
 	volume_params.VolumeSerialNumber = (uint32_t)(volume_params.VolumeCreationTime / 10000000ULL);
 	volume_params.FileInfoTimeout = 1000;
-	volume_params.CaseSensitiveSearch = 0;
+	volume_params.CaseSensitiveSearch = 1;
 	volume_params.CasePreservedNames = 1;
 	volume_params.UnicodeOnDisk = 1;
 	volume_params.PersistentAcls = 1;
@@ -783,27 +785,35 @@ NTSTATUS memfs_winfsp_create_ex(
 
 	wcscpy_s(volume_params.FileSystemName, _countof(volume_params.FileSystemName), L"MEMFS-C");
 
-	status =
-		FspFileSystemCreate(L"" FSP_FSCTL_DISK_DEVICE_NAME, &volume_params, &g_memfs_interface, &instance->file_system);
-	if (!NT_SUCCESS(status) && memfs_winfsp_should_install_embedded_driver(status)) {
-		runtime_error = memfs_winfsp_install_embedded_driver();
-		if (runtime_error == ERROR_SUCCESS) {
-			status = FspFileSystemCreate(L"" FSP_FSCTL_DISK_DEVICE_NAME, &volume_params,
-									 &g_memfs_interface, &instance->file_system);
-		} else if (detail_error) {
-			*detail_error = runtime_error;
-		}
-	}
+	memset(&frontend_config, 0, sizeof(frontend_config));
+	frontend_config.struct_size = sizeof(frontend_config);
+	frontend_config.abi_version = FS_FRONTEND_ABI_VERSION;
+	frontend_config.operation_table_size = sizeof(g_memfs_interface);
+	frontend_config.backend_context = instance;
+	frontend_config.operations = &g_memfs_interface;
+	frontend_config.volume_params = volume_params;
+	frontend_config.resolve_create_failure = memfs_winfsp_resolve_create_failure;
+	status = fsf_winfsp_create(&frontend_config, &instance->frontend,
+		&frontend_detail);
+	if (detail_error != NULL)
+		*detail_error = frontend_detail;
 	if (!NT_SUCCESS(status)) {
 		Memfs* store = instance->store;
-		if (instance->dispatcher_stopped_event != NULL)
-			CloseHandle(instance->dispatcher_stopped_event);
+		if (instance->frontend != NULL)
+			fsf_winfsp_destroy(instance->frontend);
 		memfs_allocator_free(&store->allocator, instance, sizeof(*instance));
 		memfs_destroy(store);
-		return runtime_error != ERROR_SUCCESS ? memfs_win32_status(runtime_error) : status;
+		return status;
 	}
 
-	instance->file_system->UserContext = instance;
+	instance->file_system = fsf_winfsp_object(instance->frontend);
+	if (instance->file_system == NULL) {
+		Memfs* store = instance->store;
+		fsf_winfsp_destroy(instance->frontend);
+		memfs_allocator_free(&store->allocator, instance, sizeof(*instance));
+		memfs_destroy(store);
+		return STATUS_UNSUCCESSFUL;
+	}
 
 	FspFileSystemSetOperationGuardStrategy(instance->file_system, FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE);
 
@@ -817,49 +827,41 @@ NTSTATUS memfs_winfsp_create(
 }
 
 NTSTATUS memfs_winfsp_mount(MemfsWinFsp* instance, const wchar_t* mount_point) {
-	if (instance == NULL || mount_point == NULL)
+	if (instance == NULL || instance->frontend == NULL || mount_point == NULL)
 		return STATUS_INVALID_PARAMETER;
 
-	return FspFileSystemSetMountPoint(instance->file_system, (PWSTR)mount_point);
+	return fsf_winfsp_mount(instance->frontend, mount_point);
 }
 
 NTSTATUS memfs_winfsp_start(MemfsWinFsp* instance, uint32_t thread_count) {
-	if (instance == NULL || instance->dispatcher_stopped_event == NULL)
+	if (instance == NULL || instance->frontend == NULL)
 		return STATUS_INVALID_PARAMETER;
 
-	ResetEvent(instance->dispatcher_stopped_event);
-	InterlockedExchange(
-		&instance->dispatcher_stop_reason,
-		MEMFS_DISPATCHER_ACTIVE);
-	return FspFileSystemStartDispatcher(instance->file_system, thread_count);
+	return fsf_winfsp_start(instance->frontend, thread_count);
 }
 
 HANDLE memfs_winfsp_dispatcher_stopped_event(MemfsWinFsp* instance) {
-	return instance ? instance->dispatcher_stopped_event : NULL;
+	return instance != NULL && instance->frontend != NULL
+		? fsf_winfsp_stopped_event(instance->frontend) : NULL;
 }
 
 bool memfs_winfsp_dispatcher_stopped_normally(const MemfsWinFsp* instance) {
-	return instance != NULL &&
-		InterlockedCompareExchange(
-			(volatile LONG*)&instance->dispatcher_stop_reason,
-			MEMFS_DISPATCHER_ACTIVE,
-			MEMFS_DISPATCHER_ACTIVE) ==
-			MEMFS_DISPATCHER_STOPPED_NORMALLY;
+	return instance != NULL && instance->frontend != NULL &&
+		fsf_winfsp_dispatcher_stopped_normally(instance->frontend);
 }
 
 NTSTATUS memfs_winfsp_dispatcher_result(const MemfsWinFsp* instance) {
 	NTSTATUS status = STATUS_INVALID_PARAMETER;
 
-	if (instance == NULL || instance->file_system == NULL)
+	if (instance == NULL || instance->frontend == NULL)
 		return status;
 
-	FspFileSystemGetDispatcherResult(instance->file_system, &status);
-	return status;
+	return fsf_winfsp_dispatcher_result(instance->frontend);
 }
 
 void memfs_winfsp_stop(MemfsWinFsp* instance) {
-	if (instance && instance->file_system)
-		FspFileSystemStopDispatcher(instance->file_system);
+	if (instance != NULL && instance->frontend != NULL)
+		fsf_winfsp_stop(instance->frontend);
 }
 
 void memfs_winfsp_destroy(MemfsWinFsp* instance) {
@@ -869,18 +871,8 @@ void memfs_winfsp_destroy(MemfsWinFsp* instance) {
 	{
 		Memfs* store = instance->store;
 
-		if (instance->file_system) {
-			/*
-			 * StopDispatcher is idempotent. On an abnormal dispatcher exit
-			 * the thread is already signaled, so this closes the retained
-			 * thread handle before FileSystemDelete frees the WinFsp object.
-			 */
-			FspFileSystemStopDispatcher(instance->file_system);
-			FspFileSystemDelete(instance->file_system);
-		}
-
-		if (instance->dispatcher_stopped_event != NULL)
-			CloseHandle(instance->dispatcher_stopped_event);
+		if (instance->frontend != NULL)
+			fsf_winfsp_destroy(instance->frontend);
 
 		memfs_allocator_free(&store->allocator, instance, sizeof(*instance));
 		memfs_destroy(store);

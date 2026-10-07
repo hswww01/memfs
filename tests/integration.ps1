@@ -89,8 +89,22 @@ try {
     New-Item -ItemType Directory -Path "$Drive\dir" | Out-Null
     $stage = "tiny-text-write"
     [IO.File]::WriteAllText("$Drive\hello.txt", "hello memfs")
-    if ([IO.File]::ReadAllText("$Drive\HELLO.TXT") -ne "hello memfs") {
-        throw 'case-insensitive text readback mismatch'
+    [IO.File]::WriteAllText("$Drive\HELLO.TXT", "upper-case twin")
+    if ([IO.File]::ReadAllText("$Drive\hello.txt") -ne "hello memfs" -or
+        [IO.File]::ReadAllText("$Drive\HELLO.TXT") -ne "upper-case twin") {
+        throw 'case-distinct text readback mismatch'
+    }
+    $rootNames = @(Get-ChildItem -LiteralPath "$Drive\" | Select-Object -ExpandProperty Name)
+    if ($rootNames -cnotcontains 'hello.txt' -or $rootNames -cnotcontains 'HELLO.TXT') {
+        throw 'case-distinct files were not both enumerated'
+    }
+    if (Test-Path -LiteralPath "$Drive\HeLLo.TxT") {
+        throw 'wrong-case path unexpectedly resolved'
+    }
+    Remove-Item -LiteralPath "$Drive\HELLO.TXT"
+    if (-not (Test-Path -LiteralPath "$Drive\hello.txt") -or
+        (Test-Path -LiteralPath "$Drive\HELLO.TXT")) {
+        throw 'deleting one case-distinct file changed the other entry'
     }
 
     # Exercise real multi-page storage, not only tiny-file endpoints.
@@ -145,14 +159,21 @@ try {
     finally { $stream.Dispose() }
 
     $stage = "rename-move"
-    Rename-Item "$Drive\hello.txt" "renamed.txt"
+    Rename-Item -LiteralPath "$Drive\hello.txt" -NewName "Hello.txt"
+    if ((Test-Path -LiteralPath "$Drive\hello.txt") -or
+        -not (Test-Path -LiteralPath "$Drive\Hello.txt")) {
+        throw 'case-only rename did not preserve exact spelling'
+    }
+    Rename-Item -LiteralPath "$Drive\Hello.txt" -NewName "renamed.txt"
     Move-Item "$Drive\renamed.txt" "$Drive\dir\moved.txt"
     $stage = "enumeration"
     $names = @(Get-ChildItem "$Drive\dir" | Sort-Object Name | Select-Object -ExpandProperty Name)
     if (($names -join ',') -ne 'data.bin,moved.txt,sparse.bin') { throw "directory mismatch: $($names -join ',')" }
     $stage = "wildcard-enumeration"
-    $filtered = @(Get-ChildItem "$Drive\dir" -Filter '*.TXT' | Select-Object -ExpandProperty Name)
-    if (($filtered -join ',') -ne 'moved.txt') { throw 'wildcard directory mismatch' }
+    $wrongCaseFiltered = @(Get-ChildItem -LiteralPath "$Drive\dir" -Filter '*.TXT' | Select-Object -ExpandProperty Name)
+    if ($wrongCaseFiltered.Count -ne 0) { throw 'wrong-case wildcard unexpectedly matched an entry' }
+    $filtered = @(Get-ChildItem -LiteralPath "$Drive\dir" -Filter '*.txt' | Select-Object -ExpandProperty Name)
+    if (($filtered -join ',') -ne 'moved.txt') { throw 'wildcard directory mismatch for exact-case pattern' }
     $stage = "delete-files"
     Remove-Item "$Drive\dir\moved.txt", "$Drive\dir\data.bin", "$Drive\dir\sparse.bin"
     $stage = "delete-directory"

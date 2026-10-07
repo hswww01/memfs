@@ -451,7 +451,10 @@ static void test_tree_and_lookup(void) {
 	CHECK(memfs_lookup_path(fs, L"\\Dir\\file.txt", &found) == MEMFS_OK);
 	CHECK(found == file);
 
-	CHECK(memfs_lookup_path(fs, L"\\dir\\FILE.TXT", &found) == MEMFS_OK);
+	found = NULL;
+	CHECK(memfs_lookup_path(fs, L"\\dir\\FILE.TXT", &found) == MEMFS_ERR_NOT_FOUND);
+	CHECK(found == NULL);
+	CHECK(memfs_lookup_path(fs, L"\\Dir\\file.txt", &found) == MEMFS_OK);
 	CHECK(found == file);
 
 	CHECK(memfs_lookup_parent(fs, L"\\Dir\\next.bin", &parent, name) == MEMFS_OK);
@@ -460,6 +463,138 @@ static void test_tree_and_lookup(void) {
 
 	memfs_node_close(file);
 	memfs_node_close(dir);
+	memfs_destroy(fs);
+}
+
+static void test_case_sensitive_namespace(void) {
+	Memfs* fs = NULL;
+	MemfsNode* upper_dir = NULL;
+	MemfsNode* lower_dir = NULL;
+	MemfsNode* upper_file = NULL;
+	MemfsNode* lower_file = NULL;
+	MemfsNode* found = NULL;
+	MemfsNode* item;
+	uint8_t upper_data[] = {0x11, 0x22, 0x33};
+	uint8_t lower_data[] = {0x44, 0x55, 0x66, 0x77};
+	uint8_t readback[sizeof(lower_data)];
+	uint32_t transferred = 0;
+	bool saw_upper = false;
+	bool saw_lower = false;
+
+	printf("== case-sensitive namespace ==\n");
+	CHECK(memfs_create(16 * 1024 * 1024ULL, L"CASE", &fs) == MEMFS_OK);
+	if (fs == NULL)
+		return;
+	CHECK(memfs_node_create(fs, fs->root, L"CaseDir", true,
+		FILE_ATTRIBUTE_DIRECTORY, NULL, 0, &upper_dir) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, fs->root, L"casedir", true,
+		FILE_ATTRIBUTE_DIRECTORY, NULL, 0, &lower_dir) == MEMFS_OK);
+	CHECK(upper_dir != NULL && lower_dir != NULL && upper_dir != lower_dir);
+	CHECK(memfs_node_create(fs, fs->root, L"Test.txt", false,
+		FILE_ATTRIBUTE_NORMAL, NULL, 0, &upper_file) == MEMFS_OK);
+	CHECK(memfs_node_create(fs, fs->root, L"test.txt", false,
+		FILE_ATTRIBUTE_NORMAL, NULL, 0, &lower_file) == MEMFS_OK);
+	CHECK(upper_file != NULL && lower_file != NULL && upper_file != lower_file);
+	if (upper_dir == NULL || lower_dir == NULL || upper_file == NULL || lower_file == NULL)
+		goto cleanup;
+	CHECK(memfs_lookup_path(fs, L"\\CaseDir", &found) == MEMFS_OK);
+	CHECK(found == upper_dir);
+	found = NULL;
+	CHECK(memfs_lookup_path(fs, L"\\casedir", &found) == MEMFS_OK);
+	CHECK(found == lower_dir);
+	found = NULL;
+	CHECK(memfs_lookup_path(fs, L"\\CASEDIR", &found) == MEMFS_ERR_NOT_FOUND);
+	CHECK(found == NULL);
+
+	CHECK(memfs_node_write(upper_file, upper_data, 0, sizeof(upper_data), false, false,
+		&transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(upper_data));
+	CHECK(memfs_node_write(lower_file, lower_data, 0, sizeof(lower_data), false, false,
+		&transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(lower_data));
+
+	CHECK(memfs_lookup_path(fs, L"\\Test.txt", &found) == MEMFS_OK);
+	CHECK(found == upper_file);
+	found = NULL;
+	CHECK(memfs_lookup_path(fs, L"\\TEST.TXT", &found) == MEMFS_ERR_NOT_FOUND);
+	CHECK(found == NULL);
+	CHECK(memfs_dir_lookup(fs->root, L"Test.txt") == upper_file);
+	CHECK(memfs_dir_lookup(fs->root, L"test.txt") == lower_file);
+	CHECK(memfs_dir_lookup(fs->root, L"TEST.TXT") == NULL);
+
+	for (item = memfs_dir_first(fs->root); item != NULL; item = memfs_dir_next(item)) {
+		if (wcscmp(item->name, L"CaseDir") == 0)
+			saw_upper = true;
+		if (wcscmp(item->name, L"casedir") == 0)
+			saw_lower = true;
+	}
+	CHECK(saw_upper && saw_lower);
+	saw_upper = false;
+	saw_lower = false;
+	for (item = memfs_dir_first(fs->root); item != NULL; item = memfs_dir_next(item)) {
+		if (wcscmp(item->name, L"Test.txt") == 0)
+			saw_upper = true;
+		if (wcscmp(item->name, L"test.txt") == 0)
+			saw_lower = true;
+	}
+	CHECK(saw_upper && saw_lower);
+
+	CHECK(memfs_node_rename(upper_file, fs->root, L"TEST.txt", false) == MEMFS_OK);
+	found = NULL;
+	CHECK(memfs_lookup_path(fs, L"\\Test.txt", &found) == MEMFS_ERR_NOT_FOUND);
+	CHECK(found == NULL);
+	CHECK(memfs_lookup_path(fs, L"\\TEST.txt", &found) == MEMFS_OK);
+	CHECK(found == upper_file);
+	CHECK(memfs_dir_lookup(fs->root, L"test.txt") == lower_file);
+	memset(readback, 0, sizeof(readback));
+	CHECK(memfs_node_read(upper_file, readback, 0, sizeof(upper_data), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(upper_data));
+	CHECK(memcmp(readback, upper_data, sizeof(upper_data)) == 0);
+	memset(readback, 0, sizeof(readback));
+	CHECK(memfs_node_read(lower_file, readback, 0, sizeof(lower_data), &transferred) == MEMFS_OK);
+	CHECK(transferred == sizeof(lower_data));
+	CHECK(memcmp(readback, lower_data, sizeof(lower_data)) == 0);
+
+	CHECK(memfs_node_unlink(upper_file) == MEMFS_OK);
+	memfs_node_close(upper_file);
+	upper_file = NULL;
+	CHECK(memfs_dir_lookup(fs->root, L"TEST.txt") == NULL);
+	CHECK(memfs_dir_lookup(fs->root, L"test.txt") == lower_file);
+	CHECK(memfs_node_unlink(lower_file) == MEMFS_OK);
+	memfs_node_close(lower_file);
+	lower_file = NULL;
+
+	CHECK(memfs_node_rename(upper_dir, fs->root, L"CASEDIR", false) == MEMFS_OK);
+	CHECK(memfs_dir_lookup(fs->root, L"CASEDIR") == upper_dir);
+	CHECK(memfs_dir_lookup(fs->root, L"CaseDir") == NULL);
+	CHECK(memfs_dir_lookup(fs->root, L"casedir") == lower_dir);
+	CHECK(memfs_node_unlink(upper_dir) == MEMFS_OK);
+	memfs_node_close(upper_dir);
+	upper_dir = NULL;
+	CHECK(memfs_dir_lookup(fs->root, L"CASEDIR") == NULL);
+	CHECK(memfs_dir_lookup(fs->root, L"casedir") == lower_dir);
+
+cleanup:
+	if (upper_file != NULL) {
+		if (!upper_file->deleted)
+			(void)memfs_node_unlink(upper_file);
+		memfs_node_close(upper_file);
+	}
+	if (lower_file != NULL) {
+		if (!lower_file->deleted)
+			(void)memfs_node_unlink(lower_file);
+		memfs_node_close(lower_file);
+	}
+	if (upper_dir != NULL) {
+		if (!upper_dir->deleted)
+			(void)memfs_node_unlink(upper_dir);
+		memfs_node_close(upper_dir);
+	}
+	if (lower_dir != NULL) {
+		if (!lower_dir->deleted)
+			(void)memfs_node_unlink(lower_dir);
+		memfs_node_close(lower_dir);
+	}
 	memfs_destroy(fs);
 }
 
@@ -862,7 +997,7 @@ static void test_directory_order(void) {
 	Memfs* fs = NULL;
 	MemfsNode* nodes[5];
 	const wchar_t* names[] = {L"zeta", L"Alpha", L"gamma", L"beta", L"Delta"};
-	const wchar_t* expected[] = {L"Alpha", L"beta", L"Delta", L"gamma", L"zeta"};
+	const wchar_t* expected[] = {L"Alpha", L"Delta", L"beta", L"gamma", L"zeta"};
 	MemfsNode* p;
 	uint32_t i;
 
@@ -878,14 +1013,14 @@ static void test_directory_order(void) {
 	for (i = 0; i < 5; i++) {
 		CHECK(p != NULL);
 		if (p) {
-			CHECK(_wcsicmp(p->name, expected[i]) == 0);
+			CHECK(wcscmp(p->name, expected[i]) == 0);
 			p = memfs_dir_next(p);
 		}
 	}
 	CHECK(p == NULL);
 	CHECK(memfs_dir_upper_bound(fs->root, L"") == nodes[1]);
-	CHECK(memfs_dir_upper_bound(fs->root, L"Alpha") == nodes[3]);
-	CHECK(memfs_dir_upper_bound(fs->root, L"Delta") == nodes[2]);
+	CHECK(memfs_dir_upper_bound(fs->root, L"Alpha") == nodes[4]);
+	CHECK(memfs_dir_upper_bound(fs->root, L"Delta") == nodes[3]);
 	CHECK(memfs_dir_upper_bound(fs->root, L"zeta") == NULL);
 
 	for (i = 0; i < 5; i++) {
@@ -1550,13 +1685,15 @@ static void test_large_directory(void) {
 	CHECK(fs->root->dir->hash->count == COUNT);
 
 	for (i = 0; i < COUNT; i += 97U) {
-		swprintf_s(name, _countof(name), L"ITEM-%05u", i);
+		swprintf_s(name, _countof(name), L"item-%05u", i);
 		CHECK(memfs_dir_lookup(fs->root, name) == nodes[i]);
+		swprintf_s(name, _countof(name), L"ITEM-%05u", i);
+		CHECK(memfs_dir_lookup(fs->root, name) == NULL);
 	}
 
 	for (node = memfs_dir_first(fs->root); node; node = memfs_dir_next(node)) {
 		if (prev)
-			CHECK(_wcsicmp(prev->name, node->name) < 0);
+			CHECK(wcscmp(prev->name, node->name) < 0);
 		prev = node;
 		count++;
 	}
@@ -1593,7 +1730,7 @@ static void test_large_directory(void) {
 	count = 0;
 	for (node = memfs_dir_first(fs->root); node; node = memfs_dir_next(node)) {
 		if (prev)
-			CHECK(_wcsicmp(prev->name, node->name) < 0);
+			CHECK(wcscmp(prev->name, node->name) < 0);
 		prev = node;
 		count++;
 	}
@@ -1611,7 +1748,7 @@ exit:
 
 static bool test_orphan_contains(const Memfs* fs, const MemfsNode* target);
 
-static void test_unicode_name_fallback_with_hash(void) {
+static void test_unicode_name_case_sensitive_hash(void) {
 	Memfs* fs = NULL;
 	MemfsNode* node = NULL;
 	MemfsNode* found;
@@ -1619,7 +1756,7 @@ static void test_unicode_name_fallback_with_hash(void) {
 	wchar_t name[32];
 	uint32_t i;
 
-	printf("== Unicode name fallback with directory hash ==\n");
+	printf("== Unicode case-sensitive directory hash ==\n");
 	CHECK(memfs_create(32ULL * 1024ULL * 1024ULL, L"UNICODENAME", &fs) == MEMFS_OK);
 	CHECK(fs != NULL);
 	if (fs == NULL)
@@ -1642,20 +1779,27 @@ static void test_unicode_name_fallback_with_hash(void) {
 	if (node != NULL)
 		memfs_node_close(node);
 
-	found = memfs_dir_lookup(fs->root, L"\u03A9cASE.txt");
+	found = memfs_dir_lookup(fs->root, L"\u03A9Case.TXT");
 	CHECK(found != NULL);
 	if (found != NULL)
 		CHECK(wcscmp(found->name, L"\u03A9Case.TXT") == 0);
-
+	CHECK(memfs_dir_lookup(fs->root, L"\u03A9cASE.txt") == NULL);
 	CHECK(memfs_dir_lookup(fs->root, L"\u03A8cASE.txt") == NULL);
-	CHECK(memfs_node_create(fs, fs->root, L"\u03A9CASE.txt", false,
-							FILE_ATTRIBUTE_NORMAL, NULL, 0, &duplicate) == MEMFS_ERR_EXISTS);
-	CHECK(duplicate == NULL);
+	CHECK(memfs_node_create(fs, fs->root, L"\u03C9Case.TXT", false,
+							FILE_ATTRIBUTE_NORMAL, NULL, 0, &duplicate) == MEMFS_OK);
+	CHECK(duplicate != NULL);
+	if (duplicate != NULL) {
+		CHECK(memfs_dir_lookup(fs->root, L"\u03C9Case.TXT") == duplicate);
+		CHECK(memfs_dir_lookup(fs->root, L"\u03C9case.txt") == NULL);
+		CHECK(memfs_node_unlink(duplicate) == MEMFS_OK);
+		memfs_node_close(duplicate);
+		duplicate = NULL;
+	}
 
 	memfs_destroy(fs);
 }
 
-static void test_large_directory_case_insensitive_hash_stress(void) {
+static void test_large_directory_case_sensitive_hash_stress(void) {
 	enum { COUNT = 1024 };
 	Memfs* fs = NULL;
 	MemfsNode** nodes;
@@ -1665,7 +1809,7 @@ static void test_large_directory_case_insensitive_hash_stress(void) {
 	wchar_t new_name[64];
 	uint32_t i;
 
-	printf("== large directory case-insensitive hash stress ==\n");
+	printf("== large directory case-sensitive hash stress ==\n");
 
 	nodes = calloc(COUNT, sizeof(*nodes));
 	CHECK(nodes != NULL);
@@ -1695,16 +1839,20 @@ static void test_large_directory_case_insensitive_hash_stress(void) {
 	for (i = 0; i < COUNT; i++) {
 		switch (i % 3U) {
 		case 0:
+			swprintf_s(name, _countof(name), L"Case-%04u.txt", i);
 			swprintf_s(variant, _countof(variant), L"case-%04u.TXT", i);
 			break;
 		case 1:
+			swprintf_s(name, _countof(name), L"CASE-%04u.TXT", i);
 			swprintf_s(variant, _countof(variant), L"Case-%04u.txt", i);
 			break;
 		default:
+			swprintf_s(name, _countof(name), L"case-%04u.Txt", i);
 			swprintf_s(variant, _countof(variant), L"CASE-%04u.TXT", i);
 			break;
 		}
-		CHECK(memfs_dir_lookup(fs->root, variant) == nodes[i]);
+		CHECK(memfs_dir_lookup(fs->root, name) == nodes[i]);
+		CHECK(memfs_dir_lookup(fs->root, variant) == NULL);
 	}
 
 	swprintf_s(name, _countof(name), L"missing-%04u.txt", COUNT);
@@ -1713,13 +1861,13 @@ static void test_large_directory_case_insensitive_hash_stress(void) {
 	for (i = 0; i < COUNT; i += 128U) {
 		switch (i % 3U) {
 		case 0:
-			swprintf_s(name, _countof(name), L"case-%04u.TXT", i);
-			break;
-		case 1:
 			swprintf_s(name, _countof(name), L"Case-%04u.txt", i);
 			break;
-		default:
+		case 1:
 			swprintf_s(name, _countof(name), L"CASE-%04u.TXT", i);
+			break;
+		default:
+			swprintf_s(name, _countof(name), L"case-%04u.Txt", i);
 			break;
 		}
 		CHECK(memfs_node_create(fs, fs->root, name, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) == MEMFS_ERR_EXISTS);
@@ -4282,7 +4430,8 @@ static void test_path_name_boundaries(void) {
 	CHECK(memfs_dir_lookup(fs->root, max_name) == node);
 	memcpy(variant, max_name, sizeof(variant));
 	variant[0] = L'a';
-	CHECK(memfs_dir_lookup(fs->root, variant) == node);
+	CHECK(memfs_dir_lookup(fs->root, variant) == NULL);
+	CHECK(memfs_dir_lookup(fs->root, max_name) == node);
 	CHECK(memfs_node_unlink(node) == MEMFS_OK);
 	memfs_node_close(node);
 
@@ -4321,11 +4470,14 @@ static void test_path_name_boundaries(void) {
 	CHECK(parent == dir);
 	CHECK(wcscmp(name, L"new.txt") == 0);
 
-	CHECK(memfs_lookup_path(fs, L"\\DIR\\FILE.TXT", &found) == MEMFS_OK);
+	found = NULL;
+	CHECK(memfs_lookup_path(fs, L"\\DIR\\FILE.TXT", &found) == MEMFS_ERR_NOT_FOUND);
+	CHECK(found == NULL);
+	CHECK(memfs_lookup_path(fs, L"\\Dir\\file.txt", &found) == MEMFS_OK);
 	CHECK(found == file);
-	CHECK(memfs_lookup_parent(fs, L"\\DIR\\NEW.TXT", &parent, name) == MEMFS_OK);
-	CHECK(parent == dir);
-	CHECK(wcscmp(name, L"NEW.TXT") == 0);
+	parent = NULL;
+	CHECK(memfs_lookup_parent(fs, L"\\DIR\\NEW.TXT", &parent, name) == MEMFS_ERR_PATH_NOT_FOUND);
+	CHECK(parent == NULL);
 
 #if !defined(NDEBUG)
 	/*
@@ -5045,6 +5197,7 @@ int main(void) {
 	setvbuf(stdout, NULL, _IONBF, 0);
 
 	test_tree_and_lookup();
+	test_case_sensitive_namespace();
 	test_deep_namespace_destroy();
 	test_memory_accounting_layers();	test_allocator_fragmentation_reuse();
 	test_precise_timestamp_clock();
@@ -5078,8 +5231,8 @@ int main(void) {
 	test_small_to_paged_promotion();
 	test_truncate_regrow_zero_fill();
 	test_large_directory();
-	test_unicode_name_fallback_with_hash();
-	test_large_directory_case_insensitive_hash_stress();
+	test_unicode_name_case_sensitive_hash();
+	test_large_directory_case_sensitive_hash_stress();
 	test_compression();
 	test_adaptive_compression();
 	test_compression_incompressible_page_fallback();

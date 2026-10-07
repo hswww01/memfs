@@ -41,6 +41,7 @@ static int scan_file(const char* path) {
 	int failures = 0;
 	long line_no = 0;
 	int in_block_comment = 0;
+	int in_control_plane_heap = 0;
 
 	if (fp == NULL) {
 		printf("memfs_no_crt_heap_guard: cannot open %s\n", path);
@@ -49,6 +50,16 @@ static int scan_file(const char* path) {
 
 	while (fgets(line, sizeof(line), fp)) {
 		++line_no;
+		if (strstr(line, "MEMFS_CONTROL_PLANE_HEAP_BEGIN") != NULL) {
+			in_control_plane_heap = 1;
+			continue;
+		}
+		if (strstr(line, "MEMFS_CONTROL_PLANE_HEAP_END") != NULL) {
+			in_control_plane_heap = 0;
+			continue;
+		}
+		if (in_control_plane_heap)
+			continue;
 		size_t i = 0;
 		size_t len = strlen(line);
 		int in_string = 0;

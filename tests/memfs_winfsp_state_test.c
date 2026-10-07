@@ -75,6 +75,7 @@ static void test_security_snapshot_guards(void) {
     instance.store = store;
     instance.file_system = &fs;
     fs.UserContext = &instance;
+    CHECK(fs_frontend_backend_context(&fs) == &instance);
     InitializeSRWLock(&fs.OpGuardLock);
     CHECK(ConvertStringSecurityDescriptorToSecurityDescriptorW(
         L"O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;WD)",
@@ -135,56 +136,81 @@ cleanup:
     memfs_destroy(store);
 }
 
-int main(void) {
+static void test_case_sensitive_directory_info(void) {
+    Memfs* store = NULL;
+    MemfsNode* upper = NULL;
+    MemfsNode* lower = NULL;
+    FSP_FILE_SYSTEM fs;
     MemfsWinFsp instance;
-    FSP_FILE_SYSTEM file_system;
-    HANDLE event;
+    union {
+        UINT64 alignment;
+        BYTE bytes[sizeof(FSP_FSCTL_DIR_INFO) + 64 * sizeof(WCHAR)];
+    } buffer;
+    FSP_FSCTL_DIR_INFO* dir_info = (FSP_FSCTL_DIR_INFO*)buffer.bytes;
+    NTSTATUS status;
 
+    memset(&fs, 0, sizeof(fs));
     memset(&instance, 0, sizeof(instance));
-    memset(&file_system, 0, sizeof(file_system));
+    CHECK(memfs_create(8ULL << 20, L"CASE_INFO", &store) == MEMFS_OK);
+    if (store == NULL)
+        return;
+    CHECK(memfs_node_create(store, store->root, L"Case.txt", false,
+        FILE_ATTRIBUTE_NORMAL, NULL, 0, &upper) == MEMFS_OK);
+    CHECK(memfs_node_create(store, store->root, L"case.txt", false,
+        FILE_ATTRIBUTE_NORMAL, NULL, 0, &lower) == MEMFS_OK);
+    if (upper == NULL || lower == NULL)
+        goto cleanup;
 
-    event = CreateEventW(NULL, TRUE, FALSE, NULL);
-    CHECK(event != NULL);
-    if (event == NULL)
-        return 1;
+    instance.store = store;
+    instance.file_system = &fs;
+    fs.UserContext = &instance;
+    CHECK(fs_frontend_backend_context(&fs) == &instance);
+    status = memfs_winfsp_test_get_dir_info_by_name(&fs, store->root,
+        L"Case.txt", dir_info);
+    CHECK(NT_SUCCESS(status));
+    if (NT_SUCCESS(status))
+        CHECK(memcmp(dir_info->FileNameBuf, L"Case.txt",
+            wcslen(L"Case.txt") * sizeof(WCHAR)) == 0);
 
-    instance.file_system = &file_system;
-    instance.dispatcher_stopped_event = event;
-    instance.dispatcher_stop_reason = MEMFS_DISPATCHER_ACTIVE;
-    file_system.UserContext = &instance;
-    file_system.DispatcherResult = STATUS_DEVICE_NOT_CONNECTED;
+    status = memfs_winfsp_test_get_dir_info_by_name(&fs, store->root,
+        L"case.txt", dir_info);
+    CHECK(NT_SUCCESS(status));
+    if (NT_SUCCESS(status))
+        CHECK(memcmp(dir_info->FileNameBuf, L"case.txt",
+            wcslen(L"case.txt") * sizeof(WCHAR)) == 0);
 
-    memfs_winfsp_test_dispatcher_stopped(&instance, false);
-    CHECK(WaitForSingleObject(event, 0) == WAIT_OBJECT_0);
-    CHECK(!memfs_winfsp_dispatcher_stopped_normally(&instance));
-    CHECK(instance.dispatcher_stop_reason ==
-          MEMFS_DISPATCHER_STOPPED_ABNORMALLY);
-    CHECK(memfs_winfsp_dispatcher_result(&instance) ==
-          STATUS_DEVICE_NOT_CONNECTED);
+    status = memfs_winfsp_test_get_dir_info_by_name(&fs, store->root,
+        L"CASE.TXT", dir_info);
+    CHECK(status == STATUS_OBJECT_NAME_NOT_FOUND);
 
-    ResetEvent(event);
-    InterlockedExchange(
-        &instance.dispatcher_stop_reason,
-        MEMFS_DISPATCHER_ACTIVE);
-    file_system.DispatcherResult = STATUS_SUCCESS;
+cleanup:
+    if (upper != NULL) {
+        if (!upper->deleted)
+            (void)memfs_node_unlink(upper);
+        memfs_node_close(upper);
+    }
+    if (lower != NULL) {
+        if (!lower->deleted)
+            (void)memfs_node_unlink(lower);
+        memfs_node_close(lower);
+    }
+    memfs_destroy(store);
+}
 
-    memfs_winfsp_test_dispatcher_stopped(&instance, true);
-    CHECK(WaitForSingleObject(event, 0) == WAIT_OBJECT_0);
-    CHECK(memfs_winfsp_dispatcher_stopped_normally(&instance));
-    CHECK(instance.dispatcher_stop_reason ==
-          MEMFS_DISPATCHER_STOPPED_NORMALLY);
-    CHECK(memfs_winfsp_dispatcher_result(&instance) == STATUS_SUCCESS);
-
+int main(void) {
     CHECK(memfs_winfsp_test_name_matches_pattern(NULL, L"anything.bin"));
     CHECK(memfs_winfsp_test_name_matches_pattern(L"*", L"anything.bin"));
-    CHECK(memfs_winfsp_test_name_matches_pattern(L"*.TXT", L"readme.txt"));
-    CHECK(memfs_winfsp_test_name_matches_pattern(L"file?.dat", L"FILE1.DAT"));
-    CHECK(memfs_winfsp_test_name_matches_pattern(L"foo*", L"Foobar"));
+    CHECK(memfs_winfsp_test_name_matches_pattern(L"*.TXT", L"readme.TXT"));
+    CHECK(!memfs_winfsp_test_name_matches_pattern(L"*.TXT", L"readme.txt"));
+    CHECK(memfs_winfsp_test_name_matches_pattern(L"file?.dat", L"file1.dat"));
+    CHECK(!memfs_winfsp_test_name_matches_pattern(L"file?.dat", L"FILE1.DAT"));
+    CHECK(memfs_winfsp_test_name_matches_pattern(L"foo*", L"foobar"));
+    CHECK(!memfs_winfsp_test_name_matches_pattern(L"foo*", L"Foobar"));
     CHECK(!memfs_winfsp_test_name_matches_pattern(L"*.txt", L"image.bin"));
     CHECK(!memfs_winfsp_test_name_matches_pattern(L"file?.dat", L"file12.dat"));
 
-    CloseHandle(event);
     test_security_snapshot_guards();
+    test_case_sensitive_directory_info();
 
     if (g_failures != 0) {
         fprintf(stderr, "memfs_winfsp_state_test: %d failure(s)\n", g_failures);
