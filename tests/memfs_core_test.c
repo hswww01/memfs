@@ -11,6 +11,9 @@
 
 static int g_checks;
 static int g_failures;
+static uint32_t g_thread_create_skip = UINT32_MAX;
+static bool g_thread_failure_requested;
+static bool g_thread_failure_injected;
 
 #define CHECK(expr)                                                                                                    \
 	do {                                                                                                               \
@@ -20,6 +23,65 @@ static int g_failures;
 			printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #expr);                                                     \
 		}                                                                                                              \
 	} while (0)
+
+/* Test-only fault injection; the normal path calls the real Windows API. */
+static HANDLE create_test_thread(LPTHREAD_START_ROUTINE routine, void* argument) {
+	HANDLE thread;
+
+	if (g_thread_create_skip == 0U) {
+		g_thread_create_skip = UINT32_MAX;
+		g_thread_failure_injected = true;
+		fputs("INJECTED CreateThread failure\n", stderr);
+		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+		return NULL;
+	}
+	thread = CreateThread(NULL, 0, routine, argument, 0, NULL);
+	if (thread != NULL && g_thread_create_skip != UINT32_MAX)
+		--g_thread_create_skip;
+	return thread;
+}
+
+static void join_test_threads(HANDLE* threads, uint32_t started, const char* label) {
+	DWORD wait;
+
+	if (started == 0U)
+		return;
+	wait = WaitForMultipleObjects(started, threads, TRUE, 30000);
+	CHECK(wait == WAIT_OBJECT_0);
+	if (wait != WAIT_OBJECT_0) {
+		fprintf(stderr, "%s: worker join failed (wait=%lu); "
+				"terminating before shared-state teardown\n", label,
+				(unsigned long)wait);
+		fflush(NULL);
+		ExitProcess(2);
+	}
+}
+
+static bool configure_thread_failure(int argc, char** argv) {
+	uint64_t value = 0;
+	const char* text;
+
+	if (argc == 1)
+		return true;
+	if (argc != 3 || strcmp(argv[1], "--fail-thread-create-after") != 0)
+		return false;
+	text = argv[2];
+	if (*text == '\0')
+		return false;
+	while (*text != '\0') {
+		uint32_t digit;
+
+		if (*text < '0' || *text > '9')
+			return false;
+		digit = (uint32_t)(*text++ - '0');
+		if (value > (UINT32_MAX - 1ULL - digit) / 10ULL)
+			return false;
+		value = value * 10ULL + digit;
+	}
+	g_thread_create_skip = (uint32_t)value;
+	g_thread_failure_requested = true;
+	return true;
+}
 
 static void test_memory_accounting_layers(void) {
 	MemfsOptions options = {0};
@@ -3036,6 +3098,8 @@ static void test_concurrent_files(void) {
 	HANDLE threads[THREADS] = {0};
 	uint8_t key[MEMFS_ENCRYPTION_KEY_SIZE];
 	uint32_t i;
+	uint32_t created = 0;
+	uint32_t started = 0;
 	uint64_t expected_size = (uint64_t)BLOCKS * MEMFS_PAGE_SIZE;
 
 	printf("== concurrent files / accounting ==\n");
@@ -3060,30 +3124,38 @@ static void test_concurrent_files(void) {
 
 		swprintf_s(name, _countof(name), L"thread-%u.bin", i);
 		CHECK(memfs_node_create(fs, fs->root, name, false, FILE_ATTRIBUTE_NORMAL, NULL, 0, &files[i]) == MEMFS_OK);
+		if (files[i] == NULL)
+			break;
+		++created;
 
 		args[i].file = files[i];
 		args[i].value = (uint8_t)(i + 1U);
 		args[i].blocks = BLOCKS;
 
-		threads[i] = CreateThread(NULL, 0, concurrent_io_thread, &args[i], 0, NULL);
+		threads[i] = create_test_thread(concurrent_io_thread, &args[i]);
 		CHECK(threads[i] != NULL);
+		if (threads[i] == NULL)
+			break;
+		++started;
 	}
 
-	WaitForMultipleObjects(THREADS, threads, TRUE, INFINITE);
+	join_test_threads(threads, started, "concurrent files");
+	CHECK(started == THREADS);
 
-	for (i = 0; i < THREADS; i++) {
-		if (threads[i])
-			CloseHandle(threads[i]);
+	for (i = 0; i < started; i++) {
+		CloseHandle(threads[i]);
 
 		CHECK(args[i].failures == 0);
 		CHECK(files[i]->file_size == expected_size);
 		CHECK(files[i]->allocation_size == expected_size);
 	}
 
-	CHECK(memfs_free_bytes(fs) == options.capacity - (uint64_t)THREADS * expected_size);
-	CHECK(memfs_resident_bytes(fs) < (uint64_t)THREADS * expected_size / 4U);
+	if (started == THREADS) {
+		CHECK(memfs_free_bytes(fs) == options.capacity - (uint64_t)THREADS * expected_size);
+		CHECK(memfs_resident_bytes(fs) < (uint64_t)THREADS * expected_size / 4U);
+	}
 
-	for (i = 0; i < THREADS; i++) {
+	for (i = 0; i < created; i++) {
 		CHECK(memfs_node_unlink(files[i]) == MEMFS_OK);
 		memfs_node_close(files[i]);
 	}
@@ -3793,22 +3865,28 @@ static void test_allocator_generic_concurrency(void) {
 	AllocatorThreadArg args[THREADS] = {0};
 	HANDLE threads[THREADS] = {0};
 	uint32_t i;
+	uint32_t started = 0;
 
 	printf("== allocator generic concurrency ==\n");
 	CHECK(memfs_allocator_init(&allocator, 64, 64, 64));
+	if (allocator.state == NULL)
+		return;
 	memfs_allocator_get_stats(&allocator, &before);
 
 	for (i = 0; i < THREADS; i++) {
 		args[i].allocator = &allocator;
 		args[i].thread_id = i;
-		threads[i] = CreateThread(NULL, 0, allocator_generic_thread, &args[i], 0, NULL);
+		threads[i] = create_test_thread(allocator_generic_thread, &args[i]);
 		CHECK(threads[i] != NULL);
+		if (threads[i] == NULL)
+			break;
+		++started;
 	}
 
-	WaitForMultipleObjects(THREADS, threads, TRUE, INFINITE);
-	for (i = 0; i < THREADS; i++) {
-		if (threads[i])
-			CloseHandle(threads[i]);
+	join_test_threads(threads, started, "allocator concurrency");
+	CHECK(started == THREADS);
+	for (i = 0; i < started; i++) {
+		CloseHandle(threads[i]);
 		CHECK(args[i].failures == 0);
 	}
 
@@ -4817,18 +4895,14 @@ static void test_encryption_nonce_sequence_batching(void) {
 			workers[i].fs = first;
 			workers[i].sequences =
 				&sequences[i * NONCE_BATCH_TEST_PER_THREAD];
-			threads[i] = CreateThread(
-				NULL, 0, nonce_batch_test_worker, &workers[i], 0, NULL);
+			threads[i] = create_test_thread(nonce_batch_test_worker, &workers[i]);
 			CHECK(threads[i] != NULL);
 			if (threads[i] == NULL)
 				break;
 			started++;
 		}
 
-		if (started != 0) {
-			CHECK(WaitForMultipleObjects(
-					  started, threads, TRUE, 30000) == WAIT_OBJECT_0);
-		}
+		join_test_threads(threads, started, "nonce batching");
 		for (uint32_t i = 0; i < started; ++i) {
 			CHECK(workers[i].errors == 0);
 			CloseHandle(threads[i]);
@@ -5193,8 +5267,12 @@ static void test_allocator_bootstrap_control(void) {
 }
 
 
-int main(void) {
+int main(int argc, char** argv) {
 	setvbuf(stdout, NULL, _IONBF, 0);
+	if (!configure_thread_failure(argc, argv)) {
+		fprintf(stderr, "Usage: %s [--fail-thread-create-after COUNT]\n", argv[0]);
+		return 2;
+	}
 
 	test_tree_and_lookup();
 	test_case_sensitive_namespace();
@@ -5270,6 +5348,8 @@ int main(void) {
 	test_cross_filesystem_namespace_rejected();
 
 
+	if (g_thread_failure_requested)
+		CHECK(g_thread_failure_injected);
 	printf("\nchecks=%d failures=%d => %s\n", g_checks, g_failures, g_failures ? "FAIL" : "PASS");
 
 	return g_failures ? 1 : 0;

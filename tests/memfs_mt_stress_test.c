@@ -22,6 +22,51 @@
  */
 static SRWLOCK g_namespace_lock = SRWLOCK_INIT;
 static volatile LONG g_stop = 0;
+static uint32_t g_thread_create_skip = UINT32_MAX;
+static bool g_thread_failure_requested;
+static bool g_thread_failure_injected;
+
+static HANDLE create_stress_thread(LPTHREAD_START_ROUTINE routine, void* argument) {
+    HANDLE thread;
+
+    if (g_thread_create_skip == 0U) {
+        g_thread_create_skip = UINT32_MAX;
+        g_thread_failure_injected = true;
+        fputs("INJECTED CreateThread failure\n", stderr);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    thread = CreateThread(NULL, 0, routine, argument, 0, NULL);
+    if (thread != NULL && g_thread_create_skip != UINT32_MAX)
+        --g_thread_create_skip;
+    return thread;
+}
+
+static bool configure_thread_failure(int argc, char** argv) {
+    uint64_t value = 0;
+    const char* text;
+
+    if (argc == 1)
+        return true;
+    if (argc != 3 || strcmp(argv[1], "--fail-thread-create-after") != 0)
+        return false;
+    text = argv[2];
+    if (*text == '\0')
+        return false;
+    while (*text != '\0') {
+        uint32_t digit;
+
+        if (*text < '0' || *text > '9')
+            return false;
+        digit = (uint32_t)(*text++ - '0');
+        if (value > (UINT32_MAX - 1ULL - digit) / 10ULL)
+            return false;
+        value = value * 10ULL + digit;
+    }
+    g_thread_create_skip = (uint32_t)value;
+    g_thread_failure_requested = true;
+    return true;
+}
 
 typedef struct StressThread {
     Memfs* fs;
@@ -223,7 +268,6 @@ static int run_stress(int thread_count, const char* label) {
     StressThread threads[STRESS_MAX_THREADS];
     HANDLE handles[STRESS_MAX_THREADS];
     int started = 0;
-    bool fatal_timeout = false;
     LONG64 wall_start;
     LONG64 wall_end;
     LARGE_INTEGER frequency;
@@ -280,8 +324,7 @@ static int run_stress(int thread_count, const char* label) {
 
     wall_start = qpc_ticks();
     for (int i = 0; i < thread_count; i++) {
-        handles[i] = CreateThread(
-            NULL, 0, stress_worker, &threads[i], 0, NULL);
+        handles[i] = create_stress_thread(stress_worker, &threads[i]);
         if (handles[i] == NULL) {
             printf("[%s] CreateThread failed at thread %d\n", label, i);
             InterlockedExchange(&g_stop, 1);
@@ -298,25 +341,27 @@ static int run_stress(int thread_count, const char* label) {
             TRUE,
             STRESS_DEADLOCK_TIMEOUT_MS);
 
-        if (wait == WAIT_TIMEOUT || wait == WAIT_FAILED) {
+        if (wait != WAIT_OBJECT_0) {
             DWORD grace;
 
+            errors++;
             InterlockedExchange(&g_stop, 1);
             printf(
-                "[%s] worker wait %s; requesting cooperative stop\n",
-                label,
-                wait == WAIT_TIMEOUT ? "timed out" : "failed");
+                "[%s] worker wait failed (wait=%lu); "
+                "requesting cooperative stop\n", label, (unsigned long)wait);
             grace = WaitForMultipleObjects(
                 (DWORD)started,
                 handles,
                 TRUE,
                 STRESS_GRACE_TIMEOUT_MS);
-            if (grace == WAIT_TIMEOUT || grace == WAIT_FAILED) {
-                fatal_timeout = true;
+            if (grace != WAIT_OBJECT_0) {
                 printf(
-                    "[%s] workers did not stop within grace period; "
-                    "leaving fs alive until process exit\n",
-                    label);
+                    "[%s] worker join failed (wait=%lu); "
+                    "terminating before shared-state teardown\n",
+                    label, (unsigned long)grace);
+                fflush(NULL);
+                /* Worker arguments also live on this stack; do not return. */
+                ExitProcess(2);
             }
         }
     }
@@ -326,14 +371,6 @@ static int run_stress(int thread_count, const char* label) {
     for (int i = 0; i < started; i++) {
         if (handles[i] != NULL)
             CloseHandle(handles[i]);
-    }
-
-    if (fatal_timeout) {
-        /*
-         * Threads may still dereference fs. Do not free directories or fs.
-         * main() treats return code 2 as fatal and exits the process.
-         */
-        return 2;
     }
 
     if (started != thread_count) {
@@ -398,22 +435,28 @@ static int run_stress(int thread_count, const char* label) {
     return errors == 0 ? 0 : 1;
 }
 
-int main(void) {
+int main(int argc, char** argv) {
     static const int thread_counts[] = {1, 2, 4, 8, 16};
     static const char* labels[] = {"baseline", "t2", "t4", "t8", "t16"};
     int failed = 0;
+
+    if (!configure_thread_failure(argc, argv)) {
+        fprintf(stderr, "Usage: %s [--fail-thread-create-after COUNT]\n", argv[0]);
+        return 2;
+    }
 
     printf("=== memfs multithread stress test ===\n");
 
     for (size_t i = 0; i < sizeof(thread_counts) / sizeof(thread_counts[0]); i++) {
         int result = run_stress(thread_counts[i], labels[i]);
 
-        if (result == 2) {
-            printf("FATAL TIMEOUT DETECTED\n");
-            return 2;
-        }
         if (result != 0)
             failed = 1;
+    }
+
+    if (g_thread_failure_requested && !g_thread_failure_injected) {
+        fputs("requested thread creation failure was not reached\n", stderr);
+        return 2;
     }
 
     if (failed) {

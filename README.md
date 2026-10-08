@@ -41,7 +41,7 @@ Both signed WinFsp kernel drivers (`winfsp-x64.sys` and `winfsp-a64.sys`) are em
 ## Build
 
 ```powershell
-cd D:\work\memfs
+cd D:\work\fs\memfs
 
 .\scripts\prepare-winfsp-static.ps1
 

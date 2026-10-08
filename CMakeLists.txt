@@ -271,7 +271,12 @@ else()
 		"IDR_MEMFS_WINFSP_DLL RCDATA \"${WINFSP_RUNTIME_RC}\"")
 endif()
 
-set(FS_FRONTEND_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../fs/frontend" CACHE PATH
+# Support the fs/memfs + fs/frontend layout and the original work/memfs layout.
+set(_memfs_frontend_default "${CMAKE_CURRENT_SOURCE_DIR}/../frontend")
+if(NOT EXISTS "${_memfs_frontend_default}/CMakeLists.txt")
+	set(_memfs_frontend_default "${CMAKE_CURRENT_SOURCE_DIR}/../fs/frontend")
+endif()
+set(FS_FRONTEND_SOURCE_DIR "${_memfs_frontend_default}" CACHE PATH
 	"Shared WinFsp and Windows service frontend source directory")
 if(NOT EXISTS "${FS_FRONTEND_SOURCE_DIR}/CMakeLists.txt")
 	message(FATAL_ERROR "Shared fs_frontend source tree not found: ${FS_FRONTEND_SOURCE_DIR}")
@@ -453,6 +458,22 @@ set_tests_properties(memfs_lifetime_test PROPERTIES TIMEOUT 60)
 add_executable(memfs_core_test
 	tests/memfs_core_test.c)
 
+add_executable(memfs_storage_regression_test tests/memfs_storage_regression_test.c)
+target_link_libraries(memfs_storage_regression_test PRIVATE memfs_core)
+add_test(NAME memfs_storage_regression_test COMMAND memfs_storage_regression_test)
+set_tests_properties(memfs_storage_regression_test PROPERTIES TIMEOUT 30)
+
+add_executable(memfs_alloc_zero_test
+	tests/memfs_alloc_zero_test.c src/memfs_alloc.c src/memfs_vm.c)
+target_include_directories(memfs_alloc_zero_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(memfs_alloc_zero_test PRIVATE _CRT_SECURE_NO_WARNINGS)
+add_test(NAME memfs_alloc_zero_test COMMAND memfs_alloc_zero_test)
+set_tests_properties(memfs_alloc_zero_test PROPERTIES TIMEOUT 30)
+if(MSVC)
+	target_compile_options(memfs_storage_regression_test PRIVATE /W4 /utf-8)
+	target_compile_options(memfs_alloc_zero_test PRIVATE /W4 /utf-8)
+endif()
+
 target_link_libraries(memfs_core_test
 	PRIVATE
 		memfs_core)
@@ -560,6 +581,15 @@ target_link_libraries(memfs_adaptive_compression_bench
 
 add_executable(memfs_alloc_mt_bench
 	bench/memfs_alloc_mt_bench.c)
+
+add_executable(memfs_area_zero_bench
+	bench/memfs_area_zero_bench.c src/memfs_alloc.c src/memfs_vm.c)
+target_include_directories(memfs_area_zero_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(memfs_area_zero_bench PRIVATE _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(memfs_area_zero_bench PRIVATE psapi)
+if(MSVC)
+	target_compile_options(memfs_area_zero_bench PRIVATE /W4 /utf-8)
+endif()
 
 add_executable(memfs_encryption_mt_bench
 	bench/memfs_encryption_mt_bench.c)

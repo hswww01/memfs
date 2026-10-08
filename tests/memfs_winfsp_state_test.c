@@ -197,7 +197,174 @@ cleanup:
     memfs_destroy(store);
 }
 
-int main(void) {
+static void test_volume_reports(void) {
+    MemfsOptions options = {0};
+    Memfs* store = NULL;
+    FSP_FILE_SYSTEM fs = {0};
+    MemfsWinFsp instance = {0};
+    FSP_FSCTL_VOLUME_INFO info;
+    FSP_FSCTL_VOLUME_PARAMS params;
+    const uint64_t capacity = 8ULL << 20;
+    const uint64_t used = 4096;
+
+    memfs_winfsp_test_volume_params(&params);
+    CHECK(params.MaxComponentLength == MEMFS_MAX_NAME);
+    CHECK(params.CaseSensitiveSearch && params.CasePreservedNames);
+    CHECK(params.SectorSize == MEMFS_ALLOCATION_UNIT);
+
+    CHECK(memfs_create(capacity, L"FIXED", &store) == MEMFS_OK);
+    if (store == NULL)
+        return;
+    instance.store = store;
+    fs.UserContext = &instance;
+    InterlockedExchange64(&store->used_bytes, (LONG64)used);
+    CHECK(NT_SUCCESS(memfs_winfsp_test_get_volume_info(&fs, &info)));
+    CHECK(info.TotalSize == capacity);
+    CHECK(info.FreeSize == capacity - used);
+    InterlockedExchange64(&store->used_bytes, 0);
+    memfs_destroy(store);
+
+    options.capacity_auto = true;
+    CHECK(memfs_create_ex(&options, &store) == MEMFS_OK);
+    if (store == NULL)
+        return;
+    instance.store = store;
+    InterlockedExchange64(&store->used_bytes, (LONG64)used);
+    CHECK(NT_SUCCESS(memfs_winfsp_test_get_volume_info(&fs, &info)));
+    CHECK(info.TotalSize >= info.FreeSize);
+    CHECK(info.TotalSize - info.FreeSize == used);
+    CHECK(info.TotalSize <= INT64_MAX);
+
+    /* Boundary accounting samples must not overflow the signed WinFsp
+     * allocation-unit fields or report more free bytes than total bytes. */
+    InterlockedExchange64(&store->used_bytes, INT64_MAX - 16);
+    CHECK(NT_SUCCESS(memfs_winfsp_test_get_volume_info(&fs, &info)));
+    CHECK(info.TotalSize >= info.FreeSize);
+    CHECK(info.TotalSize - info.FreeSize == (uint64_t)INT64_MAX - 16);
+    CHECK(info.TotalSize <= INT64_MAX && info.FreeSize <= 16);
+    InterlockedExchange64(&store->used_bytes, INT64_MAX);
+    CHECK(NT_SUCCESS(memfs_winfsp_test_get_volume_info(&fs, &info)));
+    CHECK(info.TotalSize == INT64_MAX && info.FreeSize == 0);
+    InterlockedExchange64(&store->used_bytes, 0);
+    memfs_destroy(store);
+}
+
+static void test_archive_attributes(void) {
+    Memfs* store = NULL;
+    MemfsNode* node = NULL;
+    FSP_FILE_SYSTEM fs = {0};
+    MemfsWinFsp instance = {0};
+    FSP_FSCTL_FILE_INFO info;
+
+    CHECK(memfs_create(8ULL << 20, L"ATTRIBUTES", &store) == MEMFS_OK);
+    if (store == NULL)
+        return;
+    instance.store = store;
+    fs.UserContext = &instance;
+    CHECK(memfs_node_create(store, store->root, L"normal", false,
+        FILE_ATTRIBUTE_NORMAL, NULL, 0, &node) == MEMFS_OK);
+    if (node != NULL) {
+        memfs_winfsp_test_cleanup(&fs, node, FspCleanupSetArchiveBit);
+        CHECK(node->attributes == FILE_ATTRIBUTE_ARCHIVE);
+
+        node->attributes = FILE_ATTRIBUTE_NORMAL;
+        CHECK(NT_SUCCESS(memfs_winfsp_test_overwrite(&fs, node, 0,
+            FALSE, 0, &info)));
+        CHECK(node->attributes == FILE_ATTRIBUTE_ARCHIVE);
+        CHECK(info.FileAttributes == FILE_ATTRIBUTE_ARCHIVE);
+        CHECK(memfs_node_unlink(node) == MEMFS_OK);
+        memfs_node_close(node);
+    }
+    memfs_destroy(store);
+}
+
+static void test_unlinked_directory_read(void) {
+    Memfs* store = NULL;
+    MemfsNode* directory = NULL;
+    FSP_FILE_SYSTEM fs = {0};
+    MemfsWinFsp instance = {0};
+    union { UINT64 alignment; BYTE bytes[2048]; } buffer;
+    ULONG transferred = 0;
+    ULONG position = 0;
+    unsigned dots = 0;
+    NTSTATUS status;
+
+    CHECK(memfs_create(8ULL << 20, L"UNLINKED", &store) == MEMFS_OK);
+    if (store == NULL)
+        return;
+    instance.store = store;
+    fs.UserContext = &instance;
+    CHECK(memfs_node_create(store, store->root, L"empty", true,
+        FILE_ATTRIBUTE_DIRECTORY, NULL, 0, &directory) == MEMFS_OK);
+    if (directory != NULL) {
+        CHECK(memfs_node_unlink(directory) == MEMFS_OK);
+        CHECK(directory->deleted && directory->parent == NULL);
+        memset(&buffer, 0xA5, sizeof(buffer));
+        status = memfs_winfsp_test_read_directory(&fs, directory, NULL,
+            NULL, buffer.bytes, sizeof(buffer.bytes), &transferred);
+        CHECK(NT_SUCCESS(status));
+        CHECK(transferred <= sizeof(buffer.bytes));
+        while (position + sizeof(UINT16) <= transferred) {
+            FSP_FSCTL_DIR_INFO* entry = (FSP_FSCTL_DIR_INFO*)(buffer.bytes + position);
+            ULONG name_bytes;
+            if (entry->Size == 0)
+                break;
+            CHECK(entry->Size >= sizeof(*entry));
+            if (entry->Size < sizeof(*entry) || entry->Size > transferred - position)
+                break;
+            name_bytes = entry->Size - (ULONG)sizeof(*entry);
+            CHECK((name_bytes == sizeof(WCHAR) &&
+                memcmp(entry->FileNameBuf, L".", name_bytes) == 0) ||
+                (name_bytes == 2 * sizeof(WCHAR) &&
+                memcmp(entry->FileNameBuf, L"..", name_bytes) == 0));
+            CHECK(entry->FileInfo.IndexNumber == memfs_node_index_number(directory));
+            ++dots;
+            position += (entry->Size + 7U) & ~7U;
+        }
+        CHECK(dots == 2);
+        memfs_node_close(directory);
+    }
+    memfs_destroy(store);
+}
+
+static void test_unlinked_directory_child(void) {
+    wchar_t executable[MAX_PATH];
+    wchar_t command[MAX_PATH + 40];
+    STARTUPINFOW startup = {0};
+    PROCESS_INFORMATION process = {0};
+    DWORD chars, code = 1, wait;
+
+    chars = GetModuleFileNameW(NULL, executable, _countof(executable));
+    CHECK(chars != 0 && chars < _countof(executable));
+    if (chars == 0 || chars >= _countof(executable))
+        return;
+    CHECK(swprintf_s(command, _countof(command),
+        L"\"%s\" --unlinked-directory-read", executable) > 0);
+    startup.cb = sizeof(startup);
+    CHECK(CreateProcessW(executable, command, NULL, NULL, FALSE,
+        CREATE_NO_WINDOW, NULL, NULL, &startup, &process));
+    if (process.hProcess == NULL)
+        return;
+    wait = WaitForSingleObject(process.hProcess, 10000);
+    CHECK(wait == WAIT_OBJECT_0);
+    if (wait != WAIT_OBJECT_0) {
+        /* This child owns only a disposable in-process fixture. */
+        TerminateProcess(process.hProcess, 2);
+        WaitForSingleObject(process.hProcess, 10000);
+    }
+    CHECK(GetExitCodeProcess(process.hProcess, &code));
+    printf("unlinked directory callback child exit=0x%08lX\n", code);
+    CHECK(code == 0);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && strcmp(argv[1], "--unlinked-directory-read") == 0) {
+        SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS);
+        test_unlinked_directory_read();
+        return g_failures ? 1 : 0;
+    }
     CHECK(memfs_winfsp_test_name_matches_pattern(NULL, L"anything.bin"));
     CHECK(memfs_winfsp_test_name_matches_pattern(L"*", L"anything.bin"));
     CHECK(memfs_winfsp_test_name_matches_pattern(L"*.TXT", L"readme.TXT"));
@@ -211,6 +378,9 @@ int main(void) {
 
     test_security_snapshot_guards();
     test_case_sensitive_directory_info();
+    test_volume_reports();
+    test_archive_attributes();
+    test_unlinked_directory_child();
 
     if (g_failures != 0) {
         fprintf(stderr, "memfs_winfsp_state_test: %d failure(s)\n", g_failures);

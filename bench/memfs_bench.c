@@ -47,6 +47,7 @@ typedef struct BenchResult {
 	const char* label;
 	double create_seconds;
 	double lookup_seconds;
+	double miss_seconds;
 	double delete_seconds;
 	uint64_t used_after_create;
 	uint64_t resident_after_create;
@@ -1757,7 +1758,7 @@ static int bench_name_hot_path(const BenchConfig* config, LARGE_INTEGER frequenc
 			uint32_t index = (uint32_t)(((uint64_t)i * 2654435761ULL +
 										 (uint64_t)round * 2246822519ULL) %
 										BENCH_NAME_HOT_COUNT);
-			if (memfs_dir_lookup(fs->root, lookup[index]) == NULL)
+			if (memfs_dir_lookup(fs->root, canonical[index]) == NULL)
 				goto cleanup;
 		}
 	}
@@ -1765,19 +1766,30 @@ static int bench_name_hot_path(const BenchConfig* config, LARGE_INTEGER frequenc
 	lookup_seconds = seconds_between(start, end, frequency);
 
 	QueryPerformanceCounter(&start);
+	for (round = 0; round < BENCH_NAME_HOT_ROUNDS; round++) {
+		for (i = 0; i < BENCH_NAME_HOT_COUNT; i++) {
+			if (memfs_dir_lookup(fs->root, lookup[i]) != NULL)
+				goto cleanup;
+		}
+	}
+	QueryPerformanceCounter(&end);
+	miss_seconds = seconds_between(start, end, frequency);
+
+	QueryPerformanceCounter(&start);
 	for (i = 0; i < BENCH_NAME_HOT_COUNT; i++) {
-		MemfsNode* node = memfs_dir_lookup(fs->root, lookup[i]);
+		MemfsNode* node = memfs_dir_lookup(fs->root, canonical[i]);
 		if (node == NULL || memfs_node_unlink(node) != MEMFS_OK)
 			goto cleanup;
 	}
 	QueryPerformanceCounter(&end);
 	delete_seconds = seconds_between(start, end, frequency);
 
-	printf("\n[ASCII case-insensitive directory hot path]\n");
+	printf("\n[ASCII case-sensitive directory hot path]\n");
 	printf("files:            %u\n", BENCH_NAME_HOT_COUNT);
 	printf("lookup rounds:    %u\n", BENCH_NAME_HOT_ROUNDS);
 	print_rate("create", BENCH_NAME_HOT_COUNT, create_seconds);
 	print_rate("lookup", BENCH_NAME_HOT_COUNT * BENCH_NAME_HOT_ROUNDS, lookup_seconds);
+	print_rate("case miss", BENCH_NAME_HOT_COUNT * BENCH_NAME_HOT_ROUNDS, miss_seconds);
 	print_rate("delete", BENCH_NAME_HOT_COUNT, delete_seconds);
 	printf("lookup ns/op:     %.1f\n",
 		   lookup_seconds * 1000000000.0 /
@@ -1856,7 +1868,7 @@ static int parse_args(int argc, char** argv, BenchConfig* plain, BenchConfig* co
 			printf("  --combined           run compression+encryption combined mode only\n");
 			printf("  --compression-page   run 200k repeated compressible 4KB page rewrites\n");
 			printf("  --sparse-groups      write one 4KB page into each of 4096 distinct page groups\n");
-			printf("  --name-hot           benchmark 50k ASCII names and 500k case-insensitive lookups\n");
+			printf("  --name-hot           benchmark 50k ASCII names, exact hits and case-mismatch misses\n");
 			printf("  --sequential-read    benchmark 128MiB sparse sequential read across 128 PageGroups\n");
 			printf("  --pressure-policy    run deterministic auto-capacity pressure/scavenge benchmark (Debug)\n");
 			printf("  --compression-level N set compression level for compression mode\n");

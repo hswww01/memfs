@@ -207,6 +207,13 @@ static NTSTATUS fs_GetVolumeInfo(FSP_FILE_SYSTEM* file_system, FSP_FSCTL_VOLUME_
 	return STATUS_SUCCESS;
 }
 
+#if defined(MEMFS_WINFSP_TESTING)
+NTSTATUS memfs_winfsp_test_get_volume_info(
+	FSP_FILE_SYSTEM* fs, FSP_FSCTL_VOLUME_INFO* volume_info) {
+	return fs_GetVolumeInfo(fs, volume_info);
+}
+#endif
+
 static NTSTATUS fs_SetVolumeLabel(FSP_FILE_SYSTEM* file_system, PWSTR volume_label,
 								  FSP_FSCTL_VOLUME_INFO* volume_info) {
 	MemfsWinFsp* instance = memfs_instance(file_system);
@@ -358,6 +365,21 @@ static VOID fs_Close(FSP_FILE_SYSTEM* file_system, PVOID file_context) {
 	(void)file_system;
 	memfs_node_close((MemfsNode*)file_context);
 }
+
+#if defined(MEMFS_WINFSP_TESTING)
+NTSTATUS memfs_winfsp_test_overwrite(
+	FSP_FILE_SYSTEM* fs, MemfsNode* node, UINT32 attributes,
+	BOOLEAN replace_attributes, UINT64 allocation_size,
+	FSP_FSCTL_FILE_INFO* info) {
+	return fs_Overwrite(fs, node, attributes, replace_attributes,
+		allocation_size, info);
+}
+
+void memfs_winfsp_test_cleanup(
+	FSP_FILE_SYSTEM* fs, MemfsNode* node, ULONG flags) {
+	fs_Cleanup(fs, node, NULL, flags);
+}
+#endif
 
 static NTSTATUS fs_Read(FSP_FILE_SYSTEM* file_system, PVOID file_context, PVOID buffer, UINT64 offset, ULONG length,
 						PULONG bytes_transferred) {
@@ -603,6 +625,15 @@ static NTSTATUS fs_ReadDirectory(FSP_FILE_SYSTEM* file_system, PVOID file_contex
 	return STATUS_SUCCESS;
 }
 
+#if defined(MEMFS_WINFSP_TESTING)
+NTSTATUS memfs_winfsp_test_read_directory(
+	FSP_FILE_SYSTEM* fs, MemfsNode* directory, PWSTR pattern, PWSTR marker,
+	PVOID buffer, ULONG length, PULONG transferred) {
+	return fs_ReadDirectory(fs, directory, pattern, marker,
+		buffer, length, transferred);
+}
+#endif
+
 static NTSTATUS fs_GetDirInfoByName(FSP_FILE_SYSTEM* file_system, PVOID file_context, PWSTR file_name,
 									FSP_FSCTL_DIR_INFO* dir_info) {
 	MemfsWinFsp* instance = memfs_instance(file_system);
@@ -726,6 +757,34 @@ static NTSTATUS memfs_winfsp_resolve_create_failure(
 	return memfs_win32_status(error);
 }
 
+static void memfs_winfsp_init_volume_params(FSP_FSCTL_VOLUME_PARAMS* volume_params) {
+	memset(volume_params, 0, sizeof(*volume_params));
+	volume_params->Version = sizeof(*volume_params);
+	volume_params->SectorSize = MEMFS_ALLOCATION_UNIT;
+	volume_params->SectorsPerAllocationUnit = 1;
+	volume_params->MaxComponentLength = MEMFS_MAX_NAME * sizeof(wchar_t);
+	volume_params->VolumeCreationTime = memfs_now();
+	volume_params->VolumeSerialNumber = (uint32_t)(volume_params->VolumeCreationTime / 10000000ULL);
+	volume_params->FileInfoTimeout = 1000;
+	volume_params->CaseSensitiveSearch = 1;
+	volume_params->CasePreservedNames = 1;
+	volume_params->UnicodeOnDisk = 1;
+	volume_params->PersistentAcls = 1;
+	volume_params->PostCleanupWhenModifiedOnly = 1;
+	volume_params->PassQueryDirectoryFileName = 1;
+	volume_params->PassQueryDirectoryPattern = 1;
+	volume_params->PostDispositionWhenNecessaryOnly = 1;
+	volume_params->AllowOpenInKernelMode = 1;
+	volume_params->SupportsPosixUnlinkRename = 0;
+	wcscpy_s(volume_params->FileSystemName, _countof(volume_params->FileSystemName), L"MEMFS-C");
+}
+
+#if defined(MEMFS_WINFSP_TESTING)
+void memfs_winfsp_test_volume_params(FSP_FSCTL_VOLUME_PARAMS* params) {
+	memfs_winfsp_init_volume_params(params);
+}
+#endif
+
 NTSTATUS memfs_winfsp_create_ex(
     const MemfsOptions* options,
     MemfsWinFsp** out_instance,
@@ -764,26 +823,7 @@ NTSTATUS memfs_winfsp_create_ex(
 	}
 	instance->store = instance_store;
 
-	memset(&volume_params, 0, sizeof(volume_params));
-	volume_params.Version = sizeof(volume_params);
-	volume_params.SectorSize = MEMFS_ALLOCATION_UNIT;
-	volume_params.SectorsPerAllocationUnit = 1;
-	volume_params.MaxComponentLength = MEMFS_MAX_NAME * sizeof(wchar_t);
-	volume_params.VolumeCreationTime = memfs_now();
-	volume_params.VolumeSerialNumber = (uint32_t)(volume_params.VolumeCreationTime / 10000000ULL);
-	volume_params.FileInfoTimeout = 1000;
-	volume_params.CaseSensitiveSearch = 1;
-	volume_params.CasePreservedNames = 1;
-	volume_params.UnicodeOnDisk = 1;
-	volume_params.PersistentAcls = 1;
-	volume_params.PostCleanupWhenModifiedOnly = 1;
-	volume_params.PassQueryDirectoryFileName = 1;
-	volume_params.PassQueryDirectoryPattern = 1;
-	volume_params.PostDispositionWhenNecessaryOnly = 1;
-	volume_params.AllowOpenInKernelMode = 1;
-	volume_params.SupportsPosixUnlinkRename = 0;
-
-	wcscpy_s(volume_params.FileSystemName, _countof(volume_params.FileSystemName), L"MEMFS-C");
+	memfs_winfsp_init_volume_params(&volume_params);
 
 	memset(&frontend_config, 0, sizeof(frontend_config));
 	frontend_config.struct_size = sizeof(frontend_config);

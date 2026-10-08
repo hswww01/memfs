@@ -1,6 +1,6 @@
 param(
-    [string]$BuildDir = "D:\work\memfs\build\x64-release",
-    [string]$OutputDir = "D:\work\memfs\dist\memfs-x64",
+    [string]$BuildDir = "",
+    [string]$OutputDir = "",
     [string]$WinFspSourceRoot = "D:\src\winfsp"
 )
 
@@ -9,6 +9,12 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $repoRoot = [IO.Path]::GetFullPath($repoRoot)
+if ([string]::IsNullOrWhiteSpace($BuildDir)) {
+    $BuildDir = Join-Path $repoRoot "build\x64-release"
+}
+if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+    $OutputDir = Join-Path $repoRoot "dist\memfs-x64"
+}
 $BuildDir = [IO.Path]::GetFullPath($BuildDir)
 $distRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot "dist"))
 $OutputDir = [IO.Path]::GetFullPath($OutputDir)
